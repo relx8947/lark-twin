@@ -64,7 +64,8 @@ class AgentDispatcher:
         return f"{msg.get('chat_id')}:{msg.get('anchor') or ''}"
 
     def should_handle(self, msg: dict, my_user_id: str) -> bool:
-        if str(msg.get('from_id')) == str(my_user_id):
+        # 默认丢弃自己账号的消息防自回环;allow_self 放开时依赖触发前缀阻断回复再次入队
+        if (not self.cfg.get('allow_self')) and str(msg.get('from_id')) == str(my_user_id):
             return False
         t = self.cfg.get('triggers') or {}
         content = (msg.get('content') or '').strip()

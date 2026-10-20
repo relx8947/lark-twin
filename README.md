@@ -16,6 +16,9 @@
 
 **无需配置飞书机器人，你的飞书账号即是 AI 助手。**
 
+> 本仓库是 [cv-cat/LarkAgentX](https://github.com/cv-cat/LarkAgentX) 的个人 fork，在上游基础上做自定义改动。
+> 上游代码版权归原作者所有；本仓库不另行授权。同步上游：`git fetch upstream && git merge upstream/master`。
+
 </div>
 
 ## 项目概述 🌟

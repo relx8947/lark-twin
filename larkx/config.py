@@ -18,6 +18,8 @@ DEFAULTS = {
     "agent_backend": "claude",
     "system_prompt": "",
     "mark_read": True,
+    # 测试用: 允许自己账号发的消息也进 agent(必须配合触发前缀,否则回复会自回环)
+    "allow_self": False,
     "triggers": {
         "prefix": "",
         "chat_types": [],
@@ -62,8 +64,9 @@ def load_config() -> dict:
         v = os.environ.get("LARKX_" + key.upper())
         if v:
             cfg[key] = v
-    if isinstance(cfg.get("mark_read"), str):
-        cfg["mark_read"] = cfg["mark_read"].strip().lower() in ("1", "true", "yes", "on")
+    for key in ("mark_read", "allow_self"):
+        if isinstance(cfg.get(key), str):
+            cfg[key] = _as_bool(cfg[key])
     triggers = dict(DEFAULTS["triggers"])
     for key, env_name in TRIGGER_ENV.items():
         v = os.environ.get(env_name)
