@@ -51,7 +51,7 @@ uv venv && uv pip install -e .
 .venv/bin/larkx doctor
 ```
 
-除了"后台服务""本机 agent 的 larkx skill"这两项之外，其余项都应该是 ✅。出现 ❌ 或 ⚠️ 时，按每项下面的 → 提示处理，再重新运行。这一步会真实调用一次模型。
+除了"后台服务""网页控制台""本机 agent 的 larkx skill"这几项之外，其余项都应该是 ✅。出现 ❌ 或 ⚠️ 时，按每项下面的 → 提示处理，再重新运行。这一步会真实调用一次模型。
 
 ### 5. 交给 systemd 托管
 
@@ -61,11 +61,21 @@ uv venv && uv pip install -e .
 .venv/bin/larkx service status
 ```
 
-`install` 会记下当前的 PATH，用来在服务里找到 agent 的启动命令。所以要在能正常运行该命令的终端里执行。服务进程不会继承终端里的代理等环境变量，agent 需要的变量要写进 `.env`。
+`install` 会装两个服务：`lark-twin.service`（数字人）和 `lark-twin-web.service`（网页控制台，只监听 `127.0.0.1:18341`）。`start` / `stop` / `restart` 默认两个一起操作，只操作一个时加 `--unit daemon` 或 `--unit web`。`install` 会记下当前的 PATH，用来在服务里找到 agent 的启动命令。所以要在能正常运行该命令的终端里执行。服务进程不会继承终端里的代理等环境变量，agent 需要的变量要写进 `.env`。
 
 如果希望用户退出登录后服务继续运行，需要开启 linger：`loginctl show-user $USER -p Linger` 应该显示 `Linger=yes`。如果不是，告诉用户执行 `loginctl enable-linger $USER`，这一步可能需要管理员权限。
 
-### 6. 让本机的 Claude Code / Codex 也能操作飞书
+### 6. 打开网页控制台（可选）
+
+控制台不直接对外，需要用 Nginx 之类反向代理到 `127.0.0.1:18341`（主机上有统一的 Nginx 管理规范时按规范接入）。代理建议关闭缓冲（`proxy_buffering off`），超时不小于 30 秒。然后在 `.env` 写上对外地址 `LARKX_WEB_URL=http://<主机名>:<端口>`，运行：
+
+```bash
+.venv/bin/larkx web url           # 打印带令牌的登录链接, 交给用户在浏览器里打开
+```
+
+令牌在链接的 `#` 后面，不会进 Nginx 访问日志。不要把令牌贴到聊天或日志里；泄露了就 `larkx web reset-token`。
+
+### 7. 让本机的 Claude Code / Codex 也能操作飞书
 
 ```bash
 .venv/bin/larkx skill install       # 装到 ~/.claude/skills/larkx 和 ~/.codex/skills/larkx
@@ -73,7 +83,7 @@ uv venv && uv pip install -e .
 
 装好后，用户在自己平时的 Claude Code 或 Codex 里就能说"给某人发消息""看看某个群在聊什么""让数字人去做……"。
 
-### 7. 验证
+### 8. 验证
 
 请用户在飞书里给数字人能看到的会话发 `/ai 你好`，然后查看日志：
 
@@ -96,6 +106,7 @@ uv venv && uv pip install -e .
 | 看定时任务 | `.venv/bin/larkx task list --all` |
 | 卸载服务 | `.venv/bin/larkx service uninstall` |
 | 全面检查 | `.venv/bin/larkx doctor` |
+| 网页控制台登录链接 | `.venv/bin/larkx web url`；令牌泄露了用 `larkx web reset-token` |
 
 数字人的人设和行为准则在 `~/.larkx/agent/CLAUDE.md`，长期记忆在 `~/.larkx/agent/memory/`，两处都可以直接修改。这个目录是一个 git 仓库，每轮的变化都会自动提交，改坏了可以用 git 回退。修改人设后，新会话一定会读到新内容：用户在飞书发 `/ai /clear` 即可开新会话，长期记忆会保留。`/ai /stop` 用来打断当前任务。这两个命令只有用户本人发才生效。
 
@@ -112,6 +123,6 @@ uv venv && uv pip install -e .
 
 ## 注意
 
-- `~/.larkx/credentials.json` 是用户飞书账号的完整登录态。不要读取它的内容，不要输出，也不要复制到别处。
+- `~/.larkx/credentials.json` 是用户飞书账号的完整登录态。不要读取它的内容，不要输出，也不要复制到别处。`~/.larkx/web_token` 同理，登录链接只交给用户本人。
 - 不要把 `.env` 或 `~/.larkx/` 下的任何文件提交到 git。
 - 同一个飞书账号只能运行一个 daemon。
