@@ -42,25 +42,37 @@ def check_config(cfg):
 
 
 def check_agent_cli(cfg):
-    from .agent.session import resolve_agent_cli
-    if cfg.get('agent_cli'):
+    from .agent import BACKENDS, resolve_agent_cli
+    backend = cfg.get('agent_backend')
+    if backend not in BACKENDS:
+        return _check('agent 命令', FAIL, f'未知的 LARKX_AGENT_BACKEND={backend}', f'改成 {" / ".join(BACKENDS)} 之一')
+    if backend == 'codex':
+        from .agent.codex import user_codex_home
         try:
-            return _check('agent 命令', OK, resolve_agent_cli(cfg['agent_cli']))
+            path = resolve_agent_cli(cfg.get('codex_cli') or 'codex')
         except FileNotFoundError as e:
-            return _check('agent 命令', FAIL, str(e), '把 LARKX_AGENT_CLI 改成完整路径')
+            return _check('agent 命令', FAIL, str(e), '安装 Codex, 或把 LARKX_CODEX_CLI 改成 codex 的完整路径')
+        if not (user_codex_home() / 'auth.json').exists():
+            return _check('agent 命令', FAIL, f'codex 还没登录({user_codex_home()}/auth.json 不存在)', '先运行 codex login')
+        return _check('agent 命令', OK, f'codex: {path}, 认证沿用 {user_codex_home()}/auth.json')
+    if cfg.get('claude_cli'):
+        try:
+            return _check('agent 命令', OK, f"claude: {resolve_agent_cli(cfg['claude_cli'])}")
+        except FileNotFoundError as e:
+            return _check('agent 命令', FAIL, str(e), '把 LARKX_CLAUDE_CLI 改成完整路径')
     if os.environ.get('ANTHROPIC_AUTH_TOKEN') or os.environ.get('ANTHROPIC_API_KEY'):
         return _check('agent 命令', OK, 'Agent SDK 自带 claude, 认证取 .env / 环境里的 ANTHROPIC_* 变量')
-    return _check('agent 命令', WARN, '未设置 LARKX_AGENT_CLI, 环境里也没有 ANTHROPIC_* 认证; 交给 systemd 后很可能调不通模型',
-                  '在 .env 设置 LARKX_AGENT_CLI 为平时启动 Claude Code 的命令(如 claude 或 ccd), 或填 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN')
+    return _check('agent 命令', WARN, '未设置 LARKX_CLAUDE_CLI, 环境里也没有 ANTHROPIC_* 认证; 交给 systemd 后很可能调不通模型',
+                  '在 .env 设置 LARKX_CLAUDE_CLI 为平时启动 Claude Code 的命令(如 claude 或 ccd), 或填 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN')
 
 
 async def _probe_model(cfg):
-    from .agent import AgentSession, ensure_agent_home
+    from .agent import create_session, ensure_agent_home
     from .storage import Storage
     with tempfile.TemporaryDirectory(prefix='larkx-doctor-') as tmp:
-        c = dict(cfg, agent_home=f'{tmp}/agent', agent_claude_dir=f'{tmp}/claude')
+        c = dict(cfg, agent_home=f'{tmp}/agent', agent_claude_dir=f'{tmp}/claude', agent_codex_dir=f'{tmp}/codex')
         ensure_agent_home(c)
-        s = AgentSession(c, Storage(f'sqlite:///{tmp}/doctor.db'))
+        s = create_session(c, Storage(f'sqlite:///{tmp}/doctor.db'))
         await s.start()
         try:
             return await s.ask('这是连通性检查, 只回复 OK 两个字母。')
@@ -72,10 +84,26 @@ def check_model(cfg):
     try:
         r = asyncio.run(_probe_model(cfg))
     except Exception as e:
-        return _check('模型调用', FAIL, f'{e!r}'[:300], '检查 LARKX_AGENT_CLI 或 ANTHROPIC_* 认证, 再运行 larkx doctor')
+        return _check('模型调用', FAIL, f'{e!r}'[:300], _model_fix(cfg))
     if 'OK' in r.text.upper():
         return _check('模型调用', OK, f'{r.duration_s:.1f}s')
-    return _check('模型调用', FAIL, f'{r.subtype}: {r.text[:200]}', '检查模型接入点和 key 是否可用')
+    return _check('模型调用', FAIL, f'{r.subtype}: {r.text[:200]}', _model_fix(cfg))
+
+
+def _model_fix(cfg) -> str:
+    if cfg.get('agent_backend') == 'codex':
+        return ('确认 codex 在终端里能正常对话; 需要代理时在 .env 写 HTTPS_PROXY / HTTP_PROXY(Codex 读大写变量); '
+                '账号不支持默认模型时设置 LARKX_AGENT_MODEL')
+    return '检查 LARKX_CLAUDE_CLI 指定的命令能否正常启动 Claude Code, 或 ANTHROPIC_* 认证是否可用'
+
+
+def check_user_skills():
+    from .skills import skill_dir
+    missing = [t for t in ('claude', 'codex') if not (skill_dir(t) / 'SKILL.md').exists()]
+    if not missing:
+        return _check('本机 agent 的 larkx skill', OK, '已装进 Claude Code 和 Codex')
+    return _check('本机 agent 的 larkx skill', WARN, f'还没装进: {", ".join(missing)}; 装上后可以直接让它们操作飞书、指挥数字人',
+                  'larkx skill install')
 
 
 def check_service():
@@ -102,4 +130,5 @@ def run(skip_model=False) -> list:
     if not skip_model and checks[-1]['level'] != FAIL:
         checks.append(check_model(cfg))
     checks.extend(check_service())
+    checks.append(check_user_skills())
     return checks

@@ -34,7 +34,6 @@ test.py
 static/resource/worklets/
 
 # 本地资产,不进提交
-tests/
 docs/
 .idea/
 *.egg-info/

@@ -84,3 +84,28 @@ def build_prompt(msg: dict, body: str, chat_name: str = '', sender_name: str = '
     if note:
         tail = f'\n({note})' + tail
     return '\n'.join(lines) + '\n' + tail
+
+
+def _fmt_ts(ts) -> str:
+    return _ts({'create_time': ts}) if ts else ''
+
+
+def build_task_prompt(task, now: float) -> str:
+    attrs = (f'id={quoteattr(str(task.id))} due={quoteattr(_fmt_ts(task.due_at))} now={quoteattr(_fmt_ts(now))} '
+             f'chat={quoteattr(task.chat_id or "")} anchor={quoteattr(task.anchor or "")} '
+             f'by_owner={quoteattr(str(bool(task.by_owner)).lower())}')
+    if task.every_sec:
+        attrs += f' every_sec={quoteattr(str(task.every_sec))}'
+    tail = '这是之前安排的任务, 现在到时间了, 按内容去做。'
+    if task.chat_id:
+        reply = f'larkx send {task.chat_id}' + (f' --root {task.anchor}' if task.anchor else '') + " - <<'EOF'"
+        tail += f'需要在原会话里通知时用: {reply} ... EOF。'
+    return f'<task {attrs}>{escape(task.prompt)}</task>\n\n{tail}'
+
+
+def build_say_prompt(text: str) -> str:
+    return f'<say>{escape(text)}</say>\n\n本人在终端里跟你说话。你最后的文字回答会显示给本人。'
+
+
+def build_system_prompt(text: str) -> str:
+    return f'<system>{escape(text)}</system>'

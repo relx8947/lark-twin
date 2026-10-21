@@ -22,16 +22,28 @@ DEFAULTS = {
     "allow_self": False,
     # 数字人工作目录: CLAUDE.md、记忆、skill 都在这里, agent 只加载这里的配置
     "agent_home": str(DATA_DIR / "agent"),
+    # 用哪种 coding agent 驱动数字人: claude(Claude Code) | codex
+    "agent_backend": "claude",
     # agent 专用的 Claude Code 配置目录, 会话记录写在这里, 不和本机其他 Claude Code 会话混在一起
     "agent_claude_dir": str(DATA_DIR / "claude"),
-    # 启动 agent 用的 Claude Code 命令, 即用户平时启动 Claude Code 的方式(如 claude、ccd 这类启动器),
-    # 认证沿用用户自己的配置。留空用 Agent SDK 自带的 claude, 认证取当前环境的 ANTHROPIC_* 变量
-    "agent_cli": "",
+    # agent 专用的 CODEX_HOME: 认证软链到用户自己的 auth.json, 配置由 larkx 生成
+    "agent_codex_dir": str(DATA_DIR / "codex"),
+    # 启动 agent 的命令, 即用户平时启动 coding agent 的方式, 认证沿用用户自己的配置。
+    # claude 后端: 如 claude、ccd 这类启动器; 留空用 Agent SDK 自带的 claude, 认证取当前环境的 ANTHROPIC_* 变量
+    "claude_cli": "",
+    # codex 后端
+    "codex_cli": "codex",
     "agent_model": "",
     # 主模型被安全策略拦截时 Claude Code 会整会话切到备用模型, 必须指定一个当前接入点可用的模型
     "agent_fallback_model": "",
     # 单轮处理超时(秒), 超时后中断这一轮
     "agent_turn_timeout": 1800,
+    # 每天几点(本地时间)让数字人回顾当天的对话和消息, 整理长期记忆; 设为 -1 关闭
+    "memory_review_hour": 4,
+    # 上下文用到自动压缩阈值的这个比例时, 先让数字人把要记的内容写进记忆(仅 claude 后端)
+    "memory_flush_ratio": 0.85,
+    # 数字人发出的消息末尾自动加上的签名, 如 "（AI 代回）"; 留空不加
+    "reply_signature": "",
     "triggers": {
         "prefix": "",
         "chat_types": [],
@@ -79,8 +91,13 @@ def load_config() -> dict:
     for key in ("mark_read", "allow_self"):
         if isinstance(cfg.get(key), str):
             cfg[key] = _as_bool(cfg[key])
+    # LARKX_AGENT_CLI 是 claude_cli 的旧名
+    if not cfg["claude_cli"] and os.environ.get("LARKX_AGENT_CLI"):
+        cfg["claude_cli"] = os.environ["LARKX_AGENT_CLI"]
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
-    for key in ("agent_home", "agent_claude_dir"):
+    cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
+    cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
+    for key in ("agent_home", "agent_claude_dir", "agent_codex_dir"):
         cfg[key] = os.path.expanduser(cfg[key])
     triggers = dict(DEFAULTS["triggers"])
     for key, env_name in TRIGGER_ENV.items():

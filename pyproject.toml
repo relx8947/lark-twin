@@ -34,4 +34,4 @@ include = ["larkx*"]
 
 [tool.setuptools.package-data]
 "larkx.protocol.proto" = ["cmd_map.json"]
-"larkx.agent" = ["templates/CLAUDE.md", "templates/skills/larkx/SKILL.md"]
+"larkx.agent" = ["templates/CLAUDE.md", "templates/skills/larkx/SKILL.md", "templates/skills/larkx-owner/SKILL.md"]

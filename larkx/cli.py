@@ -3,12 +3,14 @@ import json
 import sys
 from datetime import datetime
 from loguru import logger
+from . import state
 from .config import is_agent_actor, load_config
 from .protocol import REGIONS, AuthExpired, LarkAuth, LarkClient, get_region
 from .storage import Storage
 
-# 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务
-AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor'}
+# 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务、
+# 以本人身份给自己下指令(say)、改本机 agent 的 skill
+AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor', 'say', 'skill'}
 
 
 def _print_json(obj):
@@ -168,19 +170,34 @@ def _read_send_text(args) -> str:
     return ' '.join(args.text)
 
 
+def _audit(st, action, args_chat, content, msg_id='', ok=True, error=''):
+    turn = state.read_turn() if is_agent_actor() else None
+    st.log_action(actor='agent' if is_agent_actor() else 'human', action=action, chat_id=str(args_chat or ''),
+                  msg_id=str(msg_id or ''), content=content, ok=1 if ok else 0, error=error,
+                  turn_kind=(turn or {}).get('kind', ''), turn_ref=(turn or {}).get('ref', ''))
+
+
 def cmd_send(args):
     text = _read_send_text(args)
     if not text.strip():
         return _fail(args, '消息内容为空')
-    prefix = (load_config().get('triggers') or {}).get('prefix') or ''
-    if is_agent_actor() and prefix and text.lstrip().startswith(prefix):
+    cfg = load_config()
+    prefix = (cfg.get('triggers') or {}).get('prefix') or ''
+    st = Storage()
+    if is_agent_actor():
         # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
-        return _fail(args, f'数字人的回复不能以触发前缀 {prefix} 开头')
+        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and text.lstrip().startswith(prefix) else ''
+        denied = denied or state.send_denied(args.chat_id, state.read_turn())
+        if denied:
+            _audit(st, 'send', args.chat_id, text, ok=False, error=denied)
+            return _fail(args, denied)
+        if cfg.get('reply_signature'):
+            text = f"{text}\n{cfg['reply_signature']}"
     client = LarkClient(LarkAuth())
     msg_id = client.send_msg(text, args.chat_id, root_id=args.root)
+    _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
     if not msg_id:
         return _fail(args, '发送失败')
-    st = Storage()
     # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
     st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
     if args.json:
@@ -366,6 +383,117 @@ def cmd_daemon(args):
     return _run_logged_in(run_daemon, need_user_id=True)
 
 
+def _task_row(t) -> dict:
+    return {'id': t.id, 'kind': t.kind, 'status': t.status, 'due_at': datetime.fromtimestamp(t.due_at).strftime('%Y-%m-%d %H:%M:%S') if t.due_at else '',
+            'every_sec': t.every_sec, 'chat_id': t.chat_id, 'anchor': t.anchor, 'by_owner': bool(t.by_owner),
+            'creator': t.creator, 'run_count': t.run_count, 'prompt': t.prompt, 'result': t.result}
+
+
+def cmd_task(args):
+    st = Storage()
+    agent = is_agent_actor()
+    turn = state.read_turn() if agent else None
+    if args.action == 'list':
+        rows = [_task_row(t) for t in st.list_tasks(include_finished=args.all)]
+        if args.json:
+            _print_json(rows)
+            return 0
+        for r in rows:
+            every = f' 每{r["every_sec"]}s' if r['every_sec'] else ''
+            print(f"#{r['id']} [{r['status']}] {r['due_at']}{every} chat={r['chat_id'] or '-'}: {r['prompt'][:80]}")
+        return 0
+    if args.action == 'cancel':
+        if not args.text or not args.text[0].isdigit():
+            return _fail(args, '用法: larkx task cancel <任务 id>')
+        t = st.get_task(int(args.text[0]))
+        if not t:
+            return _fail(args, f'没有任务 #{args.text[0]}')
+        if agent and not (turn and turn['is_owner']) and t.chat_id != (turn or {}).get('chat_id'):
+            return _fail(args, '只能取消当前会话的任务; 其他任务需要本人发起')
+        st.update_task(t.id, status='cancelled')
+        if args.json:
+            _print_json({'ok': True, 'id': t.id})
+        else:
+            print(f'已取消任务 #{t.id}')
+        return 0
+    # add
+    prompt = _read_send_text(args)
+    if not prompt.strip():
+        return _fail(args, '任务内容为空')
+    try:
+        if args.at:
+            due = state.parse_at(args.at)
+        elif getattr(args, 'in_'):
+            due = datetime.now().timestamp() + state.parse_duration(args.in_)
+        else:
+            return _fail(args, '需要 --at <时间> 或 --in <时长>')
+        every = state.parse_duration(args.every) if args.every else 0
+    except ValueError as e:
+        return _fail(args, str(e))
+    chat_id, anchor, by_owner = args.chat or '', args.root or '', True
+    if agent:
+        if not turn or turn['kind'] == 'system':
+            return _fail(args, '当前没有正在处理的消息, 数字人不能新建任务')
+        by_owner = turn['is_owner']
+        chat_id = chat_id or turn['chat_id']
+        anchor = anchor or (turn['anchor'] if chat_id == turn['chat_id'] else '')
+        if chat_id != turn['chat_id'] and not by_owner:
+            return _fail(args, '只能给当前会话安排任务; 其他会话需要本人发起')
+    task_id = st.add_task(kind='task', due_at=int(due), every_sec=every, prompt=prompt, chat_id=chat_id, anchor=anchor,
+                          by_owner=1 if by_owner else 0, creator='agent' if agent else 'human')
+    when = datetime.fromtimestamp(due).strftime('%Y-%m-%d %H:%M:%S')
+    if args.json:
+        _print_json({'ok': True, 'id': task_id, 'due_at': when, 'every_sec': every, 'chat_id': chat_id})
+    else:
+        print(f'已安排任务 #{task_id}: {when}' + (f', 之后每 {args.every} 一次' if every else ''))
+    return 0
+
+
+def cmd_say(args):
+    import time
+    text = _read_send_text(args)
+    if not text.strip():
+        return _fail(args, '内容为空')
+    st = Storage()
+    task_id = st.add_task(kind='say', due_at=0, prompt=text, by_owner=1, creator='human')
+    if not args.wait:
+        print(f'已交给数字人(#{task_id}), 结果: larkx task list --all')
+        return 0
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        t = st.get_task(task_id)
+        if t.status in ('done', 'failed'):
+            if args.json:
+                _print_json({'ok': t.status == 'done', 'id': t.id, 'result': t.result})
+            else:
+                print(t.result or '(数字人没有文字回答)')
+            return 0 if t.status == 'done' else 1
+        time.sleep(1)
+    return _fail(args, f'等待超时, 任务 #{task_id} 仍在排队或处理中; daemon 是否在运行? larkx service status')
+
+
+def cmd_audit(args):
+    rows = Storage().list_actions(limit=args.limit)
+    if args.json:
+        _print_json([{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows])
+        return 0
+    for r in rows:
+        mark = '✓' if r.ok else '✗'
+        turn = f' ({r.turn_kind} {r.turn_ref})' if r.turn_kind else ''
+        detail = (r.content or '').replace('\n', ' ')[:60] + (f' | {r.error}' if r.error else '')
+        print(f'{r.created_at:%m-%d %H:%M:%S} {mark} {r.actor}{turn} {r.action} chat={r.chat_id}: {detail}')
+    return 0
+
+
+def cmd_skill(args):
+    from .skills import install_user_skill
+    targets = ['claude', 'codex'] if args.target == 'all' else [args.target]
+    for t in targets:
+        path = install_user_skill(t)
+        print(f'已安装 larkx skill 到 {t}: {path}')
+    return 0
+
+
 def cmd_service(args):
     import subprocess
     from . import service
@@ -485,6 +613,31 @@ def main():
     p.add_argument('-f', '--follow', action='store_true', help='logs 持续输出')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_service)
+    p = sub.add_parser('task', help='定时任务: 到点后交给数字人处理')
+    p.add_argument('action', choices=['add', 'list', 'cancel'])
+    p.add_argument('text', nargs='*', help='add: 任务内容(省略或写 - 时从 stdin 读); cancel: 任务 id')
+    p.add_argument('--at', help='时间, 如 "2026-10-22 09:00"、"10-22 09:00"、"09:00"')
+    p.add_argument('--in', dest='in_', help='多久之后, 如 30m、2h、1d')
+    p.add_argument('--every', help='周期, 如 1d、1w; 不填则只执行一次')
+    p.add_argument('--chat', help='关联的会话 id(到点时在这里通知)')
+    p.add_argument('--root', help='关联的话题 id')
+    p.add_argument('--all', action='store_true', help='list: 包括已完成和已取消的')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_task)
+    p = sub.add_parser('say', help='以本人身份从终端给数字人下指令')
+    p.add_argument('text', nargs='*', help='指令内容; 省略或写 - 时从 stdin 读')
+    p.add_argument('--wait', action='store_true', help='等数字人处理完并打印它的回答')
+    p.add_argument('--timeout', type=int, default=600)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_say)
+    p = sub.add_parser('audit', help='查看通过 larkx 对外做过的动作(发消息等)')
+    p.add_argument('--limit', type=int, default=50)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_audit)
+    p = sub.add_parser('skill', help='把 larkx skill 装进本机的 Claude Code / Codex, 让它们能操作你的飞书')
+    p.add_argument('action', choices=['install'])
+    p.add_argument('--target', choices=['claude', 'codex', 'all'], default='all')
+    p.set_defaults(fn=cmd_skill)
     p = sub.add_parser('doctor', help='检查登录、配置、模型调用和服务状态')
     p.add_argument('--skip-model', action='store_true', help='跳过模型调用检查')
     p.add_argument('--json', action='store_true')
@@ -494,7 +647,7 @@ def main():
     if is_agent_actor() and sub_cmd in AGENT_FORBIDDEN:
         sys.exit(_fail(argparse.Namespace(json='--json' in sys.argv), f'数字人不能使用 larkx {sub_cmd}', code=3))
     args, extra = parser.parse_known_args()
-    if extra and args.cmd == 'send':
+    if extra and args.cmd in ('send', 'task', 'say'):
         # send 的内容可以写在选项后面, 如 send <chat> --json -
         args.text += extra
     elif extra:

@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, desc
 from sqlalchemy.orm import sessionmaker
 from ..config import load_config
-from .models import AgentSession, Base, Chat, Message
+from .models import Action, AgentSession, Base, Chat, Message, Task
 
 
 def _json_default(o):
@@ -131,5 +131,79 @@ class Storage:
         s = self.Session()
         try:
             return s.query(AgentSession).order_by(desc(AgentSession.last_active)).limit(limit).all()
+        finally:
+            s.close()
+
+    def log_action(self, **fields):
+        s = self.Session()
+        try:
+            if 'content' in fields:
+                fields['content'] = (fields['content'] or '')[:2000]
+            s.add(Action(**fields))
+            s.commit()
+        finally:
+            s.close()
+
+    def list_actions(self, limit=50):
+        s = self.Session()
+        try:
+            rows = s.query(Action).order_by(desc(Action.id)).limit(limit).all()
+            rows.reverse()
+            return rows
+        finally:
+            s.close()
+
+    def add_task(self, **fields) -> int:
+        s = self.Session()
+        try:
+            row = Task(**fields)
+            s.add(row)
+            s.commit()
+            return row.id
+        finally:
+            s.close()
+
+    def get_task(self, task_id: int):
+        s = self.Session()
+        try:
+            return s.get(Task, task_id)
+        finally:
+            s.close()
+
+    def list_tasks(self, include_finished=False, limit=100):
+        s = self.Session()
+        try:
+            q = s.query(Task)
+            if not include_finished:
+                q = q.filter(Task.status.in_(('pending', 'running')))
+            return q.order_by(Task.due_at).limit(limit).all()
+        finally:
+            s.close()
+
+    def due_tasks(self, now: float):
+        s = self.Session()
+        try:
+            return s.query(Task).filter(Task.status == 'pending', Task.due_at <= now).order_by(Task.due_at).all()
+        finally:
+            s.close()
+
+    def update_task(self, task_id: int, **fields):
+        s = self.Session()
+        try:
+            row = s.get(Task, task_id)
+            if row:
+                for k, v in fields.items():
+                    setattr(row, k, v)
+                s.commit()
+        finally:
+            s.close()
+
+    def reset_running_tasks(self) -> int:
+        """daemon 重启时, 上次没跑完的任务重新排队。"""
+        s = self.Session()
+        try:
+            n = s.query(Task).filter(Task.status == 'running').update({'status': 'pending'})
+            s.commit()
+            return n
         finally:
             s.close()

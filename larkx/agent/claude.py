@@ -1,4 +1,4 @@
-"""数字人的常驻 agent 会话: 一个一直开着的 ClaudeSDKClient。
+"""Claude 后端: 一个一直开着的 ClaudeSDKClient。
 
 一次只处理一轮: 发出一条消息后读到 ResultMessage 才算结束。上一轮没结束时再 query,
 Claude Code 会把新消息插进当前这一轮(实测), 所以排队由 daemon 负责, 这里用锁保证串行。
@@ -6,11 +6,8 @@ Claude Code 会把新消息插进当前这一轮(实测), 所以排队由 daemon
 import asyncio
 import glob
 import os
-import shutil
-import sys
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, CLIConnectionError,
@@ -18,6 +15,7 @@ from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKCli
 from loguru import logger
 
 from ..config import ACTOR_ENV
+from .base import SessionCrashed, TurnResult, agent_path, resolve_agent_cli
 from .hooks import build_hooks
 
 SESSION_KEY = 'main'
@@ -27,27 +25,7 @@ PARENT_SESSION_VARS = ('CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
                        'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_EFFORT')
 
 
-def resolve_agent_cli(cmd: str) -> str:
-    path = shutil.which(os.path.expanduser(cmd))
-    if not path:
-        raise FileNotFoundError(f'找不到 agent 命令 {cmd}(LARKX_AGENT_CLI), 确认它在 PATH 里')
-    return path
-
-
-class SessionCrashed(Exception):
-    """agent 进程在一轮处理中途退出或失联; 会话已按原 id 重连, 这一轮的结果未知。"""
-
-
-@dataclass
-class TurnResult:
-    subtype: str
-    is_error: bool
-    text: str
-    duration_s: float
-    tools: list = field(default_factory=list)
-
-
-class AgentSession:
+class ClaudeSession:
     def __init__(self, cfg: dict, storage):
         self.cfg = cfg
         self.storage = storage
@@ -70,7 +48,7 @@ class AgentSession:
             # 后台任务结束时会话会自己开新的一轮, 打乱"一条消息一轮"的对应关系
             'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1',
             ACTOR_ENV: 'agent',
-            'PATH': os.path.dirname(sys.executable) + os.pathsep + os.environ.get('PATH', ''),
+            'PATH': agent_path(),
         }
         kw = dict(
             cwd=str(self.home),
@@ -81,8 +59,8 @@ class AgentSession:
             env=env,
             hooks=build_hooks(),
         )
-        if self.cfg.get('agent_cli'):
-            kw['cli_path'] = resolve_agent_cli(self.cfg['agent_cli'])
+        if self.cfg.get('claude_cli'):
+            kw['cli_path'] = resolve_agent_cli(self.cfg['claude_cli'])
         if self.cfg.get('agent_model'):
             kw['model'] = self.cfg['agent_model']
         if self.cfg.get('agent_fallback_model'):
@@ -222,6 +200,17 @@ class AgentSession:
         if not (row and row.started and row.agent_session_id == self.session_id):
             self.storage.session_upsert(SESSION_KEY, '', '', self.session_id, True)
         self.storage.session_touch(SESSION_KEY)
+
+    async def context_pressure(self):
+        if not self._client or self.busy:
+            return None
+        try:
+            u = await self._client.get_context_usage()
+        except Exception as e:
+            logger.debug(f'查询上下文用量失败: {e!r}')
+            return None
+        limit = u.get('autoCompactThreshold') or u.get('maxTokens') or 0
+        return (u.get('totalTokens') or 0) / limit if limit else None
 
     async def interrupt(self) -> bool:
         if self.busy and self._client:

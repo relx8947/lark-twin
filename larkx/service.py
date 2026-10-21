@@ -20,7 +20,7 @@ def available() -> bool:
 
 def render_unit() -> str:
     exe = Path(sys.executable).parent / 'larkx'
-    # 记下安装时的 PATH: 服务里要能找到 LARKX_AGENT_CLI 指定的命令(如 ccd)以及它依赖的工具
+    # 记下安装时的 PATH: 服务里要能找到 LARKX_CLAUDE_CLI / LARKX_CODEX_CLI 指定的命令(如 ccd、codex)以及它依赖的工具
     path = os.pathsep.join(dict.fromkeys([str(exe.parent)] + os.environ.get('PATH', '').split(os.pathsep)))
     return f"""[Unit]
 Description=lark-twin 飞书数字人 (larkx daemon)

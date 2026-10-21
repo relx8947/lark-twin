@@ -48,3 +48,38 @@ class AgentSession(Base):
     msg_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.now)
     last_active = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class Action(Base):
+    """审计: 通过 larkx 对外做的每个动作(发消息等), 记录是谁、在哪一轮里做的。"""
+    __tablename__ = 'actions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    actor = Column(String(16), default='')
+    action = Column(String(32), default='')
+    chat_id = Column(String(32), default='')
+    msg_id = Column(String(32), default='')
+    content = Column(Text, default='')
+    ok = Column(Integer, default=1)
+    error = Column(Text, default='')
+    turn_kind = Column(String(16), default='')
+    turn_ref = Column(String(64), default='')
+
+
+class Task(Base):
+    """定时任务和终端指令: 到点后由 daemon 交给数字人处理。"""
+    __tablename__ = 'tasks'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.now)
+    kind = Column(String(16), default='task')
+    due_at = Column(BigInteger, default=0, index=True)
+    every_sec = Column(Integer, default=0)
+    prompt = Column(Text, default='')
+    chat_id = Column(String(32), default='')
+    anchor = Column(String(32), default='')
+    by_owner = Column(Integer, default=0)
+    creator = Column(String(16), default='')
+    status = Column(String(16), default='pending', index=True)
+    run_count = Column(Integer, default=0)
+    last_run_at = Column(BigInteger, default=0)
+    result = Column(Text, default='')

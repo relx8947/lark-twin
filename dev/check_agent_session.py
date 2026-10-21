@@ -1,6 +1,6 @@
 """不接飞书, 单独检查常驻 agent 会话: 隔离、skill、larkx 可用性、拦截、重启恢复。
 
-用法: .venv/bin/python dev/check_agent_session.py [临时根目录, 默认 /tmp/larkx-session-check]
+用法: [LARKX_AGENT_BACKEND=codex] .venv/bin/python dev/check_agent_session.py [临时根目录, 默认 /tmp/larkx-session-check]
 会话和库都写在临时目录, 不影响真正的数字人主会话。
 """
 import asyncio
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from larkx.agent import AgentSession, ensure_agent_home
+from larkx.agent import create_session, ensure_agent_home
 from larkx.config import load_config
 from larkx.storage import Storage
 
@@ -34,13 +34,14 @@ async def main():
         shutil.rmtree(ROOT)
     ROOT.mkdir(parents=True)
     cfg = load_config()
-    cfg.update(agent_home=str(ROOT / 'agent'), agent_claude_dir=str(ROOT / 'claude'))
+    cfg.update(agent_home=str(ROOT / 'agent'), agent_claude_dir=str(ROOT / 'claude'), agent_codex_dir=str(ROOT / 'codex'))
+    print('后端:', cfg['agent_backend'])
     cfg['agent_fallback_model'] = cfg['agent_fallback_model'] or 'claude-sonnet-5-5'
     storage = Storage(f'sqlite:///{ROOT}/check.db')
     ensure_agent_home(cfg)
     logger.add(_capture, level='DEBUG')
 
-    s = AgentSession(cfg, storage)
+    s = create_session(cfg, storage)
     await s.start()
     await ask(s, '用一句话说明你是谁、代表谁。', '人设')
     print('init:', INIT_LINES[:1], '\n')
@@ -51,11 +52,10 @@ async def main():
     sid = s.session_id
     await s.close()
 
-    s2 = AgentSession(cfg, storage)
+    s2 = create_session(cfg, storage)
     await s2.start()
     r = await ask(s2, '刚才让你记住的暗号是什么?只回复暗号。', '重启后恢复')
     print('会话 id 不变:', s2.session_id == sid, '| 暗号保留:', '青松-58' in r.text)
-    print('会话记录:', [str(p) for p in (ROOT / 'claude' / 'projects').glob(f'*/{sid}.jsonl')])
     await s2.close()
 
 
