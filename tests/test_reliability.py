@@ -210,3 +210,19 @@ def test_mentions_query(tmp_path):
     st.save_message({'msg_id': 'd', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '100', 'content': '好的', 'create_time': t - 50}, sender_name='耿宇贺', direction='out')
     rows = st.mentions('100', st.owner_name('100'), t - 3600)
     assert [(r['msg_id'], r['kind'], r['replied']) for r in rows] == [('a', 'p2p', False), ('b', 'at', True)]
+
+
+def test_listener_leaves_messages_unread_by_default(tmp_path, fake_client):
+    from larkx.config import DEFAULTS
+    from larkx.daemon.listener import Listener
+    marked = []
+    fake_client.mark_read = lambda *a, **k: marked.append(a)
+    fake_client.get_user_name = lambda uid, cid: '张三'
+    fake_client.get_group_name = lambda cid: '项目群'
+    assert DEFAULTS['mark_read'] is False
+    cfg = {'mark_read': DEFAULTS['mark_read']}
+    lst = Listener(fake_client, Storage(f'sqlite:///{tmp_path}/t.db'), cfg, '100')
+    msg = {'msg_id': 'x1', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '200', 'content': '@你 /ai 在吗', 'position': 9}
+    assert asyncio.run(lst.on_message(msg)) and marked == []
+    cfg['mark_read'] = True
+    assert asyncio.run(lst.on_message({**msg, 'msg_id': 'x2', 'position': 10})) and len(marked) == 1

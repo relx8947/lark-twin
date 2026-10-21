@@ -17,7 +17,8 @@ ACTOR_ENV = "LARKX_ACTOR"
 DEFAULTS = {
     "region": "feishu",
     "storage_url": f"sqlite:///{DB_DEFAULT_PATH}",
-    "mark_read": True,
+    # 收到别人的消息就标为已读。默认关: 数字人收消息、翻记录都不会改变已读状态, 未读留给本人自己看
+    "mark_read": False,
     # 本人发的 /ai 消息也交给数字人(本人给它下指令、/stop、/clear、/takeover 都靠这个)。
     # 没有触发前缀时本人的消息一律不触发, 避免数字人的回复再次触发自己
     "allow_self": True,
