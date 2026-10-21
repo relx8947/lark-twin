@@ -204,7 +204,9 @@ def cmd_send(args):
                                         key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
             return _fail(args, denied)
         text = with_signature(text, cfg)
-    msg_id = client.send_msg(text, args.chat_id, root_id=args.root)
+    # 数字人回复触发它的那条消息时, 匿名发送就挂在那条消息下面
+    anchor = turn['ref'] if turn and turn.get('kind') == 'message' and str(turn.get('chat_id')) == str(args.chat_id) else None
+    msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'], anchor_id=anchor)
     _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
     if not msg_id:
         return _fail(args, '发送失败')

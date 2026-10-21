@@ -145,10 +145,20 @@ class LarkClient:
         resp.raise_for_status()
         return resp.content
 
-    def send_msg(self, text: str, chat_id: str, root_id: str=None):
-        """返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。"""
-        thread_chat = bool(root_id) and self.is_thread_chat(chat_id)
-        pkt = builders.build_send_message_packet(text, str(chat_id), generate_long_request_id(), root_id=root_id, thread_chat=thread_chat)
+    def send_msg(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False, anchor_id: str=None):
+        """返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
+
+        keep_unread: 会话里还有未读时, 以"回复话题并同时发送到会话"的方式发出, 对方在主会话照常看到这条消息,
+        但本人的已读位置不动, 未读消息仍是未读、对方也看不到已读。回复哪条: root_id > anchor_id > 对方最近的一条。
+        """
+        chat_id = str(chat_id)
+        thread_chat = (bool(root_id) or keep_unread) and self.is_thread_chat(chat_id)
+        sync = False
+        if keep_unread and not thread_chat:
+            root_id = root_id or self._unread_anchor(chat_id, anchor_id)
+            sync = bool(root_id)
+        pkt = builders.build_send_message_packet(text, chat_id, generate_long_request_id(), root_id=root_id,
+                                                 thread_chat=thread_chat, sync_to_chat=sync)
         try:
             content = self._gateway_post(pkt)
         except Exception as e:
@@ -163,6 +173,24 @@ class LarkClient:
             logger.error('服务端已接受发送请求,但响应里没有消息 id,无法确认是否发出')
             return None
         return msg_id
+
+    def read_state(self, chat_id: str):
+        """(本人已读到的 position, 会话最新 position)。"""
+        info = self.get_chat_info(chat_id) or {}
+        return int(info.get('readPosition') or 0), int(info.get('lastMessagePosition') or 0)
+
+    def _unread_anchor(self, chat_id: str, anchor_id: str=None) -> str:
+        """会话里有未读时, 匿名发送要挂在哪条消息下面; 没有未读返回空, 照常发送就不会改变任何已读状态。"""
+        read, last = self.read_state(chat_id)
+        if read >= last:
+            return ''
+        if anchor_id:
+            return str(anchor_id)
+        me = str(self.auth.user_id)
+        recent = self.pull_history(chat_id, range(max(1, last - 19), last + 1))
+        others = [m for m in recent if m.get('msg_id') and str(m.get('from_id')) != me and m.get('msg_type') != 6]
+        pick = (others or [m for m in recent if m.get('msg_id')] or [{}])[-1]
+        return str(pick.get('msg_id') or '')
 
     def search(self, query: str):
         pkt = builders.build_search_packet(query, generate_long_request_id(), self.auth.region.locale)

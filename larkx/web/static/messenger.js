@@ -246,7 +246,7 @@ function renderChat() {
   S.input = input; S.grow = grow;
   put($('chat'), S.head, S.body,
     h('div', { class: 'composer' }, S.replyBar, input,
-      h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；发出消息后，这个会话之前的消息会变为已读'), sendBtn)));
+      h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送，发出消息也不会把这个会话标为已读'), sendBtn)));
   renderHead(); renderMsgs('bottom');
   input.focus();
 }
@@ -319,11 +319,11 @@ async function sendMsg() {
   const input = S.input;
   const text = input.value.trim();
   if (!text || !S.chat) return;
-  if (S.chat.unread && !confirm(`发出后，这个会话里 ${S.chat.unread} 条未读会变为已读，对方能看到。继续发送？`)) return;
   input.disabled = true;
   const r = await act(() => api(`/api/im/chat/${S.chatId}/send`, { method: 'POST', body: { text, root_id: S.replyTo ? S.replyTo.root_id : null } }));
   input.disabled = false;
   if (!r) return;
+  if (!r.kept_unread) toast('这次发送让会话变成了已读：这类会话不支持匿名发送');
   input.value = ''; S.grow(); S.replyTo = null; renderReply(); input.focus();
   await pollChat(S.seq);
   S.body.scrollTop = S.body.scrollHeight;

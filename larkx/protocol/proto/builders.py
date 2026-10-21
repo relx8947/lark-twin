@@ -11,7 +11,10 @@ def wrap_packet(cmd: int, payload_msg, request_id: str) -> P.Packet:
     return pkt
 
 
-def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id: str=None, thread_chat: bool=False) -> P.Packet:
+def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id: str=None, thread_chat: bool=False,
+                              sync_to_chat: bool=False) -> P.Packet:
+    """sync_to_chat: 以话题回复发出, 同时在主会话显示一份(飞书的"同时发送到会话")。
+    这样发出的消息不会推进本人在这个会话的已读位置, 之前的未读消息仍是未读; 普通发送会把它们都算作已读。"""
     cid_1 = generate_request_cid()
     cid_2 = generate_request_cid()
     req = P.PutMessageRequest()
@@ -32,6 +35,14 @@ def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id:
     tp = P.TextProperty()
     tp.content = str(text)
     req.content.richText.elements.dictionary[cid_2].property = tp.SerializeToString()
+    if sync_to_chat and root_id and not thread_chat:
+        # 旧的 proto_pb2 里没有 syncToChat, 换成完整定义(线格式兼容)再设置
+        from . import lark_all_pb2 as LA
+        full = LA.messages.PutMessageRequest()
+        full.ParseFromString(req.SerializeToString())
+        full.isReplyInThread = True
+        full.syncToChat = True
+        req = full
     return wrap_packet(5, req, request_id)
 
 

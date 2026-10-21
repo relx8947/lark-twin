@@ -2,7 +2,8 @@
 
 会话列表用 feed.PullFeedCardsRequest, 消息用 PullMessagesByPositionsRequest, 都是只读接口;
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
-例外是发消息: 在某个会话发出消息后, 飞书服务端会把这个会话之前的消息都算作已读。
+发消息也不改已读: 普通发送会被服务端把会话之前的消息都算作已读, 所以有未读时改用"回复话题并同时发送到会话"
+(见 LarkClient.send_msg 的 keep_unread), 对方在主会话照常看到, 已读位置不动。
 """
 import re
 import threading
@@ -261,12 +262,21 @@ def send(request: Request):
     if len(text) > MAX_TEXT:
         raise ValueError(f'消息太长(超过 {MAX_TEXT} 字)')
     root_id = _digits(b['root_id'], 'root_id') if b.get('root_id') else None
-    msg_id = _call(c.send_msg, text, chat_id, root_id=root_id)
+    read, last = _call(c.read_state, chat_id)
+    # 网页版一律匿名发送: 有未读时挂在对方最近一条消息下面, 同时发送到会话, 已读位置不动
+    msg_id = _call(c.send_msg, text, chat_id, root_id=root_id, keep_unread=True)
     Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''), content=text,
                          ok=1 if msg_id else 0, error='' if msg_id else '发送失败', turn_kind='web')
     if not msg_id:
         raise UpstreamError('发送失败: 飞书没有确认收到这条消息')
-    return {'ok': True, 'msg_id': str(msg_id)}
+    # 发前有未读、发后已读位置却前进了, 说明这类会话不支持匿名发送, 如实告诉页面
+    try:
+        moved = read < last and c.read_state(chat_id)[0] > read
+    except Exception:
+        moved = False
+    if moved:
+        logger.warning(f'匿名发送后会话 {chat_id} 的已读位置仍然前进了')
+    return {'ok': True, 'msg_id': str(msg_id), 'kept_unread': not moved}
 
 
 def search(request: Request):

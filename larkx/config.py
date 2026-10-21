@@ -19,6 +19,8 @@ DEFAULTS = {
     "storage_url": f"sqlite:///{DB_DEFAULT_PATH}",
     # 收到别人的消息就标为已读。默认关: 数字人收消息、翻记录都不会改变已读状态, 未读留给本人自己看
     "mark_read": False,
+    # 发消息也不把会话标为已读: 会话里有未读时, 以"回复话题并同时发送到会话"发出, 对方照常在主会话看到
+    "keep_unread": True,
     # 本人发的 /ai 消息也交给数字人(本人给它下指令、/stop、/clear、/takeover 都靠这个)。
     # 没有触发前缀时本人的消息一律不触发, 避免数字人的回复再次触发自己
     "allow_self": True,
@@ -109,7 +111,7 @@ def load_config() -> dict:
         v = os.environ.get("LARKX_" + key.upper())
         if v:
             cfg[key] = v
-    for key in ("mark_read", "allow_self", "mirror"):
+    for key in ("mark_read", "keep_unread", "allow_self", "mirror"):
         if isinstance(cfg.get(key), str):
             cfg[key] = _as_bool(cfg[key])
     # LARKX_AGENT_CLI 是 claude_cli 的旧名

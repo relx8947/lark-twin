@@ -42,9 +42,12 @@ class FakeIMClient:
                  'content': '[图片] imageKey=k1 (1x1)' if p == 100 else f'第{p}条',
                  'content_data': {'image': {'origin': {'key': 'img_k1'}}} if p == 100 else None} for p in positions]
 
-    def send_msg(self, text, chat_id, root_id=None):
-        self.sent.append((chat_id, text, root_id))
+    def send_msg(self, text, chat_id, root_id=None, keep_unread=False, anchor_id=None):
+        self.sent.append((chat_id, text, root_id, keep_unread))
         return '777'
+
+    def read_state(self, chat_id):
+        return (95, 100)
 
     def mark_read(self, *a, **k):
         raise AssertionError('网页版飞书不能标已读')
@@ -91,7 +94,7 @@ def test_send_is_audited_as_owner(ctx):
     assert c.post('/api/im/chat/5/send', json={'text': '  '}).status_code == 400
     assert c.post('/api/im/chat/5/send', json={'text': 'hi', 'root_id': 'x'}).status_code == 400
     r = c.post('/api/im/chat/5/send', json={'text': '收到\n', 'root_id': '42'})
-    assert r.json() == {'ok': True, 'msg_id': '777'} and fake.sent == [('5', '收到', '42')]
+    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True} and fake.sent == [('5', '收到', '42', True)]
     a = Storage().list_actions()[-1]
     assert (a.actor, a.action, a.chat_id, a.msg_id, a.turn_kind) == ('human', 'send', '5', '777', 'web')
     # 改动类请求一样要带 X-Larkx
