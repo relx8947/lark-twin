@@ -5,12 +5,13 @@ import signal
 from loguru import logger
 
 from ..agent import AgentSession, SessionCrashed, ensure_agent_home
-from ..config import load_config
+from ..config import DATA_DIR, load_config
 from ..protocol import LarkClient
 from ..storage import Storage
 from .listener import Listener
 from .triggers import build_prompt, parse_command, should_handle, strip_prefix
 
+LOG_PATH = DATA_DIR / 'logs' / 'daemon.log'
 RETRY_NOTE = '上一次处理这条消息时 agent 进程中断过。先用 larkx messages 查一下是否已经回复过, 避免重复回复'
 
 
@@ -123,6 +124,8 @@ async def _run_until_signal(coro):
 
 
 def run_daemon(auth):
+    # 自己写日志文件: 有的机器上普通用户读不到自己的 journal
+    logger.add(LOG_PATH, level='INFO', rotation='10 MB', retention=5, encoding='utf-8')
     return asyncio.run(_run_until_signal(Daemon(auth).run()))
 
 

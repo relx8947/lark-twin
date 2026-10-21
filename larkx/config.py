@@ -24,6 +24,9 @@ DEFAULTS = {
     "agent_home": str(DATA_DIR / "agent"),
     # agent 专用的 Claude Code 配置目录, 会话记录写在这里, 不和本机其他 Claude Code 会话混在一起
     "agent_claude_dir": str(DATA_DIR / "claude"),
+    # 启动 agent 用的 Claude Code 命令, 即用户平时启动 Claude Code 的方式(如 claude、ccd 这类启动器),
+    # 认证沿用用户自己的配置。留空用 Agent SDK 自带的 claude, 认证取当前环境的 ANTHROPIC_* 变量
+    "agent_cli": "",
     "agent_model": "",
     # 主模型被安全策略拦截时 Claude Code 会整会话切到备用模型, 必须指定一个当前接入点可用的模型
     "agent_fallback_model": "",

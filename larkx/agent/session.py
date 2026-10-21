@@ -5,8 +5,8 @@ Claude Code 会把新消息插进当前这一轮(实测), 所以排队由 daemon
 """
 import asyncio
 import glob
-import json
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -25,6 +25,13 @@ SESSION_KEY = 'main'
 PARENT_SESSION_VARS = ('CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
                        'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_PID',
                        'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_EFFORT')
+
+
+def resolve_agent_cli(cmd: str) -> str:
+    path = shutil.which(os.path.expanduser(cmd))
+    if not path:
+        raise FileNotFoundError(f'找不到 agent 命令 {cmd}(LARKX_AGENT_CLI), 确认它在 PATH 里')
+    return path
 
 
 class SessionCrashed(Exception):
@@ -73,9 +80,9 @@ class AgentSession:
             permission_mode='bypassPermissions',
             env=env,
             hooks=build_hooks(),
-            # 会话记录默认 30 天清理, 常驻会话要长期保留
-            settings=json.dumps({'cleanupPeriodDays': 3650}),
         )
+        if self.cfg.get('agent_cli'):
+            kw['cli_path'] = resolve_agent_cli(self.cfg['agent_cli'])
         if self.cfg.get('agent_model'):
             kw['model'] = self.cfg['agent_model']
         if self.cfg.get('agent_fallback_model'):

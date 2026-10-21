@@ -34,18 +34,25 @@ larkx/
 
 ## 快速开始
 
-需要 Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)。Agent SDK 自带 Claude Code CLI，模型接入沿用当前环境里的 `ANTHROPIC_*` 变量。
+最省事的方式：在仓库目录里打开 Claude Code，说一句"帮我部署 lark-twin"。仓库自带运维 skill（`.claude/skills/lark-twin/`），它会按步骤完成安装、配置、扫码登录、体检和 systemd 托管，需要你做决定或扫码时会停下来问你。
+
+手动部署需要 Linux、Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-uv venv && uv pip install -e '.[dev]'
-cp .env.example .env            # 至少确认 LARKX_TRIGGER_PREFIX 和 LARKX_AGENT_FALLBACK_MODEL
+uv venv && uv pip install -e .
+cp .env.example .env            # 至少设置 LARKX_AGENT_CLI 和 LARKX_AGENT_FALLBACK_MODEL
 .venv/bin/larkx auth qr         # 用飞书 App 扫码登录
-.venv/bin/larkx daemon          # 启动数字人
+.venv/bin/larkx doctor          # 检查登录、配置、模型调用
+.venv/bin/larkx service install && .venv/bin/larkx service start
 ```
 
-然后在飞书里给自己发一条 `/ai 你好` 试试。单账号自测要把 `LARKX_ALLOW_SELF` 设为 `true`，详见 `.env.example`。
+然后在飞书里发一条 `/ai 你好` 试试。如果是自己给自己发，要把 `LARKX_ALLOW_SELF` 设为 `true`。
+
+**数字人用你自己的 coding agent。** `LARKX_AGENT_CLI` 填你平时启动 Claude Code 的命令（`claude`，或者 `ccd` 这类启动器），数字人就用它启动 agent，认证和模型选择都沿用你自己的配置，不用另外配 key。没有这样的命令时，也可以在 `.env` 里直接写 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_AUTH_TOKEN`。目前只支持 Claude Code。
 
 首次启动会生成 `~/.larkx/agent/CLAUDE.md`，这是数字人的人设和行为准则，之后不会被覆盖，可以直接修改。`.claude/skills/larkx/SKILL.md` 跟着代码版本走，每次启动都会同步。
+
+运维命令：`larkx service status|logs|restart|stop`，日志文件在 `~/.larkx/logs/daemon.log`。
 
 ## 控制命令
 
@@ -68,8 +75,10 @@ cp .env.example .env            # 至少确认 LARKX_TRIGGER_PREFIX 和 LARKX_AG
 | `larkx api <请求类型> [JSON]` | 调用任意网关接口，类型名见 `larkx/protocol/proto/cmd_map.json` |
 | `larkx auth qr\|import\|check\|status` | 登录与凭证 |
 | `larkx listen` / `larkx daemon` | 只收消息入库 / 运行数字人 |
+| `larkx service install\|start\|stop\|restart\|status\|logs` | 用 systemd 用户服务托管 daemon |
+| `larkx doctor [--json]` | 检查登录、配置、模型调用、服务状态 |
 
-`lark` 是 `larkx` 的别名，兼容旧脚本。数字人调用时（环境变量 `LARKX_ACTOR=agent`）不能用 `api`、`auth`、`listen`、`daemon`，回复内容也不能以触发前缀开头，否则 CLI 会拒绝。
+`lark` 是 `larkx` 的别名，兼容旧脚本。数字人调用时（环境变量 `LARKX_ACTOR=agent`）不能用 `api`、`auth`、`listen`、`daemon`、`service`、`doctor`，回复内容也不能以触发前缀开头，否则 CLI 会拒绝。
 
 Lark 国际版：登录时加 `--region lark`，之后所有命令自动走凭证里记录的区域。
 

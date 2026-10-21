@@ -49,4 +49,4 @@ larkx download <msg_id> -o <保存路径>
 
 ## 不能用的命令
 
-`larkx api`、`larkx auth`、`larkx listen`、`larkx daemon` 都会被拒绝。需要的能力如果上面没有，就告诉本人。
+`larkx api`、`larkx auth`、`larkx listen`、`larkx daemon`、`larkx service`、`larkx doctor` 都会被拒绝。需要的能力如果上面没有，就告诉本人。

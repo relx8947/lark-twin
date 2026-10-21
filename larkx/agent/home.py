@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,14 @@ def ensure_agent_home(cfg: dict) -> Path:
     claude_md = home / 'CLAUDE.md'
     if not claude_md.exists():
         shutil.copyfile(TEMPLATES / 'CLAUDE.md', claude_md)
+    # 会话记录默认 30 天清理, 常驻会话要长期保留。写在项目配置里而不是 --settings 参数,
+    # 因为 ccd 这类启动器自己也会传 --settings, 两个参数会互相覆盖
+    settings = home / '.claude' / 'settings.json'
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(settings.read_text(encoding='utf-8')) if settings.exists() else {}
+    if data.get('cleanupPeriodDays') != 3650:
+        data['cleanupPeriodDays'] = 3650
+        settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     # skill 是 larkx CLI 的使用手册, 跟着代码版本走, 每次启动都同步
     skill_dir = home / '.claude' / 'skills' / 'larkx'
     skill_dir.mkdir(parents=True, exist_ok=True)

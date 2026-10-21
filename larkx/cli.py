@@ -7,8 +7,8 @@ from .config import is_agent_actor, load_config
 from .protocol import REGIONS, AuthExpired, LarkAuth, LarkClient, get_region
 from .storage import Storage
 
-# 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程
-AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon'}
+# 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务
+AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor'}
 
 
 def _print_json(obj):
@@ -366,6 +366,58 @@ def cmd_daemon(args):
     return _run_logged_in(run_daemon, need_user_id=True)
 
 
+def cmd_service(args):
+    import subprocess
+    from . import service
+    if not service.available():
+        return _fail(args, '本机没有 systemd, 无法托管为服务; 可以直接运行 larkx daemon')
+    if args.action == 'install':
+        path = service.install()
+        print(f'已安装并设为开机自启: {path}\n启动: larkx service start')
+        return 0
+    if args.action == 'uninstall':
+        service.uninstall()
+        print('已停止并卸载服务')
+        return 0
+    if args.action in ('start', 'stop', 'restart'):
+        if not service.unit_path().exists():
+            return _fail(args, '服务未安装, 先运行 larkx service install')
+        r = service.systemctl(args.action, service.UNIT)
+        if r.returncode != 0:
+            return _fail(args, f'systemctl {args.action} 失败: {r.stderr.strip()}')
+    if args.action == 'logs':
+        from .daemon import LOG_PATH
+        if not LOG_PATH.exists():
+            return _fail(args, f'还没有日志文件 {LOG_PATH}, 服务可能从未成功启动; 可以试试 journalctl --user -u {service.UNIT}')
+        cmd = ['tail', '-n', str(args.lines)] + (['-F'] if args.follow else []) + [str(LOG_PATH)]
+        return subprocess.run(cmd).returncode
+    st = service.status()
+    st['stray_daemons'] = service.stray_daemons()
+    if args.json:
+        _print_json(st)
+    else:
+        state = '运行中' if st['active'] else ('已停止' if st['installed'] else '未安装')
+        print(f"{service.UNIT}: {state}  pid={st['main_pid'] or '-'}  开机自启={st['enabled']}")
+        if st['stray_daemons']:
+            print(f"注意: 还有不归 systemd 管的 larkx daemon 进程 {st['stray_daemons']}, 同一账号会出现两个数字人")
+    return 0
+
+
+def cmd_doctor(args):
+    from . import doctor
+    checks = doctor.run(skip_model=args.skip_model)
+    failed = any(c['level'] == doctor.FAIL for c in checks)
+    if args.json:
+        _print_json({'ok': not failed, 'checks': checks})
+    else:
+        mark = {doctor.OK: '✅', doctor.WARN: '⚠️ ', doctor.FAIL: '❌'}
+        for c in checks:
+            print(f"{mark[c['level']]} {c['name']}: {c['detail']}")
+            if c['fix'] and c['level'] != doctor.OK:
+                print(f"    → {c['fix']}")
+    return 1 if failed else 0
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -427,6 +479,16 @@ def main():
     p.set_defaults(fn=cmd_listen)
     p = sub.add_parser('daemon', help='常驻运行数字人: 收消息并交给一直开着的 agent 会话')
     p.set_defaults(fn=cmd_daemon)
+    p = sub.add_parser('service', help='用 systemd 用户服务托管 daemon')
+    p.add_argument('action', choices=['install', 'uninstall', 'start', 'stop', 'restart', 'status', 'logs'])
+    p.add_argument('-n', '--lines', type=int, default=100, help='logs 显示的行数')
+    p.add_argument('-f', '--follow', action='store_true', help='logs 持续输出')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_service)
+    p = sub.add_parser('doctor', help='检查登录、配置、模型调用和服务状态')
+    p.add_argument('--skip-model', action='store_true', help='跳过模型调用检查')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_doctor)
     # 在解析参数之前拦截, 参数写错时也不会绕过
     sub_cmd = next((a for a in sys.argv[1:] if not a.startswith('-')), None)
     if is_agent_actor() and sub_cmd in AGENT_FORBIDDEN:
