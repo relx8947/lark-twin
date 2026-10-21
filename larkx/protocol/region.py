@@ -15,6 +15,8 @@ class Region:
     # 页面 __feishuMeta.teaAppId 的兜底值;登录后会从 messenger 页面抓取实际值存进凭证
     web_app_id: str
     locale: str
+    # 头像等静态图片的 CDN, 不需要登录态。国内版实测可用; 国际版的域名未实测
+    image_cdn: str = ''
 
     @property
     def ticket_url(self) -> str:
@@ -60,10 +62,17 @@ class Region:
     def file_host(self) -> str:
         return f'https://internal-api-lark-file.{self.domain}'
 
+    def avatar_url(self, key: str, size: str = '72x72') -> str:
+        if not key:
+            return ''
+        return f'{self.image_cdn}/static-resource/v1/{key}~?image_size={size}&cut_type=&quality=&format=png&sticker_format=.webp'
+
 
 REGIONS = {
-    'feishu': Region(name='feishu', label='飞书', domain='feishu.cn', web_app_id='161471', locale='zh_CN'),
-    'lark': Region(name='lark', label='Lark', domain='larksuite.com', web_app_id='161471', locale='en_US'),
+    'feishu': Region(name='feishu', label='飞书', domain='feishu.cn', web_app_id='161471', locale='zh_CN',
+                     image_cdn='https://s1-imfile.feishucdn.com'),
+    'lark': Region(name='lark', label='Lark', domain='larksuite.com', web_app_id='161471', locale='en_US',
+                   image_cdn='https://sf16-sg.larksuitecdn.com'),
 }
 
 

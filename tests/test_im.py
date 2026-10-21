@@ -10,21 +10,27 @@ class FakeIMClient:
     """网页版飞书用到的协议接口; 调到 mark_read 就算失败。"""
 
     def __init__(self):
-        self.auth = type('A', (), {'user_id': '100', 'region': type('R', (), {'file_host': 'f.example'})()})()
+        from larkx.protocol import get_region
+        self.auth = type('A', (), {'user_id': '100', 'region': get_region('feishu')})()
         self.sent = []
 
     def api(self, cmd, data=None):
+        if cmd == 'chatters.PullChattersByIdsRequest':
+            people = {'100': {'name': '我本人', 'avatar': {'key': 'a100'}},
+                      '200': {'name': '张三', 'alias': '张三(备注)', 'avatar': {'key': 'a200'}},
+                      '300': {'name': 'Li', 'displayName': {'defaultVal': 'Li', 'i18nVals': {'zh_cn': '李四'}}}}
+            return {'chatters': {u: people[u] for u in data['chatterIds'] if u in people}}
         assert cmd == 'feed.PullFeedCardsRequest'
         return {'cards': [{'id': 1, 'type': 1, 'rankTime': 50}, {'id': 2, 'type': 1, 'rankTime': 40},
                           {'id': 9, 'type': 13, 'rankTime': 30}, {'id': 3, 'type': 1, 'isHide': True}],
                 'chats': {'1': {'name': '项目群', 'type': 2, 'lastMessagePositionBadgeCount': 7, 'readPositionBadgeCount': 4,
                                 'isRemind': False},
-                          '2': {'name': '', 'type': 1, 'lastMessageId': 'm2'}},
+                          '2': {'name': '', 'type': 1, 'lastMessageId': 'm2', 'avatar': {'key': 'c2'}}},
                 'messages': {'m2': {'fromId': '200', 'type': 4, 'content': b''}},
                 'nextCursor': 123}
 
     def get_user_name(self, uid, chat_id):
-        return {'200': '张三', '300': '李四'}.get(str(uid))
+        return None
 
     def get_chat_info(self, chat_id):
         return {'name': '项目群', 'type': 2, 'lastMessagePosition': 100, 'firstChatMessagePosition': 60,
@@ -50,7 +56,7 @@ def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(web, 'TOKEN_PATH', tmp_path / 'web_token')
     monkeypatch.setattr(im, 'client', lambda: fake)
     monkeypatch.setattr(im, '_owner_chat', lambda: 'self')
-    monkeypatch.setattr(im, '_user_names', {})
+    monkeypatch.setattr(im, '_profiles', {})
     monkeypatch.setattr(im, '_p2p_names', {})
     c = TestClient(web.create_app())
     c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
@@ -61,7 +67,9 @@ def test_feed_lists_chats_with_unread(ctx):
     c, _ = ctx
     d = c.get('/api/im/feed').json()
     assert [(i['chat_id'], i['name'], i['kind'], i['unread'], i['muted']) for i in d['items']] == [
-        ('1', '项目群', 'group', 3, True), ('2', '张三', 'p2p', 0, False)]
+        ('1', '项目群', 'group', 3, True), ('2', '张三(备注)', 'p2p', 0, False)]
+    assert d['items'][1]['avatar'].startswith('https://s1-imfile.feishucdn.com/static-resource/v1/c2~')
+    assert c.get('/api/im/me').json()['name'] == '我本人'
     assert d['next_cursor'] == '123'
 
 
@@ -71,7 +79,7 @@ def test_chat_pages_and_marks_own_messages(ctx):
     assert (d['start'], d['end'], d['has_more']) == (91, 100, True)
     last = d['messages'][-1]
     assert last['image_key'] == 'img_k1' and last['content'] == '[图片]' and last['me'] is False
-    assert d['messages'][0]['me'] is True and d['messages'][1]['sender'] == '李四'
+    assert d['messages'][0]['me'] is True and d['messages'][1]['sender'] == '李四' and d['messages'][1]['avatar'] == ''
     older = c.get('/api/im/chat/5?before=61&count=30').json()
     assert (older['start'], older['end'], older['has_more']) == (60, 60, False)
     assert c.get('/api/im/chat/5?after=100').json()['messages'] == []

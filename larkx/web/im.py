@@ -21,9 +21,10 @@ OWNER_CHAT_NAME = '我自己（私聊）'
 MAX_TEXT = 10000
 _lock = threading.Lock()
 _client = {'obj': None, 'mtime': 0.0}
-# 名字只缓存在内存里: 写进 chats 表会刷新 updated_at, 打乱数字人看到的"最近会话"
-_user_names = {}
+# 名字和头像只缓存在内存里: 写进 chats 表会刷新 updated_at, 打乱数字人看到的"最近会话"
+_profiles = {}   # user_id -> {'name', 'avatar'}
 _p2p_names = {}
+_p2p_peers = {}  # 私聊 chat_id -> 对方 user_id
 
 
 class UpstreamError(Exception):
@@ -59,20 +60,55 @@ def _digits(value, what: str) -> str:
     return value
 
 
-def _remember_names(user_ids, st: Storage):
-    missing = [u for u in {str(u) for u in user_ids if u} if u not in _user_names]
-    _user_names.update(st.sender_names(missing))
+def _display_name(chatter: dict, locale: str) -> str:
+    """和客户端一样: 有备注名用备注名, 否则用当前语言的显示名。"""
+    for field in ('alias', 'displayName', 'name'):
+        v = chatter.get(field)
+        if isinstance(v, dict):
+            v = (v.get('i18nVals') or {}).get(locale.lower()) or v.get('defaultVal')
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ''
+
+
+def _people(c: LarkClient, user_ids, st: Storage):
+    """批量查好这些人的名字(有备注名用备注名)和头像; 查不到的退回消息库里见过的名字。"""
+    missing = sorted({str(u) for u in user_ids if u} - set(_profiles))
+    for i in range(0, len(missing), 50):
+        batch = missing[i:i + 50]
+        try:
+            r = c.api('chatters.PullChattersByIdsRequest', {'chatterIds': batch, 'needBotInfo': True}) or {}
+        except Exception as e:
+            logger.warning(f'批量查联系人失败: {e}')
+            r = {}
+        for uid, ch in (r.get('chatters') or {}).items():
+            _profiles[str(uid)] = {'name': _display_name(ch, c.auth.region.locale),
+                                   'avatar': (ch.get('avatar') or {}).get('key') or ''}
+    unnamed = [u for u in missing if not (_profiles.get(u) or {}).get('name')]
+    known = st.sender_names(unnamed)
+    for u in unnamed:
+        _profiles[u] = {'name': known.get(u, ''), 'avatar': (_profiles.get(u) or {}).get('avatar', '')}
+
+
+def _profile(c: LarkClient, user_id, chat_id) -> dict:
+    uid = str(user_id or '')
+    if not uid:
+        return {'name': '', 'avatar': ''}
+    p = _profiles.get(uid)
+    if p is None or not p['name']:
+        # 批量接口没查到(比如部分机器人), 单个再查一次名字
+        p = _profiles[uid] = {'name': c.get_user_name(uid, chat_id) or '', 'avatar': (p or {}).get('avatar', '')}
+    return p
 
 
 def _user_name(c: LarkClient, user_id, chat_id) -> str:
-    uid = str(user_id or '')
-    if not uid:
-        return ''
-    if uid == str(c.auth.user_id):
+    if str(user_id or '') == str(c.auth.user_id):
         return '我'
-    if uid not in _user_names:
-        _user_names[uid] = c.get_user_name(uid, chat_id) or ''
-    return _user_names[uid]
+    return _profile(c, user_id, chat_id)['name']
+
+
+def _avatar(c: LarkClient, key: str) -> str:
+    return c.auth.region.avatar_url(key)
 
 
 def _badge(chat: dict) -> int:
@@ -95,17 +131,27 @@ def _chat_name(c: LarkClient, chat_id: str, chat: dict, known: dict, last_from: 
         return _p2p_names[chat_id]
     name = known.get(chat_id, '')
     me = str(c.auth.user_id)
-    if not name and last_from and last_from != me:
-        name = _user_name(c, last_from, chat_id)
-    if not name:
+    peer = last_from if last_from and last_from != me else ''
+    if not peer:
         last = int(chat.get('lastMessagePosition') or 0)
         if last:
             for m in reversed(_call(c.pull_history, chat_id, range(max(1, last - 9), last + 1))):
                 if m.get('from_id') and str(m['from_id']) != me:
-                    name = _user_name(c, m['from_id'], chat_id)
+                    peer = str(m['from_id'])
                     break
+    if peer:
+        _p2p_peers[chat_id] = peer
+        name = name or _user_name(c, peer, chat_id)
     _p2p_names[chat_id] = name = name or '私聊'
     return name
+
+
+def _chat_avatar(c: LarkClient, chat_id: str, chat: dict) -> str:
+    """会话自己的头像; 私聊没有的话用对方的头像。"""
+    key = (chat.get('avatar') or {}).get('key', '')
+    if not key and chat_id in _p2p_peers:
+        key = _profile(c, _p2p_peers[chat_id], chat_id)['avatar']
+    return _avatar(c, key)
 
 
 def _preview(c: LarkClient, chat_id: str, chat: dict, msg: dict) -> str:
@@ -123,6 +169,9 @@ def _preview(c: LarkClient, chat_id: str, chat: dict, msg: dict) -> str:
 def _clean(summary: str) -> str:
     """去掉摘要里给 agent 用的 key、尺寸等字段, 只留给人看的部分。"""
     summary = summary or ''
+    # 服务端对它认为"旧版客户端看不了"的新消息类型只返回这句英文
+    if "current version doesn't support viewing this message" in summary:
+        return '[暂不支持显示这类消息，请在飞书客户端查看]'
     summary = re.sub(r'^\[(图片|表情包)\].*$', r'[\1]', summary, flags=re.S)
     return re.sub(r'^(\[(?:文件|视频)\] [^(]*?) \(.*$', r'\1', summary, flags=re.S)
 
@@ -140,7 +189,7 @@ def feed(request: Request):
     chats, msgs = r.get('chats') or {}, r.get('messages') or {}
     st = Storage()
     known = {ch.chat_id: ch.name for ch in st.list_chats(limit=2000) if ch.name}
-    _remember_names([m.get('fromId') for m in msgs.values()], st)
+    _people(c, [m.get('fromId') for m in msgs.values()], st)
     items = []
     for card in r.get('cards') or []:
         if decoders.enum_to_int(card.get('type', 0)) != 1 or card.get('isHide'):
@@ -151,6 +200,7 @@ def feed(request: Request):
         items.append({'chat_id': chat_id, 'name': _chat_name(c, chat_id, chat, known, str(last_msg.get('fromId') or '')),
                       'kind': _kind(chat), 'unread': _badge(chat), 'muted': chat.get('isRemind') is False,
                       'time': int(card.get('rankTime') or card.get('updateTime') or 0),
+                      'avatar': _chat_avatar(c, chat_id, chat),
                       'preview': _preview(c, chat_id, chat, last_msg)})
     return {'items': items, 'next_cursor': str(r['nextCursor']) if r.get('nextCursor') else ''}
 
@@ -158,8 +208,9 @@ def feed(request: Request):
 def _message_out(c: LarkClient, m: dict, chat_id: str) -> dict:
     me = str(c.auth.user_id)
     key = extract_resource_key(m.get('msg_type', 0), m.get('content_data') or {}) if m.get('msg_type') == 5 else ''
+    who = _profile(c, m.get('from_id'), chat_id)
     return {'msg_id': str(m.get('msg_id') or ''), 'position': int(m.get('position') or 0),
-            'from_id': str(m.get('from_id') or ''), 'sender': _user_name(c, m.get('from_id'), chat_id),
+            'from_id': str(m.get('from_id') or ''), 'sender': who['name'], 'avatar': _avatar(c, who['avatar']),
             'me': str(m.get('from_id')) == me, 'time': int(m.get('create_time') or 0),
             'type': m.get('msg_type_name', ''), 'content': _clean(m.get('content', '')),
             'root_id': str(m.get('root_id') or ''), 'image_key': key}
@@ -184,12 +235,20 @@ def chat(request: Request):
         end, start = last, max(first, last - count + 1)
     msgs = _call(c.pull_history, chat_id, range(start, end + 1)) if end >= start else []
     st = Storage()
-    _remember_names([m.get('from_id') for m in msgs], st)
+    _people(c, [m.get('from_id') for m in msgs] + [c.auth.user_id], st)
     known = {chat_id: st.get_chat_name(chat_id)}
     return {'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known), 'kind': _kind(info),
+                     'avatar': _chat_avatar(c, chat_id, info),
                      'unread': _badge(info), 'last_position': last, 'member_count': int(info.get('memberCount') or 0)},
             'messages': [_message_out(c, m, chat_id) for m in msgs],
             'start': start, 'end': end, 'has_more': start > first}
+
+
+def me(request: Request):
+    c = client()
+    _people(c, [c.auth.user_id], Storage())
+    p = _profile(c, c.auth.user_id, '')
+    return {'user_id': str(c.auth.user_id), 'name': p['name'], 'avatar': _avatar(c, p['avatar'])}
 
 
 def send(request: Request):
@@ -246,6 +305,7 @@ def media(request: Request):
 
 
 ROUTES = [
+    ('/api/im/me', me, ['GET']),
     ('/api/im/feed', feed, ['GET']),
     ('/api/im/chat/{chat_id}', chat, ['GET']),
     ('/api/im/chat/{chat_id}/send', send, ['POST']),

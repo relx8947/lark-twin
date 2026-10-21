@@ -76,9 +76,17 @@ def api(fn):
 
 # ---- 页面与登录 ----
 
+def _page(name: str) -> Response:
+    return Response((STATIC / name).read_text(encoding='utf-8'), media_type='text/html', headers={'Cache-Control': 'no-cache'})
+
+
 def index(request: Request):
-    return Response((STATIC / 'index.html').read_text(encoding='utf-8'), media_type='text/html',
-                    headers={'Cache-Control': 'no-cache'})
+    """首页是网页版飞书; 控制台在 /console, 也嵌在它的「数字人」标签页里。"""
+    return _page('messenger.html')
+
+
+def console(request: Request):
+    return _page('index.html')
 
 
 def login(request: Request):
@@ -451,7 +459,7 @@ class _JSONBody:
 
 def create_app() -> Starlette:
     routes = [
-        Route('/', index), Route('/login', login, methods=['POST']),
+        Route('/', index), Route('/console', console), Route('/login', login, methods=['POST']),
         Route('/api/overview', overview), Route('/api/activity', activity), Route('/api/conversations', conversations),
         Route('/api/chats', chats), Route('/api/mentions', mentions),
         Route('/api/tasks', tasks, methods=['GET', 'POST']), Route('/api/tasks/{task_id:int}', task_item, methods=['GET', 'DELETE']),
