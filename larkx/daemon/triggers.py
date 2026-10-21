@@ -3,10 +3,11 @@ import re
 from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
 
+from .. import state
 from ..protocol.proto import proto_pb2 as P
 
 CHAT_TYPE_NAMES = {1: 'p2p', 2: 'group', 3: 'topic_group'}
-COMMANDS = ('clear', 'stop')
+COMMANDS = ('clear', 'stop', 'takeover', 'release')
 # 群里常见"@某人 /ai ..."的写法: 判断前缀前先去掉开头的 @提及(可以有多个)
 LEADING_MENTIONS = re.compile(r'^(?:@[^\s/@]+\s*)+')
 
@@ -60,10 +61,10 @@ def addressed_to_me(msg: dict, my_user_id: str) -> bool:
 
 
 def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
-    # 默认丢弃自己账号的消息防自回环; allow_self 放开时靠触发前缀阻断(agent 的回复被 CLI 禁止以前缀开头)
-    if (not cfg.get('allow_self')) and str(msg.get('from_id')) == str(my_user_id):
-        return False
     t = cfg.get('triggers') or {}
+    # 本人的消息只在有触发前缀时才可能触发: 数字人的回复被 CLI 禁止以前缀开头, 这样不会自己触发自己
+    if str(msg.get('from_id')) == str(my_user_id) and not (cfg.get('allow_self') and t.get('prefix')):
+        return False
     content = strip_mentions(msg.get('content'))
     chat_id = str(msg.get('chat_id'))
     sender_id = str(msg.get('from_id'))
@@ -108,6 +109,23 @@ def parse_command(body: str):
         if body.startswith(word) and body[len(word)] in (' ', '\t', '\n'):
             return cmd, body[len(word):].strip()
     return None, body
+
+
+def parse_takeover(rest: str, default_sec: int):
+    """'/takeover 2h 帮我约时间' 的余下部分 → (时长秒数, 目标)。时长省略时用默认值。"""
+    first, _, tail = (rest or '').strip().partition(' ')
+    try:
+        return state.parse_duration(first), tail.strip()
+    except ValueError:
+        return default_sec, (rest or '').strip()
+
+
+def takeover_note(goal: str, until: float) -> str:
+    when = datetime.fromtimestamp(until).strftime('%H:%M')
+    note = (f'你正在替本人接管这个会话(本人授权, 到 {when} 为止), 对方的每条消息都会直接交给你, 不需要 /ai。'
+            '像本人一样自然地回复, 不要提自己是在接管; 需要本人拍板、涉及承诺或敏感信息的事, 告诉对方稍后确认并记进记忆。'
+            '群聊里只在和本人有关、需要本人回应时才回复, 否则直接结束')
+    return note + (f'。本人交代的目标: {goal}' if goal else '')
 
 
 def _ts(msg: dict) -> str:

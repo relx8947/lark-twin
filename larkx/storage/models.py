@@ -95,3 +95,14 @@ class InboxItem(Base):
     payload = Column(Text, default='')
     status = Column(String(16), default='pending', index=True)
 
+
+class Takeover(Base):
+    """接管中的会话: 截止前对方的每条消息都直接交给数字人, 不需要触发前缀。"""
+    __tablename__ = 'takeovers'
+    chat_id = Column(String(32), primary_key=True)
+    created_at = Column(DateTime, default=datetime.now)
+    until = Column(BigInteger, default=0)
+    goal = Column(Text, default='')
+    creator = Column(String(16), default='')
+    active = Column(Integer, default=1)
+

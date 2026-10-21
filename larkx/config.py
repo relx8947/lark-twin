@@ -18,8 +18,9 @@ DEFAULTS = {
     "region": "feishu",
     "storage_url": f"sqlite:///{DB_DEFAULT_PATH}",
     "mark_read": True,
-    # 允许自己账号发的消息也触发数字人(单账号自测用)。安全前提是触发前缀: agent 的回复被 CLI 禁止以前缀开头
-    "allow_self": False,
+    # 本人发的 /ai 消息也交给数字人(本人给它下指令、/stop、/clear、/takeover 都靠这个)。
+    # 没有触发前缀时本人的消息一律不触发, 避免数字人的回复再次触发自己
+    "allow_self": True,
     # 数字人工作目录: CLAUDE.md、记忆、skill 都在这里, agent 只加载这里的配置
     "agent_home": str(DATA_DIR / "agent"),
     # 用哪种 coding agent 驱动数字人: claude(Claude Code) | codex
@@ -57,6 +58,8 @@ DEFAULTS = {
     "inbox_max_age": 7200,
     # 多久核对一次最近活跃会话有没有漏收的消息(秒), 0 关闭
     "catchup_interval": 900,
+    # /ai /takeover 不写时长时, 默认接管多久(秒)
+    "takeover_default": 3600,
     "triggers": {
         "prefix": "",
         "chat_types": [],
@@ -110,7 +113,7 @@ def load_config() -> dict:
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
     cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
     cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
-    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval"):
+    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default"):
         cfg[key] = int(cfg[key])
     for key in ("agent_home", "agent_claude_dir", "agent_codex_dir"):
         cfg[key] = os.path.expanduser(cfg[key])

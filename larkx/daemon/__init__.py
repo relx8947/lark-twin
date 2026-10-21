@@ -17,7 +17,7 @@ from ..protocol import AuthExpired, LarkAuth, LarkClient
 from ..storage import Storage
 from .listener import Listener
 from .triggers import (build_prompt, build_say_prompt, build_system_prompt, build_task_prompt, parse_command,
-                       should_handle, strip_prefix)
+                       parse_takeover, should_handle, strip_prefix, takeover_note)
 
 LOG_PATH = DATA_DIR / 'logs' / 'daemon.log'
 DAEMON_STATE = state.STATE_DIR / 'daemon.json'
@@ -26,6 +26,8 @@ RETRY_NOTE = '上一次处理这条消息时 agent 进程中断过。先用 lark
 RESTART_NOTE = 'daemon 重启前收到了这条消息但没处理完。先用 larkx messages 查一下是否已经回复过, 避免重复回复'
 MSG_FIELDS = ('msg_id', 'chat_id', 'chat_type', 'from_id', 'anchor', 'at_me', 'create_time', 'content')
 CATCHUP_DELAY = 5
+TAKEOVER_SUMMARY = ('接管「{name}」(chat_id={chat}) 已结束({why})。用 larkx messages {chat} --limit 60 回顾接管期间的对话, '
+                    '给本人发一份简短总结: 聊了什么、谈成了什么、还有什么等本人决定或跟进。目标是: {goal}')
 RECONNECT_ALERT = (3, 600)  # 10 分钟内断线 3 次就告警
 FLUSH_PROMPT = ('上下文快满了, 马上会被压缩, 压缩后早期的细节会丢失。现在把这段时间里值得长期记住、但还没写进 memory/ 的内容整理进去'
                 '(人、偏好、约定、待跟进的事、群的背景), 更新 memory/MEMORY.md 索引。不要发飞书消息, 整理完直接结束。')
@@ -103,19 +105,22 @@ class Daemon:
         await asyncio.wrap_future(fut)
 
     async def on_message(self, msg: dict, chat_name: str = '', sender_name: str = ''):
-        if not should_handle(msg, self.cfg, self.auth.user_id):
+        is_owner = str(msg.get('from_id')) == str(self.auth.user_id)
+        chat_id = str(msg['chat_id'])
+        tk = None if is_owner else self.storage.takeover_get(chat_id, time.time())
+        if not tk and not should_handle(msg, self.cfg, self.auth.user_id):
             return
         age = time.time() - float(msg.get('create_time') or time.time())
         if age > self.cfg['inbox_max_age']:
-            logger.info(f'跳过 {age / 60:.0f} 分钟前的触发消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
+            logger.info(f'跳过 {age / 60:.0f} 分钟前的消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
             return
-        if msg.get('msg_id') and self.storage.inbox_seen(msg['msg_id']):
-            return
-        is_owner = str(msg.get('from_id')) == str(self.auth.user_id)
+        if tk:
+            # 接管中的会话: 对方说的每句话都交给数字人, 不看触发规则
+            return await self._enqueue_message(msg, (msg.get('content') or '').strip(), chat_name, sender_name, False,
+                                               note=takeover_note(tk.goal, tk.until))
         body = strip_prefix(msg.get('content'), self.prefix)
-        # 主会话是所有会话共用的, 清空和打断只认本人
+        # 主会话是所有会话共用的, 清空、打断、接管只认本人
         cmd, rest = parse_command(body) if is_owner else (None, body)
-        chat_id = str(msg['chat_id'])
         root_id = msg.get('anchor') or None
         if cmd == 'stop':
             n = self._drain_inbox()
@@ -132,13 +137,55 @@ class Daemon:
             if not rest:
                 await self._reply(chat_id, '✅ 已开启新会话(长期记忆保留)', root_id)
                 return
+        elif cmd == 'takeover':
+            if chat_id == self.notifier.owner_chat():
+                self.notifier.send('要接管哪个会话, 就在那个会话里发 /ai /takeover [时长] [目标]; '
+                                   '或者在这里直接告诉数字人, 比如"接管和张三的私聊两小时, 帮我约下周二开会"')
+                return
+            seconds, goal = parse_takeover(rest, self.cfg['takeover_default'])
+            until = time.time() + seconds
+            self.storage.takeover_start(chat_id, until, goal, 'owner')
+            when = datetime.fromtimestamp(until).strftime('%H:%M')
+            # 确认发到本人私聊, 不在对方看得到的会话里出现
+            self.notifier.send(f'✅ 已接管「{chat_name or chat_id}」到 {when}' + (f', 目标: {goal}' if goal else '')
+                               + '。对方的消息都由数字人回复, 它发的每条都会抄送给你; 在那个会话发 /ai /release 或运行 '
+                               f'larkx takeover stop {chat_id} 结束。')
+            return
+        elif cmd == 'release':
+            if self.storage.takeover_expire(chat_id, time.time()):
+                await self._finish_takeovers()
+            else:
+                self.notifier.send(f'「{chat_name or chat_id}」当前没有在接管')
+            return
         if not rest:
+            return
+        await self._enqueue_message(msg, rest, chat_name, sender_name, is_owner)
+
+    async def _enqueue_message(self, msg, body, chat_name, sender_name, is_owner, note=''):
+        if not body:
+            return
+        if msg.get('msg_id') and self.storage.inbox_seen(msg['msg_id']):
             return
         # 先落库再排队: daemon 中途重启时, 没处理完的消息下次启动接着处理
         slim = {k: msg.get(k) for k in MSG_FIELDS}
-        inbox_id = self.storage.inbox_add(slim['msg_id'] or '', chat_id, {'msg': slim, 'body': rest, 'chat_name': chat_name,
-                                                                            'sender_name': sender_name, 'is_owner': is_owner})
-        await self.inbox.put(self._message_event(slim, rest, chat_name, sender_name, is_owner, inbox_id))
+        inbox_id = self.storage.inbox_add(slim['msg_id'] or '', str(msg['chat_id']),
+                                          {'msg': slim, 'body': body, 'chat_name': chat_name, 'sender_name': sender_name,
+                                           'is_owner': is_owner, 'note': note})
+        await self.inbox.put(self._message_event(slim, body, chat_name, sender_name, is_owner, inbox_id, note=note))
+
+    async def _finish_takeovers(self):
+        """收尾已到期或被本人结束的接管: 让数字人在本人私聊发一份总结。"""
+        owner_chat = self.notifier.owner_chat()
+        for tk, stopped in self.storage.takeover_finish_due(time.time()):
+            why = '本人结束' if stopped else '到期'
+            name = self.storage.get_chat_name(tk.chat_id) or tk.chat_id
+            logger.info(f'接管结束({why}): {name}')
+            if not owner_chat:
+                continue
+            prompt = build_system_prompt(TAKEOVER_SUMMARY.format(name=name, chat=tk.chat_id, why=why, goal=tk.goal or '(无)'))
+            prompt = prompt.replace('<system>', '<task>').replace('</system>', '</task>') + \
+                f"\n\n用 larkx send {owner_chat} - <<'EOF' ... EOF 发给本人。"
+            await self.inbox.put(Event('task', prompt, chat_id=owner_chat, is_owner=True, ref=f'takeover-end:{tk.chat_id}'))
 
     @staticmethod
     def _message_event(msg, body, chat_name, sender_name, is_owner, inbox_id, note=''):
@@ -159,8 +206,9 @@ class Daemon:
                 self.storage.inbox_set(row.id, 'expired')
                 expired += 1
                 continue
+            note = '; '.join(n for n in (p.get('note'), RESTART_NOTE) if n)
             self.inbox.put_nowait(self._message_event(p['msg'], p['body'], p.get('chat_name', ''), p.get('sender_name', ''),
-                                                      p.get('is_owner', False), row.id, note=RESTART_NOTE))
+                                                      p.get('is_owner', False), row.id, note=note))
             restored += 1
         if restored or expired:
             logger.info(f'收件箱: {restored} 条重启前没处理完的消息接着处理, {expired} 条太久远已放弃')
@@ -257,6 +305,7 @@ class Daemon:
                         ev = Event('task', build_task_prompt(task, now), chat_id=task.chat_id, anchor=task.anchor,
                                    is_owner=bool(task.by_owner), ref=f'task#{task.id}', task_id=task.id)
                     await self.inbox.put(ev)
+                await self._finish_takeovers()
                 hour = self.cfg.get('memory_review_hour', -1)
                 st = self._load_state()
                 today = datetime.now().strftime('%Y-%m-%d')

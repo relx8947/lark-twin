@@ -435,6 +435,66 @@ def cmd_recall(args):
     return 0
 
 
+def cmd_takeover(args):
+    import time
+    st = Storage()
+    agent = is_agent_actor()
+    turn = state.read_turn() if agent else None
+    if args.action == 'list':
+        rows = [{'chat_id': t.chat_id, 'chat_name': st.get_chat_name(t.chat_id),
+                 'until': datetime.fromtimestamp(t.until).strftime('%Y-%m-%d %H:%M:%S'), 'goal': t.goal, 'creator': t.creator}
+                for t in st.takeover_list() if t.until > time.time()]
+        if args.json:
+            _print_json(rows)
+        else:
+            for r in rows:
+                print(f"{r['chat_name'] or r['chat_id']}  到 {r['until']}  {r['goal']}")
+            if not rows:
+                print('当前没有接管中的会话')
+        return 0
+    if not args.chat_id:
+        return _fail(args, f'用法: larkx takeover {args.action} <chat_id>')
+    if agent and not (turn and turn['is_owner']) and not (args.action == 'stop' and turn and turn['chat_id'] == args.chat_id):
+        return _fail(args, '接管会话需要本人发起')
+    if args.action == 'stop':
+        ok = st.takeover_expire(args.chat_id, time.time())
+        msg = '已结束接管, daemon 会在本人私聊发一份总结' if ok else '这个会话当前没有在接管'
+    else:
+        try:
+            seconds = state.parse_duration(args.for_) if args.for_ else load_config()['takeover_default']
+        except ValueError as e:
+            return _fail(args, str(e))
+        until = time.time() + seconds
+        st.takeover_start(args.chat_id, until, args.goal or '', 'agent' if agent else 'human')
+        ok, msg = True, f"已接管 {st.get_chat_name(args.chat_id) or args.chat_id} 到 {datetime.fromtimestamp(until):%H:%M}"
+    if args.json:
+        _print_json({'ok': ok, 'message': msg})
+    else:
+        print(msg)
+    return 0 if ok else 1
+
+
+def cmd_mentions(args):
+    import time
+    try:
+        since = time.time() - state.parse_duration(args.since)
+    except ValueError as e:
+        return _fail(args, str(e))
+    auth = LarkAuth()
+    st = Storage()
+    rows = st.mentions(auth.user_id, st.owner_name(auth.user_id), int(since))
+    if args.json:
+        _print_json(rows)
+        return 0
+    for r in rows:
+        when = datetime.fromtimestamp(r['create_time']).strftime('%m-%d %H:%M') if r['create_time'] else ''
+        where = '私聊' if r['kind'] == 'p2p' else f"「{r['chat_name'] or r['chat_id']}」@你"
+        print(f"{when} {'  ' if r['replied'] else '● '}{where} {r['sender_name']}: {(r['content'] or '')[:80]}")
+    if not rows:
+        print('这段时间没有人私聊或 @ 你')
+    return 0
+
+
 def cmd_task(args):
     st = Storage()
     agent = is_agent_actor()
@@ -663,6 +723,17 @@ def main():
     p.add_argument('msg_id')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_recall)
+    p = sub.add_parser('takeover', help='接管会话: 一段时间内对方的消息都交给数字人回复')
+    p.add_argument('action', choices=['start', 'stop', 'list'])
+    p.add_argument('chat_id', nargs='?')
+    p.add_argument('--for', dest='for_', help='接管多久, 如 30m、2h; 默认 LARKX_TAKEOVER_DEFAULT')
+    p.add_argument('--goal', help='交代给数字人的目标, 如"帮我和他约下周二开会"')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_takeover)
+    p = sub.add_parser('mentions', help='最近谁找过你: 别人的私聊、@你的群消息, 以及你之后回没回')
+    p.add_argument('--since', default='24h', help='多久以内, 如 12h、1d')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_mentions)
     p = sub.add_parser('task', help='定时任务: 到点后交给数字人处理')
     p.add_argument('action', choices=['add', 'list', 'cancel'])
     p.add_argument('text', nargs='*', help='add: 任务内容(省略或写 - 时从 stdin 读); cancel: 任务 id')

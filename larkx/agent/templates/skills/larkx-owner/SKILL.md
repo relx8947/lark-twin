@@ -54,6 +54,22 @@ larkx audit --limit 30                            # 通过 larkx 发出的所有
 larkx recall <msg_id>                             # 撤回一条消息（比如数字人误发的那条，msg_id 在 audit 里）
 ```
 
+### 让数字人替你聊一段（接管会话）
+
+```bash
+larkx takeover start <chat_id> --for 2h --goal "帮我和他约下周二下午开会"
+larkx takeover list
+larkx takeover stop <chat_id>     # 提前结束；结束后数字人会在你的私聊里发一份总结
+```
+
+接管期间，对方的每条消息都由数字人回复，它发出的每条也都会抄送到你的私聊。在飞书里也可以操作：在那个会话里发 `/ai /takeover 2h 目标` 开始，发 `/ai /release` 结束。
+
+### 谁找过你
+
+```bash
+larkx mentions --since 24h        # 别人的私聊和 @你 的群消息；● 表示你之后还没在那个会话说过话
+```
+
 数字人的人设和行为准则在 `~/.larkx/agent/CLAUDE.md`，长期记忆在 `~/.larkx/agent/memory/`，这两处都可以直接查看和修改。
 
 ## 服务运维

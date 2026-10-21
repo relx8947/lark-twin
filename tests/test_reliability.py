@@ -158,3 +158,55 @@ def test_reconnect_storm_alerts_once(tmp_path, monkeypatch, fake_client):
         obj._on_disconnect(RuntimeError('boom'))
     alerts = [t for c, t in fake_client.sent if '长连接' in t]
     assert len(alerts) == 1
+
+
+def test_parse_takeover():
+    from larkx.daemon.triggers import parse_takeover
+    assert parse_takeover('2h 帮我约下周二开会', 3600) == (7200, '帮我约下周二开会')
+    assert parse_takeover('帮我约时间', 3600) == (3600, '帮我约时间')
+    assert parse_takeover('', 3600) == (3600, '')
+
+
+def test_takeover_flow(tmp_path, monkeypatch, fake_client):
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    me = fake_client.auth.user_id
+    now = int(time.time())
+    base = {'chat_id': 'p1', 'chat_type': 1, 'create_time': now}
+
+    async def run():
+        await obj.on_message(dict(base, msg_id='c1', from_id=me, content='/ai /takeover 2h 帮我约下周二开会'), '张三', '我')
+        await obj.on_message(dict(base, msg_id='c2', from_id='200', content='周二下午可以吗'), '张三', '张三')
+        await obj.on_message(dict(base, msg_id='c3', from_id=me, content='我自己插一句'), '张三', '我')
+        n_during = obj.inbox.qsize()
+        await obj.on_message(dict(base, msg_id='c4', from_id=me, content='/ai /release'), '张三', '我')
+        return n_during
+
+    assert asyncio.run(run()) == 1                       # 只有对方那条进了队列, 本人插话不触发
+    ev = obj.inbox.get_nowait()
+    assert ev.ref == 'c2' and '接管' in ev.note and '下周二' in ev.note and not ev.is_owner
+    summary = obj.inbox.get_nowait()                     # 结束后让数字人在本人私聊发总结
+    assert summary.kind == 'task' and summary.chat_id == 'self' and summary.is_owner and 'p1' in summary.prompt
+    assert '本人结束' in summary.prompt
+    assert any('已接管' in t for c, t in fake_client.sent if c == 'self')  # 确认只发到本人私聊
+    assert all(c == 'self' for c, _ in fake_client.sent)
+    assert obj.storage.takeover_get('p1', time.time()) is None
+
+
+def test_takeover_in_owner_chat_gives_hint(tmp_path, monkeypatch, fake_client):
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    msg = {'chat_id': 'self', 'chat_type': 1, 'create_time': int(time.time()), 'msg_id': 'h1',
+           'from_id': fake_client.auth.user_id, 'content': '/ai /takeover 1h'}
+    obj.cfg['allow_self'] = True
+    asyncio.run(obj.on_message(msg, '', '我'))
+    assert obj.storage.takeover_list() == [] and '要接管哪个会话' in fake_client.sent[-1][1]
+
+
+def test_mentions_query(tmp_path):
+    st = Storage(f'sqlite:///{tmp_path}/m.db')
+    t = int(time.time())
+    st.save_message({'msg_id': 'a', 'chat_id': 'p1', 'chat_type': 1, 'from_id': '200', 'content': '在吗', 'create_time': t - 100}, sender_name='张三')
+    st.save_message({'msg_id': 'b', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '300', 'content': '@耿宇贺 看下工单', 'create_time': t - 90}, sender_name='李四')
+    st.save_message({'msg_id': 'c', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '300', 'content': '无关的话', 'create_time': t - 80}, sender_name='李四')
+    st.save_message({'msg_id': 'd', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '100', 'content': '好的', 'create_time': t - 50}, sender_name='耿宇贺', direction='out')
+    rows = st.mentions('100', st.owner_name('100'), t - 3600)
+    assert [(r['msg_id'], r['kind'], r['replied']) for r in rows] == [('a', 'p2p', False), ('b', 'at', True)]

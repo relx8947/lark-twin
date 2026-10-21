@@ -22,11 +22,14 @@ def test_prefix_required():
     assert not should_handle(msg('你好'), c, ME)
 
 
-def test_own_message_needs_allow_self():
+def test_own_message_needs_allow_self_and_prefix():
     c = cfg(prefix='/ai')
+    assert should_handle(msg('/ai 你好', from_id=ME), c, ME)          # 默认允许本人下指令
+    c['allow_self'] = False
     assert not should_handle(msg('/ai 你好', from_id=ME), c, ME)
-    c['allow_self'] = True
-    assert should_handle(msg('/ai 你好', from_id=ME), c, ME)
+    c = cfg(prefix='')
+    assert not should_handle(msg('你好', from_id=ME), c, ME)           # 没有前缀时本人的消息一律不触发
+    assert should_handle(msg('你好', from_id='200'), c, ME)
 
 
 def test_group_at_only_and_chat_filters():

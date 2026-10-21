@@ -24,6 +24,20 @@ EOF
 - 只能发到触发这一轮的会话。本人发起时，才能发到其他会话，否则会被拒绝。处理 `<system>` 时不能发消息。
 - 10 分钟内发送的消息数有上限，超过会被拒绝。被拦截的消息会通知本人，在其他会话发出的消息也会抄送给本人。
 
+## 接管会话（只有本人发起时可用）
+
+```bash
+larkx takeover start <chat_id> --for 2h --goal "帮本人和他约下周二开会" --json
+larkx takeover list --json
+larkx takeover stop <chat_id> --json
+```
+
+## 谁找过本人
+
+```bash
+larkx mentions --since 24h --json    # 别人的私聊、@本人的群消息；replied=false 表示本人还没回
+```
+
 ## 撤回
 
 ```bash

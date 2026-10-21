@@ -1,9 +1,9 @@
 import json
 from datetime import datetime
-from sqlalchemy import create_engine, desc
+from sqlalchemy import create_engine, desc, func, or_
 from sqlalchemy.orm import sessionmaker
 from ..config import load_config
-from .models import Action, AgentSession, Base, Chat, InboxItem, Message, Task
+from .models import Action, AgentSession, Base, Chat, InboxItem, Message, Takeover, Task
 
 
 def _json_default(o):
@@ -19,7 +19,8 @@ class Storage:
         self.url = url or cfg['storage_url']
         self.engine = create_engine(self.url, pool_pre_ping=True)
         Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine)
+        # 方法返回的对象在会话关闭后还要读属性, 提交时不让它们过期
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def save_message(self, msg: dict, sender_name='', chat_name='', direction='in') -> bool:
         s = self.Session()
@@ -261,5 +262,86 @@ class Storage:
         s = self.Session()
         try:
             return s.query(InboxItem).filter(InboxItem.status == 'pending').order_by(InboxItem.id).all()
+        finally:
+            s.close()
+
+    def takeover_start(self, chat_id: str, until: int, goal: str = '', creator: str = ''):
+        s = self.Session()
+        try:
+            row = s.get(Takeover, str(chat_id)) or Takeover(chat_id=str(chat_id))
+            row.until, row.goal, row.creator, row.active, row.created_at = int(until), goal or '', creator, 1, datetime.now()
+            s.merge(row)
+            s.commit()
+        finally:
+            s.close()
+
+    def takeover_get(self, chat_id: str, now: float):
+        s = self.Session()
+        try:
+            row = s.get(Takeover, str(chat_id))
+            return row if row and row.active and row.until > now else None
+        finally:
+            s.close()
+
+    def takeover_list(self):
+        s = self.Session()
+        try:
+            return s.query(Takeover).filter(Takeover.active == 1).order_by(Takeover.until).all()  # 不含正在收尾的
+        finally:
+            s.close()
+
+    def takeover_expire(self, chat_id: str, now: float):
+        """本人提前结束: 立即停止接管(active=2), 由 daemon 在下一次调度时收尾。"""
+        s = self.Session()
+        try:
+            row = s.get(Takeover, str(chat_id))
+            if row and row.active == 1:
+                row.until, row.active = int(now), 2
+                s.commit()
+                return True
+            return False
+        finally:
+            s.close()
+
+    def takeover_finish_due(self, now: float):
+        """取出已到期或被本人结束的接管并标记为结束, 每条只会被取出一次。返回 [(接管, 是否本人结束)]。"""
+        s = self.Session()
+        try:
+            rows = s.query(Takeover).filter(Takeover.active.in_((1, 2)), Takeover.until <= now).all()
+            out = [(r, r.active == 2) for r in rows]
+            for r in rows:
+                r.active = 0
+            s.commit()
+            return out
+        finally:
+            s.close()
+
+    def owner_name(self, user_id: str) -> str:
+        s = self.Session()
+        try:
+            row = (s.query(Message.sender_name, func.count()).filter(Message.sender_id == str(user_id),
+                   Message.sender_name.notin_(('', '我'))).group_by(Message.sender_name).order_by(desc(func.count())).first())
+            return row[0] if row else ''
+        finally:
+            s.close()
+
+    def mentions(self, user_id: str, name: str, since_ts: int, limit=200):
+        """since_ts 之后找本人的消息: 别人发来的私聊, 以及 @ 到本人的群消息; 附带本人之后有没有在该会话回过话。"""
+        s = self.Session()
+        try:
+            q = s.query(Message).filter(Message.create_time >= since_ts, Message.sender_id != str(user_id),
+                                        Message.direction == 'in')
+            cond = [Message.chat_type == 1]
+            if name:
+                cond.append(Message.content.like(f'%@{name}%'))
+            rows = q.filter(or_(*cond)).order_by(Message.create_time).limit(limit).all()
+            out = []
+            for r in rows:
+                replied = s.query(Message.id).filter(Message.chat_id == r.chat_id, Message.sender_id == str(user_id),
+                                                     Message.create_time >= r.create_time).first() is not None
+                out.append({'msg_id': r.msg_id, 'chat_id': r.chat_id, 'chat_name': r.chat_name, 'chat_type': r.chat_type,
+                            'sender_name': r.sender_name, 'sender_id': r.sender_id, 'create_time': r.create_time,
+                            'content': r.content, 'kind': 'p2p' if r.chat_type == 1 else 'at', 'replied': replied})
+            return out
         finally:
             s.close()

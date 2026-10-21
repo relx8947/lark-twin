@@ -32,7 +32,7 @@ uv venv && uv pip install -e .
 | `HTTPS_PROXY` / `HTTP_PROXY` | 选 codex 并且需要代理时填。Codex 读的是大写变量，所以要确认大写变量指向一个能访问 OpenAI 的代理 |
 | `LARKX_AGENT_MODEL` | 一般留空，用默认模型。Codex 账号不支持默认模型时再设置 |
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认 `/ai` |
-| `LARKX_ALLOW_SELF` | 只有用户想自己给自己发消息测试时才设为 `true`，而且必须同时设置触发前缀 |
+| `LARKX_ALLOW_SELF` | 默认 `true`：用户自己发的 `/ai` 也会交给数字人，这是给它下指令、`/stop`、`/clear`、`/takeover` 的前提。没有触发前缀时，用户自己的消息一律不触发 |
 | `LARKX_REPLY_SIGNATURE` | 用户希望数字人发出的消息带上 AI 标识时填，比如 `（AI 代回）`。默认不加 |
 
 `.env` 里写了 key 时，执行 `chmod 600 .env`。不要把 key 的内容输出到对话里。
