@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 import requests
 from loguru import logger
-from .config import CREDENTIALS_PATH, DATA_DIR, load_config
+from ..config import CREDENTIALS_PATH, DATA_DIR, load_config
 from .region import Region, get_region
 
 

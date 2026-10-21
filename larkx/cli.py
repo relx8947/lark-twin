@@ -1,18 +1,26 @@
 import argparse
-import asyncio
 import json
 import sys
 from datetime import datetime
 from loguru import logger
-from .agent import AgentDispatcher, get_backend
-from .auth import AuthExpired, LarkAuth
-from .client import LarkClient
-from .region import REGIONS, get_region
+from .config import is_agent_actor, load_config
+from .protocol import REGIONS, AuthExpired, LarkAuth, LarkClient, get_region
 from .storage import Storage
+
+# 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程
+AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon'}
 
 
 def _print_json(obj):
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+def _fail(args, msg: str, code: int=1) -> int:
+    if getattr(args, 'json', False):
+        _print_json({'ok': False, 'error': msg})
+    else:
+        print(msg, file=sys.stderr)
+    return code
 
 
 def cmd_auth(args):
@@ -49,7 +57,7 @@ def cmd_auth(args):
         except ImportError:
             print('需要 qrcode 包: pip install qrcode', file=sys.stderr)
             return 1
-        from .auth import QR_STATUS_NAMES, QrLogin
+        from .protocol.auth import QR_STATUS_NAMES, QrLogin
         from .config import DATA_DIR
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         png_path = DATA_DIR / 'login_qr.png'
@@ -128,7 +136,7 @@ def _interactive_login():
         return auth
     if not sys.stdin.isatty():
         raise AuthExpired(msg)
-    print(f'凭证缺失或已失效(区域: {auth.region.name},切换区域用 lark auth qr --region <feishu|lark>): {msg}', flush=True)
+    print(f'凭证缺失或已失效(区域: {auth.region.name},切换区域用 larkx auth qr --region <feishu|lark>): {msg}', flush=True)
     while True:
         choice = _ask_login_choice()
         if choice == 'qr':
@@ -151,22 +159,38 @@ def _interactive_login():
             raise SystemExit(1)
 
 
+def _read_send_text(args) -> str:
+    # 省略内容或写 - 时从 stdin 读: 多行和含引号、$ 的内容不经过 shell 参数拼接
+    if not args.text or args.text == ['-']:
+        if sys.stdin.isatty():
+            return ''
+        return sys.stdin.read().rstrip('\n')
+    return ' '.join(args.text)
+
+
 def cmd_send(args):
+    text = _read_send_text(args)
+    if not text.strip():
+        return _fail(args, '消息内容为空')
+    prefix = (load_config().get('triggers') or {}).get('prefix') or ''
+    if is_agent_actor() and prefix and text.lstrip().startswith(prefix):
+        # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
+        return _fail(args, f'数字人的回复不能以触发前缀 {prefix} 开头')
     client = LarkClient(LarkAuth())
-    text = ' '.join(args.text)
     msg_id = client.send_msg(text, args.chat_id, root_id=args.root)
-    if msg_id:
-        st = Storage()
-        # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
-        st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    if not msg_id:
+        return _fail(args, '发送失败')
+    st = Storage()
+    # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
+    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    if args.json:
+        _print_json({'ok': True, 'msg_id': msg_id, 'chat_id': args.chat_id})
+    else:
         print(f'已发送 msg_id={msg_id}')
-        return 0
-    print('发送失败', file=sys.stderr)
-    return 1
+    return 0
 
 
 def cmd_config(args):
-    from .config import load_config
     cfg = load_config()
     _print_json(cfg)
     return 0
@@ -175,6 +199,9 @@ def cmd_config(args):
 def cmd_chats(args):
     st = Storage()
     rows = st.list_chats(limit=args.limit)
+    if args.json:
+        _print_json([{'chat_id': c.chat_id, 'name': c.name, 'chat_type': c.chat_type, 'updated_at': c.updated_at} for c in rows])
+        return 0
     for c in rows:
         type_name = {1: '私聊', 2: '群聊', 3: '话题群'}.get(c.chat_type, '?')
         print(f"{c.chat_id}\t{type_name}\t{c.name or '(未命名)'}\t更新于 {c.updated_at}")
@@ -267,7 +294,7 @@ def cmd_history(args):
 
 
 def cmd_download(args):
-    from .media import download, extract_resource_key, message_resource_url
+    from .protocol.media import download, extract_resource_key, message_resource_url
     auth = LarkAuth()
     auth.require_valid()
     file_host = auth.region.file_host
@@ -307,79 +334,18 @@ def cmd_download(args):
     return 0
 
 
-async def _listen(args, auth):
-    client = LarkClient(auth)
-    st = Storage()
-    cfg_agent = args.agent
-    if cfg_agent and (not auth.user_id):
-        auth._fetch_profile()
-        auth.save()
-    if cfg_agent and (not auth.user_id):
-        print('无法确定当前账号 user_id,--agent 存在自回环风险,已拒绝启动。请先 lark auth check 确认凭证有效。', file=sys.stderr)
-        raise SystemExit(1)
-    from .config import load_config
-    cfg = load_config()
-    t = cfg.get('triggers') or {}
-    print('─' * 56, flush=True)
-    print(f"LarkAgentX 启动  region={auth.region.name}  user={auth.user_id}  device={auth.device_id[:12]}…", flush=True)
-    print(f"  存储: {cfg['storage_url']}", flush=True)
-    print(f"  上下文边界: {cfg['context_scope']}  agent后端: {cfg['agent_backend']}{'  (已启用)' if cfg_agent else '  (未启用,仅入库)'}", flush=True)
-    print(f"  触发前缀: {t.get('prefix') or '(全部消息)'}  自定义提示词: {'有' if cfg.get('system_prompt') else '无'}", flush=True)
-    print('─' * 56, flush=True)
-    dispatcher = None
-    if cfg_agent:
-        backend = get_backend()
-        async def reply_fn(chat_id, text, root_id=None):
-            return await asyncio.to_thread(client.send_msg, text, chat_id, root_id)
-        dispatcher = AgentDispatcher(backend, reply_fn)
-    name_cache = {}
-    async def on_message(msg):
-        chat_id = msg['chat_id']
-        chat_type = msg.get('chat_type', 0)
-        is_own = str(msg['from_id']) == str(auth.user_id)
-        sender_key = (msg['from_id'], chat_id)
-        if sender_key not in name_cache:
-            name_cache[sender_key] = await asyncio.to_thread(client.get_user_name, msg['from_id'], chat_id)
-        sender_name = name_cache.get(sender_key) or ''
-        if chat_id not in name_cache:
-            if chat_type in (2, 3):
-                name_cache[chat_id] = await asyncio.to_thread(client.get_group_name, chat_id)
-                if name_cache[chat_id]:
-                    st.update_chat_name(chat_id, name_cache[chat_id], chat_type)
-            elif chat_type == 1 and not is_own and sender_name:
-                name_cache[chat_id] = sender_name
-                st.update_chat_name(chat_id, sender_name, chat_type)
-        chat_name = name_cache.get(chat_id) or ''
-        saved = st.save_message(msg, sender_name=sender_name, chat_name=chat_name,
-                                direction='out' if is_own else 'in')
-        if saved:
-            where = chat_name or chat_id
-            content = msg['content'] or ''
-            shown = content[:80] + ('…' if len(content) > 80 else '')
-            line = f"[{where}] {sender_name or msg['from_id']}: {shown}"
-            if is_own and sys.stderr.isatty():
-                line = f'[36m{line}[0m'
-            logger.info(line)
-            if cfg.get('mark_read') and not is_own and msg.get('position'):
-                await asyncio.to_thread(client.mark_read, chat_id, msg['position'], [msg['msg_id']])
-            if dispatcher:
-                await dispatcher.submit(msg, chat_name=chat_name, sender_name=sender_name, my_user_id=auth.user_id)
-    while True:
-        try:
-            await client.connect_websocket(on_message)
-        except AuthExpired:
-            raise
-        except Exception as e:
-            logger.warning(f'WS 断开,10s 后重连: {e}')
-            await asyncio.sleep(10)
-
-
-def cmd_listen(args):
+def _run_logged_in(fn, need_user_id=False):
     try:
         while True:
             try:
                 auth = _interactive_login()
-                return asyncio.run(_listen(args, auth))
+                if need_user_id and not auth.user_id:
+                    auth._fetch_profile()
+                    auth.save()
+                if need_user_id and not auth.user_id:
+                    print('无法确定当前账号 user_id, 数字人存在自回环风险, 已拒绝启动。请先 larkx auth check 确认凭证有效。', file=sys.stderr)
+                    return 1
+                return fn(auth)
             except AuthExpired as e:
                 if not sys.stdin.isatty():
                     print(str(e), file=sys.stderr)
@@ -390,6 +356,16 @@ def cmd_listen(args):
         return 0
 
 
+def cmd_listen(args):
+    from .daemon import run_listen
+    return _run_logged_in(run_listen)
+
+
+def cmd_daemon(args):
+    from .daemon import run_daemon
+    return _run_logged_in(run_daemon, need_user_id=True)
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -398,7 +374,7 @@ def main():
             pass
     logger.remove()
     logger.add(sys.stderr, level='INFO')
-    parser = argparse.ArgumentParser(prog='lark', description='飞书 / Lark 网页版消息通道 CLI')
+    parser = argparse.ArgumentParser(prog='larkx', description='以本人身份操作飞书 / Lark 的 CLI, 也是数字人的工具')
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('auth', help='凭证管理')
     p.add_argument('action', choices=['status', 'import', 'check', 'qr'])
@@ -408,13 +384,15 @@ def main():
     p.set_defaults(fn=cmd_auth)
     p = sub.add_parser('send', help='发送文本消息')
     p.add_argument('chat_id')
-    p.add_argument('text', nargs='+')
+    p.add_argument('text', nargs='*', help='消息内容; 省略或写 - 时从 stdin 读取')
     p.add_argument('--root', help='话题/线程根消息 id,回复进话题')
+    p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser('config', help='查看生效中的配置(配置项写在 .env 里)')
     p.set_defaults(fn=cmd_config)
     p = sub.add_parser('chats', help='列出本地会话')
     p.add_argument('--limit', type=int, default=50)
+    p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_chats)
     p = sub.add_parser('sessions', help='列出 agent 会话(session 表)')
     p.add_argument('--limit', type=int, default=50)
@@ -445,10 +423,20 @@ def main():
     p.add_argument('--chat', help='chat_id(配合 --key 或加速本地查找)')
     p.add_argument('-o', '--out', required=True, help='保存路径')
     p.set_defaults(fn=cmd_download)
-    p = sub.add_parser('listen', help='常驻接收消息')
-    p.add_argument('--agent', action='store_true', help='接本地 coding agent 自动回复')
+    p = sub.add_parser('listen', help='常驻接收消息, 只入库不接数字人')
     p.set_defaults(fn=cmd_listen)
-    args = parser.parse_args()
+    p = sub.add_parser('daemon', help='常驻运行数字人: 收消息并交给一直开着的 agent 会话')
+    p.set_defaults(fn=cmd_daemon)
+    # 在解析参数之前拦截, 参数写错时也不会绕过
+    sub_cmd = next((a for a in sys.argv[1:] if not a.startswith('-')), None)
+    if is_agent_actor() and sub_cmd in AGENT_FORBIDDEN:
+        sys.exit(_fail(argparse.Namespace(json='--json' in sys.argv), f'数字人不能使用 larkx {sub_cmd}', code=3))
+    args, extra = parser.parse_known_args()
+    if extra and args.cmd == 'send':
+        # send 的内容可以写在选项后面, 如 send <chat> --json -
+        args.text += extra
+    elif extra:
+        parser.error(f'无法识别的参数: {" ".join(extra)}')
     sys.exit(args.fn(args))
 
 

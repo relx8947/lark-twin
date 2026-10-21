@@ -34,6 +34,6 @@ python gen_cmd_table.py       # 生成接口映射表(默认 out/cmd_table.md)
 
 ## 产物用途
 
-- `out/proto/lark_all.proto` → 用 grpcio-tools 1.71.x 编译为 `larkx/proto/lark_all_pb2.py`
-- `work/cmd_map.json` → 按 `lark api` 的格式整理为 `larkx/proto/cmd_map.json`
+- `out/proto/lark_all.proto` → 用 grpcio-tools 1.71.x 编译为 `larkx/protocol/proto/lark_all_pb2.py`
+- `work/cmd_map.json` → 按 `lark api` 的格式整理为 `larkx/protocol/proto/cmd_map.json`
 - `out/cmd_table.md` → 接口速查表（参考）

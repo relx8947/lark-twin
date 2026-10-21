@@ -2,7 +2,7 @@ import os
 import requests
 from loguru import logger
 from .auth import LarkAuth
-from .config import load_config
+from ..config import load_config
 from .region import get_region
 
 

@@ -1,19 +1,6 @@
-from .agent import AgentDispatcher, ClaudeCodeBackend, NullBackend, get_backend
-from .auth import AuthExpired, LarkAuth, QrLogin
-from .client import LarkClient
+from .protocol import AuthExpired, LarkAuth, LarkClient, QrLogin
 from .storage import Storage
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
-__all__ = [
-    "AgentDispatcher",
-    "AuthExpired",
-    "ClaudeCodeBackend",
-    "LarkAuth",
-    "LarkClient",
-    "NullBackend",
-    "QrLogin",
-    "Storage",
-    "get_backend",
-    "__version__",
-]
+__all__ = ["AuthExpired", "LarkAuth", "LarkClient", "QrLogin", "Storage", "__version__"]

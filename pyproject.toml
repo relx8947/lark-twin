@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "larkx"
-version = "2.0.0"
-description = "飞书网页版消息通道 + 本地 coding agent 接入"
-requires-python = ">=3.9"
+version = "3.0.0"
+description = "lark-twin: 以本人身份常驻飞书的数字人(larkx CLI + 常驻 agent 会话)"
+requires-python = ">=3.10"
 dependencies = [
     "loguru==0.7.3",
     "requests==2.31.0",
@@ -17,16 +17,21 @@ dependencies = [
     "qrcode[pil]==8.2",
     "python-dotenv==1.1.0",
     "questionary==2.1.0",
+    "claude-agent-sdk==0.2.168",
 ]
 
 [project.optional-dependencies]
 mysql = ["PyMySQL==1.1.0"]
+dev = ["pytest"]
 
 [project.scripts]
+larkx = "larkx.cli:main"
+# 兼容上游文档和旧脚本里的 lark 命令
 lark = "larkx.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["larkx*"]
 
 [tool.setuptools.package-data]
-"larkx.proto" = ["cmd_map.json"]
+"larkx.protocol.proto" = ["cmd_map.json"]
+"larkx.agent" = ["templates/CLAUDE.md", "templates/skills/larkx/SKILL.md"]
