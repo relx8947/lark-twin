@@ -33,6 +33,7 @@ class ClaudeSession:
         self.claude_dir = Path(cfg['agent_claude_dir'])
         self.session_id = ''
         self.busy = False
+        self.events = []
         self._client = None
         self._queue = None
         self._pump = None
@@ -164,6 +165,7 @@ class ClaudeSession:
                 if interrupted:
                     raise SessionCrashed('中断后 60 秒仍未结束这一轮')
                 logger.warning('这一轮处理超时, 中断')
+                self.events.append(f'一轮处理超过 {self.cfg["agent_turn_timeout"]} 秒, 已中断')
                 interrupted = True
                 await self._client.interrupt()
                 deadline = time.monotonic() + 60
@@ -192,6 +194,7 @@ class ClaudeSession:
             logger.info(f'[agent] 上下文已压缩 {meta.get("pre_tokens")} → {meta.get("post_tokens")} tokens ({meta.get("trigger")})')
         elif m.subtype == 'model_refusal_fallback':
             logger.warning(f'[agent] 主模型被安全策略拦截, 整个会话已切到备用模型: {str(data)[:300]}')
+            self.events.append('主模型被安全策略拦截, 整个会话已切到备用模型。必要时发 /ai /clear 开新会话')
         else:
             logger.debug(f'agent system[{m.subtype}]')
 

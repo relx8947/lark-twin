@@ -4,15 +4,16 @@ import json
 import signal
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from loguru import logger
 
 from .. import state
 from ..agent import SessionCrashed, create_session, ensure_agent_home
 from ..agent.home import commit_agent_home
-from ..config import DATA_DIR, load_config
-from ..protocol import LarkClient
+from ..config import CREDENTIALS_PATH, DATA_DIR, load_config
+from ..notify import Notifier
+from ..protocol import AuthExpired, LarkAuth, LarkClient
 from ..storage import Storage
 from .listener import Listener
 from .triggers import (build_prompt, build_say_prompt, build_system_prompt, build_task_prompt, parse_command,
@@ -22,6 +23,10 @@ LOG_PATH = DATA_DIR / 'logs' / 'daemon.log'
 DAEMON_STATE = state.STATE_DIR / 'daemon.json'
 SCHEDULER_INTERVAL = 15
 RETRY_NOTE = '上一次处理这条消息时 agent 进程中断过。先用 larkx messages 查一下是否已经回复过, 避免重复回复'
+RESTART_NOTE = 'daemon 重启前收到了这条消息但没处理完。先用 larkx messages 查一下是否已经回复过, 避免重复回复'
+MSG_FIELDS = ('msg_id', 'chat_id', 'chat_type', 'from_id', 'anchor', 'at_me', 'create_time', 'content')
+CATCHUP_DELAY = 5
+RECONNECT_ALERT = (3, 600)  # 10 分钟内断线 3 次就告警
 FLUSH_PROMPT = ('上下文快满了, 马上会被压缩, 压缩后早期的细节会丢失。现在把这段时间里值得长期记住、但还没写进 memory/ 的内容整理进去'
                 '(人、偏好、约定、待跟进的事、群的背景), 更新 memory/MEMORY.md 索引。不要发飞书消息, 整理完直接结束。')
 REVIEW_PROMPT = ('每日回顾: 用 larkx chats 和 larkx messages 看一下最近 24 小时本人参与的会话(重点是本人发的消息和找本人的消息), '
@@ -42,6 +47,8 @@ class Event:
     body: str = ''
     chat_name: str = ''
     sender_name: str = ''
+    inbox_id: int = 0
+    note: str = ''
 
 
 class Daemon:
@@ -51,10 +58,13 @@ class Daemon:
         self.client = LarkClient(auth)
         self.storage = Storage()
         self.session = create_session(self.cfg, self.storage)
+        self.notifier = Notifier(self.cfg, self.client)
         self.prefix = (self.cfg.get('triggers') or {}).get('prefix') or ''
         self.inbox = asyncio.Queue()
         self.home = None
         self.loop = None
+        self.listener = None
+        self._disconnects = []
 
     def _banner(self):
         t = self.cfg.get('triggers') or {}
@@ -72,10 +82,13 @@ class Daemon:
         if n:
             logger.info(f'{n} 个上次没跑完的任务已重新排队')
         await self.session.start()
-        workers = [asyncio.create_task(self._consume()), asyncio.create_task(self._schedule())]
-        listener = Listener(self.client, self.storage, self.cfg, self.auth.user_id, on_stored=self._from_listener)
+        self._restore_inbox()
+        self.listener = Listener(self.client, self.storage, self.cfg, self.auth.user_id, on_stored=self._from_listener,
+                                 on_disconnect=self._on_disconnect)
+        workers = [asyncio.create_task(self._consume()), asyncio.create_task(self._schedule()),
+                   asyncio.create_task(self._catch_up_loop())]
         try:
-            await listener.run_forever()
+            await self.listener.run_forever()
         finally:
             for w in workers:
                 w.cancel()
@@ -91,6 +104,12 @@ class Daemon:
 
     async def on_message(self, msg: dict, chat_name: str = '', sender_name: str = ''):
         if not should_handle(msg, self.cfg, self.auth.user_id):
+            return
+        age = time.time() - float(msg.get('create_time') or time.time())
+        if age > self.cfg['inbox_max_age']:
+            logger.info(f'跳过 {age / 60:.0f} 分钟前的触发消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
+            return
+        if msg.get('msg_id') and self.storage.inbox_seen(msg['msg_id']):
             return
         is_owner = str(msg.get('from_id')) == str(self.auth.user_id)
         body = strip_prefix(msg.get('content'), self.prefix)
@@ -115,9 +134,82 @@ class Daemon:
                 return
         if not rest:
             return
-        await self.inbox.put(Event('message', '', chat_id=chat_id, anchor=msg.get('anchor') or '', is_owner=is_owner,
-                                   ref=str(msg.get('msg_id') or ''), msg=msg, body=rest, chat_name=chat_name,
-                                   sender_name=sender_name))
+        # 先落库再排队: daemon 中途重启时, 没处理完的消息下次启动接着处理
+        slim = {k: msg.get(k) for k in MSG_FIELDS}
+        inbox_id = self.storage.inbox_add(slim['msg_id'] or '', chat_id, {'msg': slim, 'body': rest, 'chat_name': chat_name,
+                                                                            'sender_name': sender_name, 'is_owner': is_owner})
+        await self.inbox.put(self._message_event(slim, rest, chat_name, sender_name, is_owner, inbox_id))
+
+    @staticmethod
+    def _message_event(msg, body, chat_name, sender_name, is_owner, inbox_id, note=''):
+        return Event('message', '', chat_id=str(msg['chat_id']), anchor=msg.get('anchor') or '', is_owner=is_owner,
+                     ref=str(msg.get('msg_id') or ''), msg=msg, body=body, chat_name=chat_name, sender_name=sender_name,
+                     inbox_id=inbox_id, note=note)
+
+    def _restore_inbox(self):
+        restored = expired = 0
+        for row in self.storage.inbox_unfinished():
+            try:
+                p = json.loads(row.payload)
+            except json.JSONDecodeError:
+                self.storage.inbox_set(row.id, 'failed')
+                continue
+            age = time.time() - float(p['msg'].get('create_time') or 0)
+            if age > self.cfg['inbox_max_age']:
+                self.storage.inbox_set(row.id, 'expired')
+                expired += 1
+                continue
+            self.inbox.put_nowait(self._message_event(p['msg'], p['body'], p.get('chat_name', ''), p.get('sender_name', ''),
+                                                      p.get('is_owner', False), row.id, note=RESTART_NOTE))
+            restored += 1
+        if restored or expired:
+            logger.info(f'收件箱: {restored} 条重启前没处理完的消息接着处理, {expired} 条太久远已放弃')
+
+    # ---- 漏收检查与断线告警 ----
+
+    async def _catch_up_loop(self):
+        interval = self.cfg.get('catchup_interval') or 0
+        await asyncio.sleep(CATCHUP_DELAY)
+        first = True
+        while True:
+            try:
+                n = await self.catch_up()
+                if n and not first:
+                    logger.warning(f'补收到 {n} 条 WS 没推送的消息')
+                    self.notifier.alert(f'长连接漏推了 {n} 条消息, 已从服务器补收并处理', key='ws-miss', cooldown=3600)
+                elif n:
+                    logger.info(f'补收到 {n} 条 daemon 启动前漏收的消息')
+            except Exception as e:
+                logger.warning(f'核对漏收消息失败: {e!r}')
+            first = False
+            if not interval:
+                return
+            await asyncio.sleep(interval)
+
+    async def catch_up(self) -> int:
+        """对比最近活跃会话在服务端的最新位置, 把本地没收到的消息补收进来(并照常判断是否触发)。"""
+        chats = {c.chat_id: c.last_position or 0 for c in self.storage.recent_chats(datetime.now() - timedelta(days=7))}
+        ids = [cid for cid, pos in chats.items() if pos]
+        new = 0
+        for i in range(0, len(ids), 20):
+            resp = await asyncio.to_thread(self.client.api, 'chats.PullChatsByIdsRequest', {'chatIds': ids[i:i + 20]})
+            for cid, info in ((resp or {}).get('chats') or {}).items():
+                latest = int(info.get('lastMessagePosition') or 0)
+                if latest <= chats.get(cid, latest):
+                    continue
+                positions = list(range(chats[cid] + 1, latest + 1))[-50:]
+                for m in await asyncio.to_thread(self.client.pull_history, cid, positions):
+                    if m.get('from_id') and await self.listener.on_message(m):
+                        new += 1
+        return new
+
+    def _on_disconnect(self, error):
+        now = time.time()
+        times, window = RECONNECT_ALERT
+        self._disconnects = [t for t in self._disconnects if now - t < window] + [now]
+        if len(self._disconnects) >= times:
+            self.notifier.alert(f'飞书长连接 {window // 60} 分钟内断开了 {len(self._disconnects)} 次, 最近一次: {error}',
+                                key='ws-unstable', cooldown=3600)
 
     def _drain_inbox(self) -> int:
         """清空排队的飞书消息; 定时任务和终端指令放回队列。"""
@@ -126,6 +218,8 @@ class Daemon:
             ev = self.inbox.get_nowait()
             if ev.kind == 'message':
                 n += 1
+                if ev.inbox_id:
+                    self.storage.inbox_set(ev.inbox_id, 'cancelled')
             else:
                 kept.append(ev)
         for ev in kept:
@@ -196,7 +290,7 @@ class Daemon:
             state.clear_turn()
 
     async def _handle(self, ev: Event):
-        note, result = '', None
+        note, result = ev.note, None
         for attempt in (1, 2):
             prompt = ev.prompt
             if ev.kind == 'message':
@@ -207,12 +301,27 @@ class Daemon:
             except SessionCrashed as e:
                 logger.error(f'agent 会话中断({attempt}/2): {e}')
                 note = RETRY_NOTE
+        if ev.inbox_id:
+            self.storage.inbox_set(ev.inbox_id, 'done' if result else 'failed')
+        self._report(ev, result)
         if result:
             logger.info(f'[agent] {ev.kind} {ev.ref} 结束: {result.subtype} {result.duration_s:.1f}s 工具调用 {len(result.tools)} 次'
                         + (f' | 输出: {result.text[:200]}' if result.text else ''))
         if ev.task_id:
             self._finish_task(ev, result)
         await asyncio.to_thread(commit_agent_home, self.home, f'{ev.kind} {ev.ref}'.strip())
+
+    def _report(self, ev: Event, result):
+        """把这一轮里值得本人知道的异常发给本人。"""
+        for note in getattr(self.session, 'events', [])[:]:
+            self.notifier.alert(note, key=f'session:{note[:30]}', cooldown=1800)
+        if hasattr(self.session, 'events'):
+            self.session.events.clear()
+        if result is None:
+            self.notifier.alert(f'处理 {ev.kind} {ev.ref} 时 agent 两次中断, 这一条没有处理完', key='crash', cooldown=900)
+        elif result.is_error and result.subtype != 'interrupted' and ev.kind != 'system':
+            self.notifier.alert(f'处理 {ev.kind} {ev.ref} 失败({result.subtype}): {result.text[:150]}',
+                                key=f'error:{result.text[:30]}', cooldown=1800)
 
     async def _maybe_flush_memory(self):
         pressure = await self.session.context_pressure()
@@ -248,10 +357,46 @@ async def _run_until_signal(coro):
         logger.info('收到停止信号, 已退出')
 
 
-def run_daemon(auth):
+def _log_to_file():
     # 自己写日志文件: 有的机器上普通用户读不到自己的 journal
     logger.add(LOG_PATH, level='INFO', rotation='10 MB', retention=5, encoding='utf-8')
+
+
+def run_daemon(auth):
+    _log_to_file()
     return asyncio.run(_run_until_signal(Daemon(auth).run()))
+
+
+def _credentials_mtime() -> float:
+    try:
+        return CREDENTIALS_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return 0
+
+
+def run_service(wait_interval: int = 60):
+    """无人值守运行(systemd): 飞书登录失效时用备用通道告警, 等本人重新登录后自动恢复。"""
+    _log_to_file()
+    cfg = load_config()
+    notifier = Notifier(cfg)
+    while True:
+        auth = LarkAuth()
+        ok, msg = auth.validate(fetch_profile=True)
+        if ok and not auth.user_id:
+            ok, msg = False, '拿不到当前账号的 user_id'
+        if ok:
+            auth.save()
+            try:
+                return asyncio.run(_run_until_signal(Daemon(auth).run()))
+            except AuthExpired as e:
+                msg = str(e)
+        logger.error(f'飞书登录不可用: {msg}')
+        notifier.fallback_alert(f'飞书登录已失效, 数字人暂停工作。在服务器上运行 larkx auth qr 重新登录后会自动恢复。({msg[:120]})',
+                                key='auth-expired', cooldown=6 * 3600)
+        seen = _credentials_mtime()
+        while _credentials_mtime() == seen:
+            time.sleep(wait_interval)
+        logger.info('检测到凭证更新, 重新连接')
 
 
 def run_listen(auth):

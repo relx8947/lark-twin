@@ -26,7 +26,7 @@ larkx send <chat_id> --json - <<'EOF'
 EOF
 ```
 
-回复话题时加上 `--root <话题 id>`。**发送前，要先和本人确认发给谁、发什么**，除非本人已经明确给出了对象和原文。
+回复话题时加上 `--root <话题 id>`。发错了可以用 `larkx recall <msg_id>` 撤回，必须在飞书允许的撤回时限内。**发送前，要先和本人确认发给谁、发什么**，除非本人已经明确给出了对象和原文。
 
 ## 看聊天记录
 
@@ -51,6 +51,7 @@ larkx task add --at "10-22 09:00" --every 1d -   # 周期任务，内容同样�
 larkx task list [--all] [--json]                  # 查看任务，--all 会包括已完成的
 larkx task cancel <id>
 larkx audit --limit 30                            # 通过 larkx 发出的所有消息，标明是本人还是数字人发的，以及是哪一轮
+larkx recall <msg_id>                             # 撤回一条消息（比如数字人误发的那条，msg_id 在 audit 里）
 ```
 
 数字人的人设和行为准则在 `~/.larkx/agent/CLAUDE.md`，长期记忆在 `~/.larkx/agent/memory/`，这两处都可以直接查看和修改。

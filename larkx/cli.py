@@ -1,7 +1,7 @@
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
 from . import state
 from .config import is_agent_actor, load_config
@@ -184,21 +184,37 @@ def cmd_send(args):
     cfg = load_config()
     prefix = (cfg.get('triggers') or {}).get('prefix') or ''
     st = Storage()
-    if is_agent_actor():
-        # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
+    agent = is_agent_actor()
+    turn = state.read_turn() if agent else None
+    client = LarkClient(LarkAuth())
+    if agent:
         from .daemon.triggers import strip_mentions
+        from .notify import Notifier
+        # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
         denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(text).startswith(prefix) else ''
-        denied = denied or state.send_denied(args.chat_id, state.read_turn())
+        denied = denied or state.send_denied(args.chat_id, turn)
+        if not denied:
+            n = st.count_actions('agent', 'send', datetime.now() - timedelta(minutes=10))
+            if n >= cfg['send_rate_limit']:
+                denied = f'数字人 10 分钟内已经发了 {n} 条消息, 达到上限 {cfg["send_rate_limit"]}(LARKX_SEND_RATE_LIMIT)'
         if denied:
             _audit(st, 'send', args.chat_id, text, ok=False, error=denied)
+            name = st.get_chat_name(args.chat_id) or args.chat_id
+            Notifier(cfg, client).alert(f'拦下了数字人发往「{name}」的消息: {denied}\n内容: {text[:200]}',
+                                        key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
             return _fail(args, denied)
         if cfg.get('reply_signature'):
             text = f"{text}\n{cfg['reply_signature']}"
-    client = LarkClient(LarkAuth())
     msg_id = client.send_msg(text, args.chat_id, root_id=args.root)
     _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
     if not msg_id:
         return _fail(args, '发送失败')
+    if agent and cfg.get('mirror'):
+        from .notify import Notifier, should_mirror
+        notifier = Notifier(cfg, client)
+        if should_mirror(args.chat_id, turn, notifier.owner_chat()):
+            name = st.get_chat_name(args.chat_id) or args.chat_id
+            notifier.send(f'📤 数字人在「{name}」发了:\n{text}', fallback=False)
     # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
     st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
     if args.json:
@@ -380,7 +396,10 @@ def cmd_listen(args):
 
 
 def cmd_daemon(args):
-    from .daemon import run_daemon
+    from .daemon import run_daemon, run_service
+    if not sys.stdin.isatty():
+        # 无人值守: 登录失效时告警并等待重新登录, 不让 systemd 反复重启
+        return run_service()
     return _run_logged_in(run_daemon, need_user_id=True)
 
 
@@ -388,6 +407,32 @@ def _task_row(t) -> dict:
     return {'id': t.id, 'kind': t.kind, 'status': t.status, 'due_at': datetime.fromtimestamp(t.due_at).strftime('%Y-%m-%d %H:%M:%S') if t.due_at else '',
             'every_sec': t.every_sec, 'chat_id': t.chat_id, 'anchor': t.anchor, 'by_owner': bool(t.by_owner),
             'creator': t.creator, 'run_count': t.run_count, 'prompt': t.prompt, 'result': t.result}
+
+
+def cmd_recall(args):
+    st = Storage()
+    sent = st.find_action('agent', 'send', args.msg_id) or st.find_action('human', 'send', args.msg_id)
+    if is_agent_actor():
+        turn = state.read_turn()
+        mine = st.find_action('agent', 'send', args.msg_id)
+        if not mine:
+            return _fail(args, '数字人只能撤回自己发出的消息')
+        if not turn or turn['kind'] == 'system' or (not turn['is_owner'] and mine.chat_id != turn['chat_id']):
+            return _fail(args, '只能撤回当前会话里自己发的消息; 其他会话的需要本人发起')
+    client = LarkClient(LarkAuth())
+    chat_id = sent.chat_id if sent else ''
+    try:
+        client.api('messages.DeleteMessageRequest', {'id': str(args.msg_id)})
+    except Exception as e:
+        err = f'撤回失败: {e}'[:300]
+        _audit(st, 'recall', chat_id, f'撤回 {args.msg_id}', msg_id=args.msg_id, ok=False, error=err)
+        return _fail(args, err + '(只能撤回自己发的消息, 且要在飞书允许的撤回时限内)')
+    _audit(st, 'recall', chat_id, f'撤回 {args.msg_id}', msg_id=args.msg_id)
+    if args.json:
+        _print_json({'ok': True, 'msg_id': args.msg_id})
+    else:
+        print(f'已撤回 {args.msg_id}')
+    return 0
 
 
 def cmd_task(args):
@@ -614,6 +659,10 @@ def main():
     p.add_argument('-f', '--follow', action='store_true', help='logs 持续输出')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_service)
+    p = sub.add_parser('recall', help='撤回一条自己发出的消息')
+    p.add_argument('msg_id')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_recall)
     p = sub.add_parser('task', help='定时任务: 到点后交给数字人处理')
     p.add_argument('action', choices=['add', 'list', 'cancel'])
     p.add_argument('text', nargs='*', help='add: 任务内容(省略或写 - 时从 stdin 读); cancel: 任务 id')

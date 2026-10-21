@@ -83,3 +83,15 @@ class Task(Base):
     run_count = Column(Integer, default=0)
     last_run_at = Column(BigInteger, default=0)
     result = Column(Text, default='')
+
+
+class InboxItem(Base):
+    """已收到、还没处理完的触发消息。daemon 重启后据此接着处理, 不丢消息。"""
+    __tablename__ = 'inbox'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.now)
+    msg_id = Column(String(32), default='', index=True)
+    chat_id = Column(String(32), default='')
+    payload = Column(Text, default='')
+    status = Column(String(16), default='pending', index=True)
+

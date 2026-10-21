@@ -97,6 +97,18 @@ def _model_fix(cfg) -> str:
     return '检查 LARKX_CLAUDE_CLI 指定的命令能否正常启动 Claude Code, 或 ANTHROPIC_* 认证是否可用'
 
 
+def check_alert_channel(cfg):
+    import shlex
+    import shutil
+    if not cfg.get('alert_cmd'):
+        return _check('备用告警通道', WARN, '未设置 LARKX_ALERT_CMD: 飞书登录失效时没有办法通知你',
+                      '例: LARKX_ALERT_CMD=lark-cli im +messages-send --as bot --user-id <你的 open_id> --text {text}')
+    exe = shlex.split(cfg['alert_cmd'])[0]
+    if not shutil.which(exe):
+        return _check('备用告警通道', FAIL, f'找不到命令 {exe}', '把 LARKX_ALERT_CMD 里的命令改成完整路径')
+    return _check('备用告警通道', OK, exe)
+
+
 def check_user_skills():
     from .skills import skill_dir
     missing = [t for t in ('claude', 'codex') if not (skill_dir(t) / 'SKILL.md').exists()]
@@ -130,5 +142,6 @@ def run(skip_model=False) -> list:
     if not skip_model and checks[-1]['level'] != FAIL:
         checks.append(check_model(cfg))
     checks.extend(check_service())
+    checks.append(check_alert_channel(cfg))
     checks.append(check_user_skills())
     return checks

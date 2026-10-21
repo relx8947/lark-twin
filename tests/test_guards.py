@@ -23,14 +23,17 @@ def test_send_text_from_stdin(monkeypatch):
     assert cli._read_send_text(_send_args(['你好', '世界'])) == '你好 世界'
 
 
-def test_agent_reply_cannot_start_with_prefix(tmp_path, monkeypatch, capsys):
+def test_agent_reply_cannot_start_with_prefix(tmp_path, monkeypatch, capsys, fake_client):
     from larkx.storage import Storage
     st = Storage(f'sqlite:///{tmp_path}/t.db')
     monkeypatch.setattr(cli, 'Storage', lambda: st)
+    monkeypatch.setattr(cli, 'LarkClient', lambda *a, **k: fake_client)
+    monkeypatch.setattr(cli, 'LarkAuth', lambda *a, **k: None)
     monkeypatch.setenv('LARKX_ACTOR', 'agent')
     monkeypatch.setenv('LARKX_TRIGGER_PREFIX', '/ai')
-    monkeypatch.setattr(cli, 'LarkClient', lambda *a, **k: (_ for _ in ()).throw(AssertionError('不应发送')))
     assert cli.cmd_send(_send_args(['/ai', '回声'])) == 1
     assert '触发前缀' in capsys.readouterr().out
     assert cli.cmd_send(_send_args(['@张三', '/ai', '回声'])) == 1  # 开头带 @ 也会被 daemon 当成触发
     assert [(a.actor, a.ok) for a in st.list_actions()] == [('agent', 0), ('agent', 0)]
+    # 被拦下时只给本人私聊发告警, 不会发到目标会话
+    assert {c for c, _ in fake_client.sent} == {'self'} and '拦下' in fake_client.sent[0][1]

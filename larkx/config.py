@@ -44,6 +44,19 @@ DEFAULTS = {
     "memory_flush_ratio": 0.85,
     # 数字人发出的消息末尾自动加上的签名, 如 "（AI 代回）"; 留空不加
     "reply_signature": "",
+    # 数字人在别的会话以本人名义发消息时, 抄送一份到本人私聊
+    "mirror": True,
+    # 通知和告警发往的会话; 留空 = 本人和自己的私聊
+    "notify_chat": "",
+    # 本人账号用不了(如飞书登录失效)时的备用通知命令, {text} 替换成通知内容; 例:
+    # lark-cli im +messages-send --as bot --user-id ou_xxx --text {text}
+    "alert_cmd": "",
+    # 数字人 10 分钟内最多发多少条消息, 超过后拒绝发送并告警
+    "send_rate_limit": 20,
+    # 重启后补处理的消息最多是多久之前的(秒), 更早的不再回复
+    "inbox_max_age": 7200,
+    # 多久核对一次最近活跃会话有没有漏收的消息(秒), 0 关闭
+    "catchup_interval": 900,
     "triggers": {
         "prefix": "",
         "chat_types": [],
@@ -88,7 +101,7 @@ def load_config() -> dict:
         v = os.environ.get("LARKX_" + key.upper())
         if v:
             cfg[key] = v
-    for key in ("mark_read", "allow_self"):
+    for key in ("mark_read", "allow_self", "mirror"):
         if isinstance(cfg.get(key), str):
             cfg[key] = _as_bool(cfg[key])
     # LARKX_AGENT_CLI 是 claude_cli 的旧名
@@ -97,6 +110,8 @@ def load_config() -> dict:
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
     cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
     cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
+    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval"):
+        cfg[key] = int(cfg[key])
     for key in ("agent_home", "agent_claude_dir", "agent_codex_dir"):
         cfg[key] = os.path.expanduser(cfg[key])
     triggers = dict(DEFAULTS["triggers"])

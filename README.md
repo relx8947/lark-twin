@@ -12,7 +12,8 @@
 - **一个会话**：所有会话共用同一个"你"，重启或崩溃后自动接上之前的对话。
 - **长期记忆**：人物、偏好、约定都会写进记忆，每天回顾一次，每次修改都有 git 记录。
 - **定时跟进**：可以安排"半小时后提醒我""每天早上汇总"这类任务。
-- **有边界**：没有你的指令，不会去别的会话发消息；每次发送都有审计记录。
+- **有边界**：没有你的指令，不会去别的会话发消息。它在外面说的话会实时抄送给你，异常时会告警，每次发送都有审计记录。
+- **不丢消息**：消息先落库再处理；重启后会接着处理没回完的消息，并从服务器补收长连接漏推的消息。
 
 ## 快速开始
 
@@ -46,6 +47,7 @@ larkx send <chat_id> - <<'EOF'   # 以你的身份发消息
 larkx say --wait "…"             # 直接指挥数字人
 larkx task add --in 30m -        # 安排定时任务
 larkx audit                      # 它发过什么
+larkx recall <msg_id>            # 撤回一条
 larkx service status | logs -f   # 运行状态
 ```
 
@@ -62,6 +64,7 @@ larkx service status | logs -f   # 运行状态
 | `LARKX_AGENT_FALLBACK_MODEL` | 用 Claude 时，主模型被安全策略拦截后改用的备用模型 |
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认是 `/ai` |
 | `LARKX_REPLY_SIGNATURE` | 每条回复末尾的标注，比如 `🤖 lark-twin · 数字分身` |
+| `LARKX_ALERT_CMD` | 飞书登录失效时的备用告警命令，比如用 lark-cli 机器人身份发给你 |
 
 数字人的人设在 `~/.larkx/agent/CLAUDE.md`，记忆在 `~/.larkx/agent/memory/`，都可以直接修改。
 

@@ -136,6 +136,7 @@ class CodexSession:
         self.cli = resolve_agent_cli(cfg.get('codex_cli') or 'codex')
         self.session_id = ''
         self.busy = False
+        self.events = []
         self._proc = None
         self._interrupted = False
         self._lock = asyncio.Lock()
@@ -195,6 +196,7 @@ class CodexSession:
             await asyncio.wait_for(read_events(), self.cfg['agent_turn_timeout'])
         except asyncio.TimeoutError:
             logger.warning('这一轮处理超时, 中断')
+            self.events.append(f'一轮处理超过 {self.cfg["agent_turn_timeout"]} 秒, 已中断')
             await self.interrupt()
             try:
                 await asyncio.wait_for(read_events(), 30)

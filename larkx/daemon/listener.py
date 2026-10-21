@@ -12,15 +12,17 @@ class Listener:
     on_message 跑在协议层自己的事件循环线程里(LarkClient.loop), on_stored 需要自己切回调用方的循环。
     """
 
-    def __init__(self, client, storage, cfg: dict, my_user_id: str, on_stored=None):
+    def __init__(self, client, storage, cfg: dict, my_user_id: str, on_stored=None, on_disconnect=None):
         self.client = client
         self.storage = storage
         self.cfg = cfg
         self.my_user_id = str(my_user_id)
         self.on_stored = on_stored
+        self.on_disconnect = on_disconnect
         self.name_cache = {}
 
-    async def on_message(self, msg):
+    async def on_message(self, msg) -> bool:
+        """返回这条消息是否是第一次入库(重复推送、补收到已有的消息返回 False)。"""
         client, st, cache = self.client, self.storage, self.name_cache
         chat_id = msg['chat_id']
         chat_type = msg.get('chat_type', 0)
@@ -41,7 +43,7 @@ class Listener:
         saved = st.save_message(msg, sender_name=sender_name, chat_name=chat_name,
                                 direction='out' if is_own else 'in')
         if not saved:
-            return
+            return False
         content = msg['content'] or ''
         shown = content[:80] + ('…' if len(content) > 80 else '')
         line = f"[{chat_name or chat_id}] {sender_name or msg['from_id']}: {shown}"
@@ -52,6 +54,7 @@ class Listener:
             await asyncio.to_thread(client.mark_read, chat_id, msg['position'], [msg['msg_id']])
         if self.on_stored:
             await self.on_stored(msg, chat_name, sender_name)
+        return True
 
     async def run_forever(self):
         while True:
@@ -61,4 +64,6 @@ class Listener:
                 raise
             except Exception as e:
                 logger.warning(f'WS 断开, 10s 后重连: {e}')
+                if self.on_disconnect:
+                    self.on_disconnect(e)
                 await asyncio.sleep(10)

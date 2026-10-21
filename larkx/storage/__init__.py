@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, desc
 from sqlalchemy.orm import sessionmaker
 from ..config import load_config
-from .models import Action, AgentSession, Base, Chat, Message, Task
+from .models import Action, AgentSession, Base, Chat, InboxItem, Message, Task
 
 
 def _json_default(o):
@@ -205,5 +205,61 @@ class Storage:
             n = s.query(Task).filter(Task.status == 'running').update({'status': 'pending'})
             s.commit()
             return n
+        finally:
+            s.close()
+
+    def count_actions(self, actor: str, action: str, since: datetime) -> int:
+        s = self.Session()
+        try:
+            return s.query(Action).filter(Action.actor == actor, Action.action == action, Action.ok == 1,
+                                          Action.created_at >= since).count()
+        finally:
+            s.close()
+
+    def find_action(self, actor: str, action: str, msg_id: str):
+        s = self.Session()
+        try:
+            return s.query(Action).filter_by(actor=actor, action=action, msg_id=str(msg_id), ok=1).first()
+        finally:
+            s.close()
+
+    def recent_chats(self, since: datetime, limit=30):
+        s = self.Session()
+        try:
+            return s.query(Chat).filter(Chat.updated_at >= since).order_by(desc(Chat.updated_at)).limit(limit).all()
+        finally:
+            s.close()
+
+    def inbox_add(self, msg_id: str, chat_id: str, payload: dict) -> int:
+        s = self.Session()
+        try:
+            row = InboxItem(msg_id=str(msg_id), chat_id=str(chat_id), payload=json.dumps(payload, ensure_ascii=False, default=_json_default))
+            s.add(row)
+            s.commit()
+            return row.id
+        finally:
+            s.close()
+
+    def inbox_seen(self, msg_id: str) -> bool:
+        s = self.Session()
+        try:
+            return s.query(InboxItem).filter_by(msg_id=str(msg_id)).first() is not None
+        finally:
+            s.close()
+
+    def inbox_set(self, item_id: int, status: str):
+        s = self.Session()
+        try:
+            row = s.get(InboxItem, item_id)
+            if row:
+                row.status = status
+                s.commit()
+        finally:
+            s.close()
+
+    def inbox_unfinished(self):
+        s = self.Session()
+        try:
+            return s.query(InboxItem).filter(InboxItem.status == 'pending').order_by(InboxItem.id).all()
         finally:
             s.close()
