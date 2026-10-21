@@ -3,10 +3,12 @@
 会话列表用 feed.PullFeedCardsRequest, 消息用 PullMessagesByPositionsRequest, 都是只读接口;
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
 发消息也不改已读: 普通发送会被服务端把会话之前的消息都算作已读, 所以有未读时改用"回复话题并同时发送到会话"
-(见 LarkClient.send_msg 的 keep_unread), 对方在主会话照常看到, 已读位置不动。
+(见 LarkClient.send_msg 的 keep_unread), 对方在主会话照常看到, 已读位置不动。被回复的那条会变成已读,
+所以默认挂在自己发的消息下面; 发出后再逐条核对别人的未读消息, 有变成已读的如实告诉页面。
 """
 import re
 import threading
+import time
 
 from loguru import logger
 from starlette.requests import Request
@@ -20,6 +22,8 @@ from ..storage import Storage
 
 OWNER_CHAT_NAME = '我自己（私聊）'
 MAX_TEXT = 10000
+# 被回复的那条要过一会儿才在服务端变成已读(实测 0.3 秒内), 发出后等这么久再核对
+READ_CHECK_DELAY = 1.5
 _lock = threading.Lock()
 _client = {'obj': None, 'mtime': 0.0}
 # 名字和头像只缓存在内存里: 写进 chats 表会刷新 updated_at, 打乱数字人看到的"最近会话"
@@ -263,20 +267,48 @@ def send(request: Request):
         raise ValueError(f'消息太长(超过 {MAX_TEXT} 字)')
     root_id = _digits(b['root_id'], 'root_id') if b.get('root_id') else None
     read, last = _call(c.read_state, chat_id)
-    # 网页版一律匿名发送: 有未读时挂在对方最近一条消息下面, 同时发送到会话, 已读位置不动
+    # 发送前记下别人发的、对我还是未读的消息, 发出后逐条核对; 显式回复的那条变成已读是"回复"本身的意思, 不算
+    watch = []
+    if read < last:
+        try:
+            watch = [i for i in _others_unread(c, chat_id, read, last) if i != root_id]
+        except Exception as e:
+            logger.warning(f'发送前查询未读消息失败: {e}')
+            watch = None
+    # 网页版一律匿名发送: 有未读时挂在自己发的消息下面, 同时发送到会话, 已读位置不动
     msg_id = _call(c.send_msg, text, chat_id, root_id=root_id, keep_unread=True)
     Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''), content=text,
                          ok=1 if msg_id else 0, error='' if msg_id else '发送失败', turn_kind='web')
     if not msg_id:
         raise UpstreamError('发送失败: 飞书没有确认收到这条消息')
-    # 发前有未读、发后已读位置却前进了, 说明这类会话不支持匿名发送, 如实告诉页面
+    kept, newly = _check_unread(c, chat_id, read, watch) if read < last else (True, 0)
+    if kept is False:
+        logger.warning(f'匿名发送后会话 {chat_id} ' + (f'有 {newly} 条别人的消息变成了已读' if newly else '的已读位置前进了'))
+    return {'ok': True, 'msg_id': str(msg_id), 'kept_unread': kept, 'newly_read': newly}
+
+
+def _others_unread(c: LarkClient, chat_id: str, read: int, last: int) -> list:
+    """未读区间(只看最近 100 条)里别人发的、目前对我仍是未读的消息 id。"""
+    me = str(c.auth.user_id)
+    ids = [str(m['msg_id']) for m in c.pull_history(chat_id, range(max(read + 1, last - 99), last + 1))
+           if m.get('msg_id') and str(m.get('from_id')) != me and m.get('msg_type') != 6]
+    status = c.my_read_status(ids) if ids else {}
+    return [i for i in ids if status.get(i) is False]
+
+
+def _check_unread(c: LarkClient, chat_id: str, read: int, watch):
+    """发出后核对: 返回 (是否仍保持未读, 变成已读的条数); 核对不了时第一项是 None。"""
+    time.sleep(READ_CHECK_DELAY)
     try:
-        moved = read < last and c.read_state(chat_id)[0] > read
-    except Exception:
-        moved = False
-    if moved:
-        logger.warning(f'匿名发送后会话 {chat_id} 的已读位置仍然前进了')
-    return {'ok': True, 'msg_id': str(msg_id), 'kept_unread': not moved}
+        moved = c.read_state(chat_id)[0] > read
+        after = c.my_read_status(watch) if watch else {}
+    except Exception as e:
+        logger.warning(f'发送后核对已读状态失败: {e}')
+        return None, 0
+    newly = sum(1 for i in watch or [] if after.get(i))
+    if watch is None and not moved:
+        return None, 0
+    return not (moved or newly), newly
 
 
 def search(request: Request):

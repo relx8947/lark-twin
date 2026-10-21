@@ -20,7 +20,7 @@ class FakeClient:
         self.auth = type('A', (), {'user_id': user_id})()
         self._owner_chat = owner_chat
 
-    def send_msg(self, text, chat_id, root_id=None, keep_unread=False, anchor_id=None):
+    def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text))
         return f'm{len(self.sent)}'
 

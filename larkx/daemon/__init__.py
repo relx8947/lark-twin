@@ -129,13 +129,13 @@ class Daemon:
                 parts = ['⏹ 已停止当前任务' if stopped else '⏹ 当前没有在处理的任务']
                 if n:
                     parts.append(f'清空 {n} 条排队消息')
-                await self._reply(chat_id, ', '.join(parts), root_id, msg.get('msg_id'))
+                await self._reply(chat_id, ', '.join(parts), root_id)
                 return
         elif cmd == 'clear':
             self._drain_inbox()
             await self.session.reset()
             if not rest:
-                await self._reply(chat_id, '✅ 已开启新会话(长期记忆保留)', root_id, msg.get('msg_id'))
+                await self._reply(chat_id, '✅ 已开启新会话(长期记忆保留)', root_id)
                 return
         elif cmd == 'takeover':
             if chat_id == self.notifier.owner_chat():
@@ -296,10 +296,9 @@ class Daemon:
             self.inbox.put_nowait(ev)
         return n
 
-    async def _reply(self, chat_id, text, root_id=None, anchor_id=None):
+    async def _reply(self, chat_id, text, root_id=None):
         text = with_signature(text, self.cfg)
-        msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id,
-                                         self.cfg.get('keep_unread', True), anchor_id)
+        msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id, self.cfg.get('keep_unread', True))
         if not msg_id:
             logger.error(f'控制回执发送失败 [{chat_id}]: {text}')
 

@@ -288,6 +288,8 @@ function chatImage(m) {
 function setReply(m) {
   S.replyTo = { root_id: m.root_id || m.msg_id, sender: m.me ? '我' : m.sender, content: (m.content || '').slice(0, 80) };
   renderReply(); S.input && S.input.focus();
+  // 被回复的那条(话题的根消息)会被服务端标为已读; 回复自己发的不涉及别人
+  if (!m.me || m.root_id) toast('回复某条消息会让那一条对对方显示已读，其他消息不受影响');
 }
 
 function renderReply() {
@@ -323,7 +325,8 @@ async function sendMsg() {
   const r = await act(() => api(`/api/im/chat/${S.chatId}/send`, { method: 'POST', body: { text, root_id: S.replyTo ? S.replyTo.root_id : null } }));
   input.disabled = false;
   if (!r) return;
-  if (!r.kept_unread) toast('这次发送让会话变成了已读：这类会话不支持匿名发送');
+  if (r.kept_unread === false) toast(r.newly_read ? `已发出，但有 ${r.newly_read} 条别人的消息变成了已读` : '已发出，但会话的已读位置前进了：这类会话不支持匿名发送');
+  else if (r.kept_unread == null) toast('已发出，但没能核对别人的消息是否仍是未读');
   input.value = ''; S.grow(); S.replyTo = null; renderReply(); input.focus();
   await pollChat(S.seq);
   S.body.scrollTop = S.body.scrollHeight;

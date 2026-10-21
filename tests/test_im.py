@@ -13,6 +13,11 @@ class FakeIMClient:
         from larkx.protocol import get_region
         self.auth = type('A', (), {'user_id': '100', 'region': get_region('feishu')})()
         self.sent = []
+        self.read_pos = 95
+        self.done = set()     # 对我已是"已读"的消息
+        self.leak = []        # 发出时会被连带标成已读的消息
+        self.advance = False  # 发出时已读位置前进
+        self.status_error = False
 
     def api(self, cmd, data=None):
         if cmd == 'chatters.PullChattersByIdsRequest':
@@ -37,17 +42,26 @@ class FakeIMClient:
                 'lastMessagePositionBadgeCount': 3, 'readPositionBadgeCount': 3, 'memberCount': 5}
 
     def pull_history(self, chat_id, positions):
-        return [{'msg_id': f'id{p}', 'position': p, 'from_id': '100' if p % 2 else '300', 'create_time': p,
+        return [{'msg_id': str(p), 'position': p, 'from_id': '100' if p % 2 else '300', 'create_time': p,
                  'msg_type': 5 if p == 100 else 4, 'msg_type_name': 'IMAGE' if p == 100 else 'TEXT',
                  'content': '[图片] imageKey=k1 (1x1)' if p == 100 else f'第{p}条',
                  'content_data': {'image': {'origin': {'key': 'img_k1'}}} if p == 100 else None} for p in positions]
 
-    def send_msg(self, text, chat_id, root_id=None, keep_unread=False, anchor_id=None):
+    def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text, root_id, keep_unread))
+        # 和服务端一样: 被回复的那条变成已读
+        self.done.update(self.leak + ([root_id] if root_id else []))
+        if self.advance:
+            self.read_pos = 100
         return '777'
 
     def read_state(self, chat_id):
-        return (95, 100)
+        return (self.read_pos, 100)
+
+    def my_read_status(self, ids):
+        if self.status_error:
+            raise RuntimeError('boom')
+        return {i: i in self.done for i in ids}
 
     def mark_read(self, *a, **k):
         raise AssertionError('网页版飞书不能标已读')
@@ -61,6 +75,7 @@ def ctx(tmp_path, monkeypatch):
     monkeypatch.setattr(im, '_owner_chat', lambda: 'self')
     monkeypatch.setattr(im, '_profiles', {})
     monkeypatch.setattr(im, '_p2p_names', {})
+    monkeypatch.setattr(im, 'READ_CHECK_DELAY', 0)
     c = TestClient(web.create_app())
     c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
     return c, fake
@@ -94,11 +109,36 @@ def test_send_is_audited_as_owner(ctx):
     assert c.post('/api/im/chat/5/send', json={'text': '  '}).status_code == 400
     assert c.post('/api/im/chat/5/send', json={'text': 'hi', 'root_id': 'x'}).status_code == 400
     r = c.post('/api/im/chat/5/send', json={'text': '收到\n', 'root_id': '42'})
-    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True} and fake.sent == [('5', '收到', '42', True)]
+    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0} and fake.sent == [('5', '收到', '42', True)]
     a = Storage().list_actions()[-1]
     assert (a.actor, a.action, a.chat_id, a.msg_id, a.turn_kind) == ('human', 'send', '5', '777', 'web')
     # 改动类请求一样要带 X-Larkx
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}, headers={'X-Larkx': ''}).status_code == 403
+
+
+def test_send_reports_others_messages_turned_read(ctx):
+    c, fake = ctx
+    send = lambda **b: c.post('/api/im/chat/5/send', json={'text': 'hi', **b}).json()
+    # 未读区间 96~100 里别人发的是 96、98、100; 发出后 98 变成了已读
+    fake.leak = ['98']
+    r = send()
+    assert (r['kept_unread'], r['newly_read']) == (False, 1)
+    # 98 发送前就已经是已读, 不再算; 96 是显式回复的
+    assert send(root_id='96')['kept_unread'] is True
+    # 显式回复的那条变成已读是"回复"本身的意思, 不算泄露
+    fake.leak, fake.done = [], set()
+    assert send(root_id='98') == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
+    fake.done = set()
+    fake.leak = ['96', '100']
+    assert send(root_id='98')['newly_read'] == 2
+
+
+def test_send_reports_read_position_moved_and_unknown(ctx):
+    c, fake = ctx
+    fake.status_error = True
+    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json()['kept_unread'] is None
+    fake.status_error, fake.advance = False, True
+    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': False, 'newly_read': 0}
 
 
 def test_media_only_renders_plain_images(ctx, monkeypatch):

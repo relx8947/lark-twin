@@ -145,17 +145,22 @@ class LarkClient:
         resp.raise_for_status()
         return resp.content
 
-    def send_msg(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False, anchor_id: str=None):
+    def send_msg(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False):
         """返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
 
         keep_unread: 会话里还有未读时, 以"回复话题并同时发送到会话"的方式发出, 对方在主会话照常看到这条消息,
-        但本人的已读位置不动, 未读消息仍是未读、对方也看不到已读。回复哪条: root_id > anchor_id > 对方最近的一条。
+        但本人的已读位置不动。被回复的那条会被标成已读, 所以没指定 root_id 时挂在不会泄露的消息下面
+        (见 _unread_anchor); 指定了 root_id 就回复那条, 那一条对对方显示已读, 这是"回复"本身的意思。
         """
         chat_id = str(chat_id)
         thread_chat = (bool(root_id) or keep_unread) and self.is_thread_chat(chat_id)
         sync = False
         if keep_unread and not thread_chat:
-            root_id = root_id or self._unread_anchor(chat_id, anchor_id)
+            if not root_id:
+                root_id, leaks = self._unread_anchor(chat_id)
+                if leaks:
+                    logger.warning(f'会话 {chat_id} 最近没有自己发的或已读过的消息可挂靠, 这次挂在对方的 {root_id} 下面, '
+                                   '这一条会对对方显示已读')
             sync = bool(root_id)
         pkt = builders.build_send_message_packet(text, chat_id, generate_long_request_id(), root_id=root_id,
                                                  thread_chat=thread_chat, sync_to_chat=sync)
@@ -169,8 +174,9 @@ class LarkClient:
         except Exception as e:
             logger.error(f'服务端已接受发送请求,但响应解析失败,无法确认是否发出: {e}')
             return None
-        if not msg_id:
-            logger.error('服务端已接受发送请求,但响应里没有消息 id,无法确认是否发出')
+        if not msg_id or msg_id.startswith('-'):
+            # 拒收时(比如回复了不能当话题根的消息)返回的 id 是 -1, 主会话里也没有这条
+            logger.error(f'服务端已接受发送请求,但响应里没有有效的消息 id({msg_id or "空"}),消息没有发出')
             return None
         return msg_id
 
@@ -179,18 +185,53 @@ class LarkClient:
         info = self.get_chat_info(chat_id) or {}
         return int(info.get('readPosition') or 0), int(info.get('lastMessagePosition') or 0)
 
-    def _unread_anchor(self, chat_id: str, anchor_id: str=None) -> str:
-        """会话里有未读时, 匿名发送要挂在哪条消息下面; 没有未读返回空, 照常发送就不会改变任何已读状态。"""
+    def my_read_status(self, message_ids) -> dict:
+        """本人是否已读这些消息, {msg_id: bool}。只读查询, 不改变已读状态。"""
+        ids = [str(m) for m in message_ids if m]
+        out = {}
+        for i in range(0, len(ids), 50):
+            r = self.api('messages.PullMessageMeReadStateRequest', {'messageIds': ids[i:i + 50]}) or {}
+            out.update({str(k): bool(v) for k, v in (r.get('readStatus') or {}).items()})
+        return out
+
+    def _unread_anchor(self, chat_id: str):
+        """会话里有未读时, 匿名发送挂在哪条消息下面: 返回 (msg_id, 这次是否会让一条别人的未读消息变成已读)。
+
+        实测被回复的那条会被服务端标成"我已读", 所以依次找: 本人自己最近发的一条 > 已经是"我已读"的最近一条
+        (已读位置以下的也要逐条查, 实测有的仍是未读) > 实在没有才挂在对方最近的一条下面, 这一条会泄露已读。
+        没有未读返回空, 照常发送不会改变任何已读状态。
+        """
         read, last = self.read_state(chat_id)
         if read >= last:
-            return ''
-        if anchor_id:
-            return str(anchor_id)
+            return '', False
         me = str(self.auth.user_id)
-        recent = self.pull_history(chat_id, range(max(1, last - 19), last + 1))
-        others = [m for m in recent if m.get('msg_id') and str(m.get('from_id')) != me and m.get('msg_type') != 6]
-        pick = (others or [m for m in recent if m.get('msg_id')] or [{}])[-1]
-        return str(pick.get('msg_id') or '')
+
+        def pull(start, end):
+            return [m for m in self.pull_history(chat_id, range(max(1, start), end + 1))
+                    if m.get('msg_id') and m.get('msg_type') != 6 and not m.get('recalled')]
+
+        def target(m):
+            # "同时发送到会话"在主会话的那份不能当话题根(服务端拒收), 要挂在它所在话题的根上
+            return str(m.get('sync_root_id') or m['msg_id'])
+
+        # 本身是回复的(带 rootId)不挑, 免得连带把它回复的那条标成已读。自己那份的话题根是上次挂靠的那条, 已经读过
+        recent = pull(last - 49, last)
+        own = [m for m in recent if str(m.get('from_id')) == me and not m.get('root_id')]
+        if own:
+            return target(own[-1]), False
+        # 最近没有自己发的: 连同已读位置附近的几条, 挑已经是"我已读"的; 别人"同时发送到会话"的话题根不一定读过, 不挑
+        cands = (pull(read - 19, read) if 0 < read < last - 49 else []) + recent
+        plain = [m for m in cands if not m.get('root_id') and (str(m.get('from_id')) == me or not m.get('sync_root_id'))]
+        try:
+            done = self.my_read_status([m['msg_id'] for m in plain])
+        except Exception as e:
+            logger.warning(f'查询消息已读状态失败, 按已读位置估计: {e}')
+            done = {str(m['msg_id']): int(m.get('position') or 0) <= read for m in plain}
+        safe = [m for m in plain if str(m.get('from_id')) == me or done.get(str(m['msg_id']))]
+        if safe:
+            return target(safe[-1]), False
+        pick = ([m for m in cands if str(m.get('from_id')) != me] or cands)[-1:]
+        return (target(pick[0]), True) if pick else ('', False)
 
     def search(self, query: str):
         pkt = builders.build_search_packet(query, generate_long_request_id(), self.auth.region.locale)
@@ -271,7 +312,7 @@ class LarkClient:
             summary, data = decoders.decode_message_content(message_type, v.get('content', b''))
             root_id = v.get('rootId') or ''
             scope, anchor = decoders.resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '', thread_chat)
-            msg = {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type, 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or int(pos_key), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data}
+            msg = {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type, 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or int(pos_key), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data, 'recalled': v.get('status') == 2 or bool(v.get('isRemoved')), 'sync_root_id': str(v.get('syncToChatThreadRootId') or '')}
             out.append(msg)
             if save_storage is not None:
                 try:
