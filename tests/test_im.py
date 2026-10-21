@@ -17,6 +17,8 @@ class FakeIMClient:
         from larkx.protocol import get_region
         self.auth = type('A', (), {'user_id': '100', 'region': get_region('feishu')})()
         self.sent = []
+        self.messages = []    # 发出的消息描述(builders 的格式)
+        self.relay_fails = False  # 经本人私聊转发不成(网页版这时报发送失败)
         self.read_pos = 95
         self.done = set()     # 对我已是"已读"的消息
         self.leak = []        # 发出时被连带标成已读的消息(经本人私聊转发不该有, 用来验证核对逻辑)
@@ -68,13 +70,21 @@ class FakeIMClient:
         self.pulled.append(('ids', sorted(ids), command_version))
         return [self.by_id[i] for i in ids if i in self.by_id]
 
-    def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
-        self.sent.append((chat_id, text, root_id, keep_unread))
+    def send_message(self, msg, chat_id, root_id=None, keep_unread=False, fallback=True):
+        from larkx.protocol.proto import builders
+        assert fallback is False, '网页版转发不成不能退回普通发送'
+        if self.relay_fails and self.relays(chat_id, *self.read_state(chat_id), root_id):
+            return None
+        self.sent.append((chat_id, builders.plain_text(msg), root_id, keep_unread))
+        self.messages.append(msg)
         # 和服务端一样: 话题回复时被回复的那条变成已读; 经本人私聊转发不动已读位置
         self.done.update(self.leak + ([root_id] if root_id else []))
         if self.advance:
             self.read_pos = 100
         return '777'
+
+    def relays(self, chat_id, read, last, root_id=None):
+        return not root_id and read < last and str(chat_id) != 'self'
 
     def read_state(self, chat_id):
         return (self.read_pos, 100)
@@ -164,7 +174,7 @@ def test_send_reports_fallback_and_unknown(ctx):
     assert fake.sent[-1] == ('5', 'hi', None, True)
     fake.status_error = True
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json()['kept_unread'] is None
-    # 转发不成退回普通发送: 本人的未读被清掉, 如实告诉页面
+    # 万一发出后本人的已读位置还是前进了(比如服务端行为变了), 如实告诉页面
     fake.status_error, fake.advance = False, True
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': False, 'newly_read': 0}
 

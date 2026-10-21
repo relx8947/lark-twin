@@ -154,27 +154,38 @@ class LarkClient:
         return resp.content
 
     def send_msg(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False):
-        """返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
+        """发一条纯文字消息, 见 send_message。"""
+        return self.send_message({'kind': 'text', 'text': text}, chat_id, root_id=root_id, keep_unread=keep_unread)
+
+    def send_message(self, msg: dict, chat_id: str, root_id: str=None, keep_unread: bool=False, fallback: bool=True):
+        """发一条消息(文字、带 @ 的文字、图片、文件, 格式见 builders 里的消息描述)。
+        返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
 
         普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执。
         root_id 是话题回复, 被回复的那条会对对方显示已读, 这是"回复"本身的意思。
         keep_unread: 会话里还有本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条
         普通消息, 本人的已读位置不动; 转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
+        fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读(网页版用)。
+        各种类型的消息都走同一套流程。
         """
         chat_id = str(chat_id)
         if keep_unread and not root_id:
             read, last = self.read_state(chat_id)
-            # 本人私聊里只有本人, 普通发送不涉及别人
-            if read < last and chat_id != self._relay_chat():
-                msg_id = self._send_via_relay(text, chat_id)
-                if msg_id:
+            if self.relays(chat_id, read, last):
+                msg_id = self._send_via_relay(msg, chat_id)
+                if msg_id or not fallback:
                     return msg_id
                 logger.warning(f'经本人私聊转发到会话 {chat_id} 没成功, 已退回普通发送: 本人在这个会话的未读会被清掉, 对方看不到已读')
-        return self._put_message(text, chat_id, root_id=root_id, thread_chat=bool(root_id) and self.is_thread_chat(chat_id))
+        return self._put_message(msg, chat_id, root_id=root_id, thread_chat=bool(root_id) and self.is_thread_chat(chat_id))
 
-    def _put_message(self, text: str, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
-        pkt = builders.build_send_message_packet(text, chat_id, generate_long_request_id(), root_id=root_id,
-                                                 thread_chat=thread_chat, cid=cid)
+    def relays(self, chat_id: str, read: int, last: int, root_id: str=None) -> bool:
+        """keep_unread 时这条会不会经本人私聊转发: 会话里还有本人的未读(read < last)、不是回复、目标也不是本人私聊
+        (本人私聊里只有本人, 普通发送不涉及别人)。"""
+        return not root_id and read < last and str(chat_id) != self._relay_chat()
+
+    def _put_message(self, msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
+        pkt = builders.build_message_packet(msg, chat_id, generate_long_request_id(), root_id=root_id,
+                                            thread_chat=thread_chat, cid=cid)
         try:
             content = self._gateway_post(pkt)
         except Exception as e:
@@ -201,10 +212,13 @@ class LarkClient:
                 return ''
         return self._self_chat
 
-    def _send_via_relay(self, text: str, chat_id: str):
+    def _send_via_relay(self, msg: dict, chat_id: str):
         """先发到本人私聊, 再转发到 chat_id, 然后撤回中转的那条。返回目标会话里那条的 id, 不成返回 None。
 
-        实测转发不动本人在目标会话的已读位置, 也不给任何人的消息产生已读回执, 目标会话里是一条普通消息。
+        实测转发不动本人在目标会话的已读位置, 也不给任何人的消息产生已读回执, 目标会话里是一条普通消息;
+        图片、文件也一样转发(撤回中转消息不影响转发出去的那份)。
+        @ 转发不过去: 实测转发(以及 BatchCopyMessagesRequest 复制)都会把 AT 元素变成普通文字、去掉 atUserIdList,
+        对方收不到 @ 提醒。所以中转那条直接把 @ 写成文字发出, 不在本人私聊里 @ 别人。
         中转消息发出前先登记它的 cid(state.mark_relay), daemon 收到它时跳过, 不会当成本人在私聊里下的指令。
         """
         relay = self._relay_chat()
@@ -212,7 +226,7 @@ class LarkClient:
             return None
         cid = generate_request_cid()
         state.mark_relay(cid, relay)
-        relay_id = self._put_message(text, relay, cid=cid)
+        relay_id = self._put_message(builders.without_mentions(msg), relay, cid=cid)
         if not relay_id:
             return None
         msg_id = ''

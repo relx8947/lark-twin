@@ -3,15 +3,22 @@
 会话列表用 feed.PullFeedCardsRequest, 消息用 PullMessagesByPositionsRequest, 都是只读接口;
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
 发消息也不改已读: 普通发送不会给别人的消息产生已读回执, 但会清掉本人在这个会话的未读, 所以有未读时经本人私聊
-转发过去(见 LarkClient.send_msg 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动。回复某条(话题回复)
-会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息, 有变化的如实告诉页面。
+转发过去(见 LarkClient.send_message 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动; 转发不成就报发送
+失败, 不退回普通发送。回复某条(话题回复)会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息,
+有变化的如实告诉页面。
+
+能发文字、带 @ 的文字、图片和文件, 各种类型都走同一套匿名发送和发后核对(_deliver)。图片和文件由浏览器把原始内容
+POST 过来, 这里存进临时文件再上传到飞书(media.upload_image / upload_file), 拿到 key 后发消息。@ 经本人私聊转发后
+会变成普通文字(对方收不到 @ 提醒), 所以有未读时带 @ 的消息要页面确认过才以文字发出。
 
 消息怎么显示(富文本片段、卡片、图片、文件)由 render.message_view 整理成纯数据, 前端只用 textContent 渲染。
 打开会话时带上本人的已读位置(readPosition), 页面据此画"以下为新消息", 只是显示, 不会改已读。
 新消息优先从本地库取(daemon 收到的 WS 推送都会入库), 取不到再去服务端拉。
 """
+import asyncio
 import json
 import re
+import tempfile
 import threading
 import time
 from urllib.parse import quote
@@ -24,8 +31,8 @@ from .. import state
 from ..config import CREDENTIALS_PATH
 from ..protocol import LarkAuth, LarkClient
 from ..protocol.client import MODERN_COMMAND_VERSION
-from ..protocol.media import download, message_resource_url, open_stream
-from ..protocol.proto import decoders
+from ..protocol.media import UploadError, download, message_resource_url, open_stream, upload_file, upload_image
+from ..protocol.proto import builders, decoders
 from ..storage import Storage
 from . import render
 
@@ -46,6 +53,16 @@ MAX_INITIAL = 100
 # 图片文件头: 有的图片(比如表情包)服务端按 application/octet-stream 返回, 认出来的才按图片显示
 IMAGE_MAGIC = ((b'\x89PNG\r\n\x1a\n', 'image/png'), (b'\xff\xd8\xff', 'image/jpeg'), (b'GIF87a', 'image/gif'),
                (b'GIF89a', 'image/gif'))
+# 发送的大小上限: 图片超过这个可以作为文件发
+MAX_IMAGE = 20 * 1024 * 1024
+MAX_FILE = 100 * 1024 * 1024
+# @ 候选的会话成员缓存在内存里, 每个会话 10 分钟; 大群接口一次最多返回 2000 人
+MEMBERS_TTL = 600
+MEMBERS_CAP = 2000
+_members = {}    # chat_id -> (查询时间, 成员列表, 是否完整)
+MAX_MENTIONS = 50
+AT_RELAY_NOTE = ('这个会话里你还有未读。为了不清掉未读，消息要经你和自己的私聊转发过去，'
+                 '转发会把 @ 变成普通文字，对方收不到 @ 提醒。')
 
 
 class UpstreamError(Exception):
@@ -354,7 +371,35 @@ def me(request: Request):
     return {'user_id': str(c.auth.user_id), 'name': p['name'], 'avatar': _avatar(c, p['avatar'])}
 
 
+def _text_message(text: str, mentions) -> dict:
+    """输入框里的文字按 "@名字" 切成片段。mentions 是页面上从候选里选中的人 [{user_id, name}];
+    文字里找不到的(选完又删掉了)不算, 没从候选里选、手打的 "@名字" 仍是普通文字。同名的按出现顺序依次对上。"""
+    picks = []
+    for m in (mentions if isinstance(mentions, list) else [])[:MAX_MENTIONS]:
+        if not isinstance(m, dict):
+            continue
+        uid, name = str(m.get('user_id') or ''), str(m.get('name') or '').strip().lstrip('@')
+        if uid.isdigit() and 0 < len(name) <= 100:
+            picks.append((uid, name))
+    if not picks:
+        return {'kind': 'text', 'text': text}
+    queue = {}
+    for uid, name in picks:
+        queue.setdefault(name, []).append(uid)
+    pattern = re.compile('@(' + '|'.join(re.escape(n) for n in sorted(queue, key=len, reverse=True)) + ')')
+    segs, pos = [], 0
+    for m in pattern.finditer(text):
+        uids = queue[m.group(1)]
+        uid = uids.pop(0) if len(uids) > 1 else uids[0]
+        segs += [{'type': 'text', 'text': text[pos:m.start()]}, {'type': 'at', 'user_id': uid, 'name': m.group(1)}]
+        pos = m.end()
+    segs.append({'type': 'text', 'text': text[pos:]})
+    return {'kind': 'text', 'segments': segs}
+
+
 def send(request: Request):
+    """发文字。body: text, root_id(回复哪条, 可选), mentions(@ 了谁, 见 _text_message),
+    plain_at(有未读时同意把 @ 当普通文字发出, 见 _deliver)。"""
     c = client()
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     b = request.state.body
@@ -364,7 +409,20 @@ def send(request: Request):
     if len(text) > MAX_TEXT:
         raise ValueError(f'消息太长(超过 {MAX_TEXT} 字)')
     root_id = _digits(b['root_id'], 'root_id') if b.get('root_id') else None
+    return _deliver(c, chat_id, _text_message(text, b.get('mentions')), root_id, plain_at=bool(b.get('plain_at')))
+
+
+def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, plain_at: bool = False):
+    """发出一条消息(文字、图片、文件都走这里): 一律匿名发送, 发出后核对, 记审计。
+
+    有未读时经本人私聊转发(见 LarkClient.send_message), 转发会把 @ 变成普通文字: 带 @ 的消息这时先返回 409 让页面
+    确认, plain_at 为真才以文字发出(结果里 at_plain 为真)。没有未读时照常发送, @ 是真的 @。
+    """
     read, last = _call(c.read_state, chat_id)
+    at_plain = builders.has_mentions(msg) and c.relays(chat_id, read, last, root_id)
+    if at_plain and not plain_at:
+        return Response(json.dumps({'error': AT_RELAY_NOTE, 'confirm': 'plain_at'}, ensure_ascii=False), status_code=409,
+                        media_type='application/json')
     # 发送前记下别人发的、对我还是未读的消息, 发出后逐条核对; 显式回复的那条变成已读是"回复"本身的意思, 不算
     watch = []
     if read < last:
@@ -373,16 +431,120 @@ def send(request: Request):
         except Exception as e:
             logger.warning(f'发送前查询未读消息失败: {e}')
             watch = None
-    # 网页版一律匿名发送: 有未读时经本人私聊转发, 已读位置不动; 转发不成会退回普通发送, 下面的核对会如实报告
-    msg_id = _call(c.send_msg, text, chat_id, root_id=root_id, keep_unread=True)
-    Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''), content=text,
-                         ok=1 if msg_id else 0, error='' if msg_id else '发送失败', turn_kind='web')
+    # 网页版一律匿名发送: 有未读时经本人私聊转发, 已读位置不动; 转发不成就算发送失败, 不退回普通发送(会清掉本人的未读)。
+    # 发出后照样核对, 万一有变化如实报告
+    msg_id = _call(c.send_message, msg, chat_id, root_id=root_id, keep_unread=True, fallback=False)
+    Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''),
+                         content=builders.plain_text(msg), ok=1 if msg_id else 0, error='' if msg_id else '发送失败',
+                         turn_kind='web')
     if not msg_id:
-        raise UpstreamError('发送失败: 飞书没有确认收到这条消息')
+        raise UpstreamError('发送失败: 飞书没有确认收到这条消息' + ('(经私聊转发没成功; 为了不清掉你的未读, 没有改用普通发送)'
+                                                       if c.relays(chat_id, read, last, root_id) else ''))
     kept, newly = _check_unread(c, chat_id, read, watch) if read < last else (True, 0)
     if kept is False:
         logger.warning(f'匿名发送后会话 {chat_id} ' + (f'有 {newly} 条别人的消息变成了已读' if newly else '的已读位置前进了, 本人的未读被清掉'))
-    return {'ok': True, 'msg_id': str(msg_id), 'kept_unread': kept, 'newly_read': newly}
+    out = {'ok': True, 'msg_id': str(msg_id), 'kept_unread': kept, 'newly_read': newly}
+    if at_plain:
+        out['at_plain'] = True
+    return out
+
+
+def _sniff_image(data: bytes) -> str:
+    """按文件头认出普通图片, 返回 MIME; 认不出(包括可以带脚本的 svg)返回空串。"""
+    sniffed = next((t for magic, t in IMAGE_MAGIC if data.startswith(magic)), '')
+    if not sniffed and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        sniffed = 'image/webp'
+    return sniffed
+
+
+def _upload_name(name: str, kind: str) -> str:
+    """发出去的文件名: 去掉路径和控制字符, 限制长度。"""
+    name = re.sub(r'[\x00-\x1f\x7f]', '', str(name or '')).replace('\\', '/').rsplit('/', 1)[-1].strip()[:200]
+    return name or ('image.png' if kind == 'image' else 'file')
+
+
+def _size_text(n: int) -> str:
+    return f'{n // (1024 * 1024)}MB'
+
+
+async def upload(request: Request):
+    """发图片或文件。请求体是文件的原始内容(不是表单), query: kind=image|file, name=文件名, type=MIME,
+    root_id=回复哪条(可选)。边收边写进临时文件(超过上限立即停止), 上传到飞书后和文字一样匿名发出。"""
+    chat_id = _digits(request.path_params['chat_id'], 'chat_id')
+    q = request.query_params
+    kind = q.get('kind')
+    if kind not in ('image', 'file'):
+        raise ValueError('kind 只能是 image 或 file')
+    limit = MAX_IMAGE if kind == 'image' else MAX_FILE
+    too_big = f'图片不能超过 {_size_text(MAX_IMAGE)}，可以作为文件发送' if kind == 'image' else f'文件不能超过 {_size_text(MAX_FILE)}'
+    name = _upload_name(q.get('name'), kind)
+    mime = q.get('type') or ''
+    if not re.fullmatch(r'[\w.+\-]{1,100}/[\w.+\-]{1,100}', mime):
+        mime = ''
+    root_id = _digits(q['root_id'], 'root_id') if q.get('root_id') else None
+    if int(request.headers.get('content-length') or 0) > limit:
+        raise ValueError(too_big)
+    with tempfile.TemporaryFile() as tmp:
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > limit:
+                raise ValueError(too_big)
+            tmp.write(chunk)
+        if not size:
+            raise ValueError('文件是空的')
+        tmp.seek(0)
+        return await asyncio.to_thread(_send_upload, chat_id, kind, tmp, size, name, mime, root_id)
+
+
+def _send_upload(chat_id: str, kind: str, fileobj, size: int, name: str, mime: str, root_id):
+    c = client()
+    try:
+        if kind == 'image':
+            data = fileobj.read()
+            mime = _sniff_image(data)
+            if not mime:
+                raise ValueError('只能发 PNG、JPEG、GIF、WebP 图片，其他格式可以作为文件发送')
+            msg = {'kind': 'image', 'key': upload_image(c.auth, data, name, mime), 'name': name}
+        else:
+            key = upload_file(c.auth, fileobj, size, name, mime or 'application/octet-stream')
+            msg = {'kind': 'file', 'key': key, 'name': name, 'size': size, 'mime': mime}
+    except UploadError as e:
+        logger.warning(f'上传到飞书失败: {e}')
+        raise UpstreamError(f'上传到飞书失败: {e}') from e
+    return _deliver(c, chat_id, msg, root_id)
+
+
+def _real_name(chatter: dict, locale: str) -> str:
+    """@ 时显示的名字: 用对方自己的名字(当前语言), 不用本人给他设的备注名。"""
+    return _display_name({k: v for k, v in chatter.items() if k != 'alias'}, locale)
+
+
+def members(request: Request):
+    """@ 候选: 会话成员(chats.PullChatChattersRequest, 只读), 不含本人, 按群里的顺序。
+    complete 为假时(大群只返回了前 2000 人)页面在这里找不到再去搜联系人。"""
+    c = client()
+    chat_id = _digits(request.path_params['chat_id'], 'chat_id')
+    hit = _members.get(chat_id)
+    if not hit or time.time() - hit[0] > MEMBERS_TTL:
+        r = _call(c.api, 'chats.PullChatChattersRequest', {'chatId': chat_id, 'needChatters': True}) or {}
+        chatters = r.get('chatters') or {}
+        weight = {str(k): int(v or 0) for k, v in (r.get('orderedWeight') or {}).items()}
+        locale, me = c.auth.region.locale, str(c.auth.user_id)
+        out = []
+        for uid, ch in sorted(chatters.items(), key=lambda kv: weight.get(str(kv[0]), 0)):
+            uid = str(uid)
+            name = _real_name(ch, locale) if isinstance(ch, dict) else ''
+            if uid == me or not uid.isdigit() or not name:
+                continue
+            alias = _display_name(ch, locale)
+            out.append({'user_id': uid, 'name': name, 'alias': alias if alias != name else '',
+                        'pinyin': str(ch.get('namePinyin') or ch.get('namePy') or ''), 'en': str(ch.get('enUsName') or ''),
+                        'avatar': _avatar(c, (ch.get('avatar') or {}).get('key') or ''), 'bot': ch.get('type') == 2})
+        if len(_members) > 200:
+            _members.clear()
+        hit = _members[chat_id] = (time.time(), out, len(chatters) < MEMBERS_CAP)
+    return {'members': hit[1], 'complete': hit[2]}
 
 
 def _others_unread(c: LarkClient, chat_id: str, read: int, last: int) -> list:
@@ -448,10 +610,7 @@ def media(request: Request):
         return StreamingResponse(chunks, media_type='application/octet-stream', headers=headers)
     data, ctype = _call(download, auth, url, max_bytes=20 * 1024 * 1024)
     if not ctype.startswith('image/') or 'svg' in ctype:
-        sniffed = next((t for magic, t in IMAGE_MAGIC if data.startswith(magic)), '')
-        if not sniffed and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
-            sniffed = 'image/webp'
-        ctype = sniffed or 'application/octet-stream'
+        ctype = _sniff_image(data) or 'application/octet-stream'
     if ctype == 'application/octet-stream':
         headers['Content-Disposition'] = 'attachment'
     return Response(data, media_type=ctype, headers=headers)
@@ -470,6 +629,8 @@ ROUTES = [
     ('/api/im/changes', changes, ['GET']),
     ('/api/im/chat/{chat_id}', chat, ['GET']),
     ('/api/im/chat/{chat_id}/send', send, ['POST']),
+    ('/api/im/chat/{chat_id}/upload', upload, ['POST']),
+    ('/api/im/chat/{chat_id}/members', members, ['GET']),
     ('/api/im/search', search, ['GET']),
     ('/api/im/open', open_p2p, ['POST']),
     ('/api/im/media', media, ['GET']),

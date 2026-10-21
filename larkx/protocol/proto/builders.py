@@ -16,12 +16,77 @@ def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id:
     """普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执;
     带 root_id 是话题回复, 被回复的那条会对对方显示已读。
     cid: 这条消息的客户端 id, 推送和拉取到的消息里都带着它; 不传就随机生成。"""
-    cid_2 = generate_request_cid()
-    req = P.PutMessageRequest()
-    req.type = 4
+    return build_message_packet({'kind': 'text', 'text': text}, chat_id, request_id, root_id=root_id,
+                                thread_chat=thread_chat, cid=cid)
+
+
+# 要发出的消息统一用一个 dict 描述(LarkClient.send_message 收的就是它), 和发到哪个会话、是不是回复无关,
+# 匿名发送时同一条先发到本人私聊、再转发过去:
+#   {'kind': 'text', 'text'}                               纯文字
+#   {'kind': 'text', 'segments': [...]}                    带 @ 的文字, 片段是 {'type': 'text', 'text'} 或
+#                                                          {'type': 'at', 'user_id', 'name'}
+#   {'kind': 'image', 'key'}                               图片, key 是上传后拿到的 img_ 开头的 key
+#   {'kind': 'file', 'key', 'name', 'size', 'mime'}        文件, key 是上传后拿到的 file_ 开头的 key
+MESSAGE_KINDS = ('text', 'image', 'file')
+TYPE_TEXT, TYPE_FILE, TYPE_IMAGE = 4, 3, 5
+TAG_TEXT, TAG_AT = 1, 5
+
+
+def text_segments(msg: dict) -> list:
+    """文字消息的片段: 相邻的文字合并, 空文字去掉, user_id 不合法的 @ 退成普通文字。"""
+    segs = msg.get('segments')
+    if segs is None:
+        segs = [{'type': 'text', 'text': msg.get('text') or ''}]
+    out = []
+    for s in segs:
+        if s.get('type') == 'at':
+            uid = str(s.get('user_id') or '')
+            if uid.isdigit():
+                name = str(s.get('name') or '').lstrip('@')
+                out.append({'type': 'at', 'user_id': uid, 'name': name})
+                continue
+            s = {'type': 'text', 'text': '@' + str(s.get('name') or '').lstrip('@')}
+        text = str(s.get('text') or '')
+        if not text:
+            continue
+        if out and out[-1]['type'] == 'text':
+            out[-1]['text'] += text
+        else:
+            out.append({'type': 'text', 'text': text})
+    return out or [{'type': 'text', 'text': ''}]
+
+
+def has_mentions(msg: dict) -> bool:
+    return msg.get('kind') == 'text' and any(s['type'] == 'at' for s in text_segments(msg))
+
+
+def without_mentions(msg: dict) -> dict:
+    """把 @ 写成普通文字 "@名字"(不再 @ 到人); 不是带 @ 的文字消息原样返回。"""
+    if not has_mentions(msg):
+        return msg
+    return {'kind': 'text', 'text': plain_text(msg)}
+
+
+def plain_text(msg: dict) -> str:
+    """消息的纯文本(@ 写成 @名字), 用于摘要和审计记录。"""
+    if msg.get('kind') == 'image':
+        return '[图片]'
+    if msg.get('kind') == 'file':
+        return f"[文件] {msg.get('name') or ''}".strip()
+    return ''.join('@' + s['name'] if s['type'] == 'at' else s['text'] for s in text_segments(msg))
+
+
+def message_request(msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
+    """按消息描述生成 messages.PutMessageRequest(完整版 proto, 带 atUserIdList)。"""
+    from .gateway import _lark_all
+    L = _lark_all()
+    kind = msg.get('kind')
+    if kind not in MESSAGE_KINDS:
+        raise ValueError(f'不支持的消息类型: {kind}')
+    req = L.messages.PutMessageRequest()
     req.chatId = str(chat_id)
     req.cid = cid or generate_request_cid()
-    req.isNotified = 1
+    req.isNotified = True
     req.version = 1
     if root_id:
         req.rootId = str(root_id)
@@ -29,13 +94,48 @@ def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id:
         # 普通群缺 isReplyInThread 会落进主会话;话题群反而拒收它(replyInThread not support chat)
         if not thread_chat:
             req.isReplyInThread = True
-    req.content.richText.elementIds.append(cid_2)
-    req.content.richText.innerText = text
-    req.content.richText.elements.dictionary[cid_2].tag = 1
-    tp = P.TextProperty()
-    tp.content = str(text)
-    req.content.richText.elements.dictionary[cid_2].property = tp.SerializeToString()
-    return wrap_packet(5, req, request_id)
+    if kind == 'image':
+        # 实测只填 imageKey 会被拒("found invalid image key"), 上传图片拿到的 key 要同时填进 cryptoToken
+        req.type = TYPE_IMAGE
+        req.content.imageKey = req.content.cryptoToken = str(msg['key'])
+        return req
+    if kind == 'file':
+        req.type = TYPE_FILE
+        req.content.fileKey = str(msg['key'])
+        req.content.fileName = str(msg.get('name') or 'file')
+        req.content.fileSize = int(msg.get('size') or 0)
+        if msg.get('mime'):
+            req.content.fileMime = str(msg['mime'])
+        return req
+    # 文字: 富文本, 每段一个元素; @ 是 AT 元素(属性里是 userId 和显示的 "@名字"), 元素 id 记进 atIds,
+    # 被 @ 的人还要列进 atUserIdList, 对方才会收到 @ 提醒(和客户端发出的 @ 消息结构一致, 实测过)
+    req.type = TYPE_TEXT
+    rich = req.content.richText
+    E = L.entities.RichTextElement
+    inner = []
+    for seg in text_segments(msg):
+        el_id = generate_request_cid()
+        rich.elementIds.append(el_id)
+        el = rich.elements.dictionary[el_id]
+        if seg['type'] == 'at':
+            el.tag = TAG_AT
+            el.property = E.AtProperty(userId=seg['user_id'], content='@' + seg['name']).SerializeToString()
+            rich.atIds.append(el_id)
+            if int(seg['user_id']) not in req.atUserIdList:
+                req.atUserIdList.append(int(seg['user_id']))
+            inner.append('@' + seg['name'])
+        else:
+            el.tag = TAG_TEXT
+            el.property = E.TextProperty(content=seg['text']).SerializeToString()
+            inner.append(seg['text'])
+    rich.innerText = ''.join(inner)
+    return req
+
+
+def build_message_packet(msg: dict, chat_id: str, request_id: str, root_id: str=None, thread_chat: bool=False,
+                         cid: str=None) -> P.Packet:
+    """发消息(PutMessageRequest)的请求包, msg 见上面的消息描述。"""
+    return wrap_packet(5, message_request(msg, chat_id, root_id=root_id, thread_chat=thread_chat, cid=cid), request_id)
 
 
 def build_create_chat_packet(user_id: str, request_id: str) -> P.Packet:

@@ -1,4 +1,5 @@
 // 网页版飞书。只用只读接口看消息, 看过的仍是未读; 聊天内容一律用 textContent 渲染, 不拼 HTML。
+// 能发文字、表情(Unicode emoji)、@、图片和文件, 都由后端匿名发送(有未读时经本人私聊转发)并在发出后核对已读。
 'use strict';
 
 const $ = id => document.getElementById(id);
@@ -34,6 +35,11 @@ const ICONS = {
   chat: '<path d="M4.5 4.5h15a1.5 1.5 0 0 1 1.5 1.5v10a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3.5v-3.5h-1A1.5 1.5 0 0 1 3 16V6a1.5 1.5 0 0 1 1.5-1.5z"/>',
   file: '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/>',
   video: '<rect x="3" y="5.5" width="13" height="13" rx="2"/><path d="M16 10l5-3v10l-5-3z"/>',
+  emoji: '<circle cx="12" cy="12" r="8.5"/><path d="M8.5 14a4 4 0 0 0 7 0"/><path d="M9 9.5h.01M15 9.5h.01"/>',
+  at: '<circle cx="12" cy="12" r="3.5"/><path d="M15.5 12v1.5a2.5 2.5 0 0 0 5 0V12a8.5 8.5 0 1 0-3.3 6.7"/>',
+  image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16l-5-5-8.5 8.5"/>',
+  attach: '<path d="M20 11.5l-7.8 7.8a5 5 0 0 1-7.1-7.1l8.2-8.2a3.3 3.3 0 0 1 4.7 4.7l-8.2 8.2a1.7 1.7 0 0 1-2.4-2.4l7.4-7.4"/>',
+  close: '<path d="M6 6l12 12M18 6L6 18"/>',
 };
 function icon(name, cls) {
   const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -57,7 +63,7 @@ async function api(path, opts = {}) {
   });
   if (r.status === 401) { showLogin(); throw new Error('未登录'); }
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || r.statusText);
+  if (!r.ok) { const err = new Error(data.error || r.statusText); err.status = r.status; err.data = data; throw err; }
   return data;
 }
 
@@ -112,7 +118,8 @@ function avatar(url, name, size = 32) {
 
 const S = { feed: [], cursor: '', filter: 'all', q: '', results: null, latest: null, feedAt: 0, feedDirty: false, feedBusy: false,
   chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, seq: 0, poll: 0, me: null,
-  readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false };
+  readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false,
+  pending: [], pendingSeq: 0, mentions: [], members: null, sending: false };
 // 新消息: 每秒先问本地库(daemon 收到推送就入库), 本地没有时最多每 3 秒去服务端拉一次; 页面在后台时放慢
 const POLL_MS = 1000, SERVER_MS = 3000, SERVER_HIDDEN_MS = 10000;
 const KIND = { p2p: '单聊', group: '群组', topic: '话题群' };
@@ -213,6 +220,7 @@ function emptyChat(text) {
 async function openChat(chatId) {
   clearInterval(S.poll);
   const seq = ++S.seq;
+  clearComposer();
   Object.assign(S, { chatId, chat: null, msgs: [], replyTo: null });
   $('tab-im').classList.add('has-chat');
   renderFeed();
@@ -229,6 +237,7 @@ async function openChat(chatId) {
 
 function closeChat() {
   clearInterval(S.poll); S.seq++;
+  clearComposer();
   Object.assign(S, { chatId: '', chat: null, msgs: [] });
   $('tab-im').classList.remove('has-chat');
   emptyChat('看消息不会标为已读，对方也看不到');
@@ -277,19 +286,39 @@ function renderChat() {
   S.head = h('div', { class: 'chat-head' });
   S.body = h('div', { class: 'chat-body' });
   S.replyBar = h('div', { class: 'composer-reply', hidden: true });
+  S.pendingBar = h('div', { class: 'composer-pending', hidden: true });
+  S.mentionPop = h('div', { class: 'pop mention-pop', hidden: true });
+  S.emojiPop = h('div', { class: 'pop emoji-pop', hidden: true },
+    EMOJIS.map(e => h('button', { title: e, onmousedown: ev => ev.preventDefault(), onclick: () => { insertText(e); closeEmoji(); } }, e)));
   const input = h('textarea', { rows: 1, placeholder: `发送给 ${S.chat.name}` });
   const sendBtn = h('button', { class: 'send', title: '发送 (Enter)', disabled: true, onclick: () => sendMsg() }, icon('send'));
-  const grow = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 200) + 'px'; sendBtn.disabled = !input.value.trim(); };
-  input.addEventListener('input', grow);
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
-  });
-  S.input = input; S.grow = grow;
+  const refresh = () => { sendBtn.disabled = S.sending || (!input.value.trim() && !S.pending.length); };
+  const grow = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 200) + 'px'; refresh(); };
+  input.addEventListener('input', () => { grow(); updateMention(); });
+  input.addEventListener('keydown', onComposerKey);
+  input.addEventListener('click', updateMention);
+  input.addEventListener('keyup', e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateMention(); });
+  input.addEventListener('blur', () => closeMention());
+  input.addEventListener('paste', onPaste);
+  S.input = input; S.grow = grow; S.refreshSend = refresh;
+  const picker = (accept, kind) => h('input', { type: 'file', accept, multiple: true, hidden: true,
+    onchange: e => { addFiles(e.target.files, kind); e.target.value = ''; } });
+  const imgInput = picker('image/png,image/jpeg,image/gif,image/webp', 'image'), fileInput = picker(null, 'file');
+  S.emojiBtn = tool('emoji', '表情', () => { if (S.emojiPop.hidden) openEmoji(); else closeEmoji(); });
   put($('chat'), S.head, S.body,
-    h('div', { class: 'composer' }, S.replyBar, input,
-      h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)));
+    h('div', { class: 'composer' }, S.mentionPop, S.emojiPop, S.pendingBar, S.replyBar, input,
+      h('div', { class: 'composer-bar' },
+        h('div', { class: 'composer-tools' }, S.emojiBtn, tool('at', '@ 提及', () => insertText('@')),
+          tool('image', '发送图片（也可以粘贴截图或拖进来）', () => imgInput.click()),
+          tool('attach', '发送文件（不超过 100MB）', () => fileInput.click()), imgInput, fileInput),
+        h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)),
+    h('div', { class: 'drop-zone' }, icon('attach'), `松开发送给 ${S.chat.name}`));
   renderHead(); renderMsgs('unread');
   input.focus();
+}
+
+function tool(name, title, onclick) {
+  return h('button', { class: 'tool', title, 'aria-label': title, onmousedown: e => e.preventDefault(), onclick }, icon(name));
 }
 
 function renderHead() {
@@ -434,19 +463,302 @@ function renderMsgs(mode) {
   else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
 }
 
+// ---- 发送: 图片、文件、@、表情 ----
+
+const MAX_IMAGE = 20 * 1024 * 1024, MAX_FILE = 100 * 1024 * 1024, MAX_PENDING = 9;
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+// 表情用 Unicode emoji: 它就是普通文字, 飞书各端、通知和这里都原样显示。[微笑] 这类文字代码要作为飞书内部的
+// 表情元素(带表情 key)发出才会显示成表情, 当纯文字发出去对方看到的就是"[微笑]"几个字
+const EMOJIS = ['😀', '😄', '😁', '😂', '🤣', '😊', '🙂', '😉', '😍', '😘', '😋', '😎', '🤔', '🤨', '😐', '🙄',
+  '😏', '😮', '😴', '😅', '😓', '😭', '😢', '😤', '😡', '😱', '🥳', '🤗', '🤝', '👍', '👎', '👏',
+  '🙏', '💪', '👌', '✌️', '👋', '🙌', '👀', '❤️', '💔', '🔥', '🎉', '✨', '💯', '✅', '❌', '⚠️',
+  '❓', '❗', '⭐', '🌹', '☕', '🍺', '🎂', '🧧', '💰', '📌', '📎', '🚀', '⏰', '🌙', '☀️', '🆗'];
+
+function clearComposer() {
+  for (const p of S.pending) if (p.url) URL.revokeObjectURL(p.url);
+  Object.assign(S, { pending: [], mentions: [], members: null });
+  closeMention(); closeEmoji();
+}
+
+function insertText(text) {
+  const el = S.input;
+  if (!el) return;
+  el.focus();
+  el.setRangeText(text, el.selectionStart, el.selectionEnd, 'end');
+  S.grow(); updateMention();
+}
+
+function openEmoji() { closeMention(); S.emojiPop.hidden = false; S.emojiBtn.classList.add('on'); }
+function closeEmoji() {
+  if (S.emojiPop) S.emojiPop.hidden = true;
+  if (S.emojiBtn) S.emojiBtn.classList.remove('on');
+}
+
+// 附件: 先放在输入框上方(图片显示缩略图), 可以取消, 按发送时依次上传并发出
+function addFiles(list, prefer) {
+  if (!S.chat || S.sending) return;
+  for (const f of Array.from(list || [])) {
+    if (!f.size) { toast(`「${f.name || '文件'}」是空文件，不能发送`); continue; }
+    let kind = prefer === 'file' ? 'file' : IMAGE_TYPES.has(f.type) ? 'image' : 'file';
+    if (prefer === 'image' && kind === 'file') toast('不是 PNG、JPEG、GIF、WebP 图片，将作为文件发送');
+    if (kind === 'image' && f.size > MAX_IMAGE) { kind = 'file'; toast('图片超过 20MB，将作为文件发送'); }
+    if (kind === 'file' && f.size > MAX_FILE) { toast(`「${f.name}」超过 100MB，不能发送`); continue; }
+    if (S.pending.length >= MAX_PENDING) { toast(`一次最多发 ${MAX_PENDING} 个图片或文件`); break; }
+    S.pending.push({ id: ++S.pendingSeq, kind, file: f, url: kind === 'image' ? URL.createObjectURL(f) : '', status: '' });
+  }
+  renderPending(); S.refreshSend(); S.input.focus();
+}
+
+function removePending(id) {
+  const p = S.pending.find(x => x.id === id);
+  if (p && p.url) URL.revokeObjectURL(p.url);
+  S.pending = S.pending.filter(x => x.id !== id);
+  renderPending(); S.refreshSend(); S.input.focus();
+}
+
+function renderPending() {
+  const bar = S.pendingBar;
+  if (!bar) return;
+  bar.hidden = !S.pending.length;
+  put(bar, S.pending.map(p => h('div', { class: `pending ${p.kind}`, title: `${p.file.name || ''} ${fmtSize(p.file.size)}`.trim() },
+    // 上传进度: 图片盖在缩略图上, 文件写在文件名下面
+    p.kind === 'image' ? [h('img', { src: p.url, alt: '待发送的图片' }), p.status ? h('span', { class: 'pending-status' }, p.status) : null]
+      : [icon('file', 'pending-icon'), h('span', { class: 'pending-text' }, h('span', { class: 'pending-name' }, p.file.name || '文件'),
+        h('span', { class: 'pending-meta' + (p.status ? ' busy' : '') }, [fmtSize(p.file.size), p.status].filter(Boolean).join(' · ')))],
+    S.sending ? null : h('button', { class: 'pending-x', title: '取消', onclick: () => removePending(p.id) }, icon('close')))));
+}
+
+function onPaste(e) {
+  const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+  if (!files.length) return;  // 普通文字照常粘贴
+  e.preventDefault();
+  addFiles(files);
+}
+
+// 拖进聊天窗口: 图片按图片发, 其他按文件发; 窗口外松开不让浏览器打开文件
+const hasFiles = e => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
+let dragDepth = 0;
+function setupDrop() {
+  const box = $('chat');
+  const off = () => { dragDepth = 0; box.classList.remove('dragging'); };
+  box.addEventListener('dragenter', e => {
+    if (!S.chat || !hasFiles(e)) return;
+    e.preventDefault(); dragDepth++; box.classList.add('dragging');
+  });
+  box.addEventListener('dragover', e => { if (S.chat && hasFiles(e)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+  box.addEventListener('dragleave', () => { if (--dragDepth <= 0) off(); });
+  box.addEventListener('drop', e => { if (!S.chat || !hasFiles(e)) return; e.preventDefault(); off(); addFiles(e.dataTransfer.files); });
+  window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', e => { if (hasFiles(e)) { e.preventDefault(); off(); } });
+}
+
+// ---- @ 提及: 输入 @ 弹出候选, 上下键选择, 回车或 Tab 确认 ----
+
+const M = { open: false, start: 0, query: '', items: [], index: 0, seq: 0, hint: '', timer: 0 };
+
+function mentionContext() {
+  const el = S.input;
+  if (!el || el.selectionStart !== el.selectionEnd) return null;
+  const before = el.value.slice(0, el.selectionStart);
+  // @ 前面是开头、空白或标点才算(邮箱里的 @ 不算)
+  const m = before.match(/(?:^|[^\w@.])@([^\s@]{0,30})$/);
+  return m ? { start: el.selectionStart - m[1].length - 1, query: m[1] } : null;
+}
+
+function loadMembers() {
+  if (S.members && S.members.chatId === S.chatId) return S.members.promise;
+  const chatId = S.chatId;
+  const promise = api(`/api/im/chat/${chatId}/members`).then(d => ({ list: d.members || [], complete: !!d.complete }), () => null);
+  S.members = { chatId, promise };
+  promise.then(r => { if (!r && S.members && S.members.chatId === chatId) S.members = null; });  // 失败了下次再试
+  return promise;
+}
+
+function filterMembers(list, q) {
+  q = q.trim().toLowerCase();
+  if (!q) return list.slice(0, 8);
+  const scored = [];
+  for (const m of list) {
+    const name = m.name.toLowerCase(), alias = (m.alias || '').toLowerCase(), en = (m.en || '').toLowerCase();
+    const py = (m.pinyin || '').toLowerCase().trim(), joined = py.replace(/\s+/g, ''), initials = py.split(/\s+/).map(w => w[0] || '').join('');
+    let score = 0;
+    if (name.startsWith(q) || alias.startsWith(q)) score = 4;
+    else if (name.includes(q) || alias.includes(q)) score = 3;
+    else if (joined.startsWith(q) || initials.startsWith(q) || en.startsWith(q)) score = 2;
+    else if (joined.includes(q) || en.includes(q)) score = 1;
+    if (score) scored.push([score, m]);
+  }
+  return scored.sort((a, b) => b[0] - a[0]).slice(0, 8).map(x => x[1]);
+}
+
+async function updateMention() {
+  const ctx = mentionContext();
+  if (!ctx || !S.chat) { closeMention(); return; }
+  closeEmoji();
+  const seq = ++M.seq;
+  clearTimeout(M.timer);
+  Object.assign(M, { open: true, start: ctx.start, query: ctx.query });
+  if (!M.items.length) { M.hint = '加载成员…'; renderMention(); }
+  const members = await loadMembers();
+  if (seq !== M.seq) return;
+  Object.assign(M, { items: filterMembers(members ? members.list : [], ctx.query), index: 0 });
+  M.hint = members ? (ctx.query ? '没有找到这个人' : '这个会话里没有可以 @ 的人') : (ctx.query ? '' : '查不到会话成员，输入名字搜索联系人');
+  // 成员里找得少(或大群没取全、成员查不到)时, 再按名字搜联系人补上
+  const search = ctx.query && (!members || !members.complete || M.items.length < 3);
+  if (search && !M.items.length) M.hint = '搜索联系人…';
+  renderMention();
+  if (!search) return;
+  M.timer = setTimeout(async () => {
+    const found = await api('/api/im/search?q=' + encodeURIComponent(ctx.query)).catch(() => []);
+    if (seq !== M.seq) return;
+    const have = new Set(M.items.map(i => i.user_id));
+    const extra = found.filter(x => x.kind === 'user' && !have.has(x.id) && x.id !== (S.me && S.me.user_id))
+      .map(x => ({ user_id: x.id, name: x.name, avatar: '', contact: true }));
+    M.items = M.items.concat(extra).slice(0, 8);
+    M.hint = '没有找到这个人';
+    renderMention();
+  }, 300);
+}
+
+function renderMention() {
+  const pop = S.mentionPop;
+  if (!pop) return;
+  pop.hidden = !M.open;
+  if (!M.open) return;
+  put(pop, M.items.length ? M.items.map((m, i) => h('div', { class: 'mention-item' + (i === M.index ? ' on' : ''),
+    onmousedown: e => { e.preventDefault(); chooseMention(i); }, onmouseenter: () => { M.index = i; highlightMention(); } },
+  avatar(m.avatar, m.name, 24), h('span', { class: 'mention-name' }, m.name),
+  m.alias ? h('span', { class: 'mention-sub' }, m.alias) : null,
+  m.bot ? h('span', { class: 'mention-tag' }, '机器人') : m.contact ? h('span', { class: 'mention-tag' }, '联系人') : null))
+    : h('div', { class: 'mention-empty' }, M.hint));
+}
+
+function highlightMention() {
+  if (!S.mentionPop) return;
+  S.mentionPop.querySelectorAll('.mention-item').forEach((el, j) => {
+    el.classList.toggle('on', j === M.index);
+    if (j === M.index) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function chooseMention(i) {
+  const m = M.items[i], el = S.input;
+  if (!m || !el) return;
+  el.setRangeText(`@${m.name} `, M.start, el.selectionStart, 'end');
+  S.mentions.push({ user_id: m.user_id, name: m.name });
+  closeMention(); S.grow(); el.focus();
+}
+
+function closeMention() {
+  M.seq++; clearTimeout(M.timer);
+  Object.assign(M, { open: false, items: [], index: 0 });
+  if (S.mentionPop) S.mentionPop.hidden = true;
+}
+
+function onComposerKey(e) {
+  if (e.isComposing) return;
+  if (M.open && M.items.length) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      M.index = (M.index + (e.key === 'ArrowDown' ? 1 : -1) + M.items.length) % M.items.length;
+      highlightMention(); return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); chooseMention(M.index); return; }
+  }
+  if (e.key === 'Escape' && (M.open || !S.emojiPop.hidden)) { e.preventDefault(); closeMention(); closeEmoji(); return; }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+}
+
+function confirmBox(text, okLabel) {
+  return new Promise(resolve => {
+    const done = v => { box.remove(); resolve(v); };
+    const ok = h('button', { class: 'primary', onclick: () => done(true) }, okLabel);
+    const box = h('div', { class: 'dialog', onkeydown: e => { if (e.key === 'Escape') done(false); } },
+      h('div', { class: 'dialog-card', role: 'dialog' }, h('p', {}, text),
+        h('div', { class: 'dialog-row' }, h('button', { onclick: () => done(false) }, '取消'), ok)));
+    document.body.append(box);
+    ok.focus();
+  });
+}
+
+// 上传一个图片或文件并发出: 浏览器到这里的进度用 XHR 的上传进度显示, 之后是这里上传到飞书和发送
+function sendAttachment(p, chatId, root, show) {
+  return new Promise((resolve, reject) => {
+    const q = new URLSearchParams({ kind: p.kind, name: p.file.name || (p.kind === 'image' ? 'image.png' : 'file'), type: p.file.type || '' });
+    if (root) q.set('root_id', root);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/im/chat/${chatId}/upload?${q}`);
+    xhr.setRequestHeader('X-Larkx', '1');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    show('上传中 0%');
+    xhr.upload.onprogress = e => { if (e.lengthComputable) show(`上传中 ${Math.floor(e.loaded / e.total * 100)}%`); };
+    xhr.upload.onload = () => show('发送中…');
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (_) { /* 不是 JSON */ }
+      if (xhr.status === 401) { showLogin(); reject(new Error('未登录')); } else if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || `发送失败（HTTP ${xhr.status}）`));
+    };
+    xhr.onerror = () => reject(new Error('网络错误，没有发出'));
+    xhr.send(p.file);
+  });
+}
+
+async function sendText(chatId, body) {
+  try {
+    return await api(`/api/im/chat/${chatId}/send`, { method: 'POST', body });
+  } catch (e) {
+    // 有未读时 @ 只能以普通文字发出(经私聊转发会去掉 @), 先问一下
+    if (!(e.data && e.data.confirm === 'plain_at')) throw e;
+    if (!await confirmBox(e.message + '\n\n仍然发送吗？', '以普通文字发送')) return null;
+    return api(`/api/im/chat/${chatId}/send`, { method: 'POST', body: { ...body, plain_at: true } });
+  }
+}
+
+function report(results) {
+  const leaked = results.filter(r => r.kept_unread === false), n = leaked.reduce((a, r) => a + (r.newly_read || 0), 0);
+  if (leaked.length) toast(n ? `已发出，但有 ${n} 条别人的消息变成了已读` : '已发出，但这次没能匿名发送：你在这个会话的未读被清掉了，对方看不到已读');
+  else if (results.some(r => r.kept_unread == null)) toast('已发出，但没能核对别人的消息是否仍是未读');
+  else if (results.some(r => r.at_plain)) toast('已发出：@ 以普通文字发出，对方不会收到 @ 提醒');
+}
+
 async function sendMsg() {
   const input = S.input;
+  if (!input || !S.chat || S.sending) return;
   const text = input.value.trim();
-  if (!text || !S.chat) return;
-  input.disabled = true;
-  const r = await act(() => api(`/api/im/chat/${S.chatId}/send`, { method: 'POST', body: { text, root_id: S.replyTo ? S.replyTo.root_id : null } }));
-  input.disabled = false;
-  if (!r) return;
-  if (r.kept_unread === false) toast(r.newly_read ? `已发出，但有 ${r.newly_read} 条别人的消息变成了已读` : '已发出，但这次没能匿名发送：你在这个会话的未读被清掉了，对方看不到已读');
-  else if (r.kept_unread == null) toast('已发出，但没能核对别人的消息是否仍是未读');
-  input.value = ''; S.grow(); S.replyTo = null; renderReply(); input.focus();
-  await pollChat(S.seq);
-  S.body.scrollTop = S.body.scrollHeight;
+  if (!text && !S.pending.length) return;
+  const seq = S.seq, chatId = S.chatId, queue = S.pending, root = S.replyTo ? S.replyTo.root_id : null;
+  const current = () => seq === S.seq;
+  const results = [];
+  S.sending = true; input.disabled = true; S.refreshSend(); renderPending(); closeMention(); closeEmoji();
+  try {
+    // 先按添加的顺序发图片和文件, 再发文字
+    while (queue.length) {
+      const p = queue[0];
+      results.push(await sendAttachment(p, chatId, root, s => { p.status = s; if (current()) renderPending(); }).finally(() => { p.status = ''; }));
+      if (p.url) URL.revokeObjectURL(p.url);
+      queue.shift();
+      if (current()) renderPending();
+    }
+    if (text) {
+      const r = await sendText(chatId, { text, root_id: root, mentions: current() ? S.mentions : [] });
+      if (r) {
+        results.push(r);
+        if (current()) { input.value = ''; S.mentions = []; }
+      }
+    }
+    if (current() && !queue.length && !input.value.trim()) { S.replyTo = null; renderReply(); }
+  } catch (e) {
+    if (e.message !== '未登录') toast(e.message);
+  } finally {
+    S.sending = false; input.disabled = false;
+    if (current()) { S.grow(); renderPending(); input.focus(); }
+  }
+  report(results);
+  if (current() && results.length) {
+    await pollChat(seq);
+    S.body.scrollTop = S.body.scrollHeight;
+  }
 }
 
 // ---- 数字人(控制台)标签页 ----
@@ -492,6 +804,10 @@ function route() {
   else if (!arg) emptyChat('看消息不会标为已读，对方也看不到');
 }
 
+setupDrop();
+document.addEventListener('mousedown', e => {
+  if (S.emojiPop && !S.emojiPop.hidden && !S.emojiPop.contains(e.target) && !(S.emojiBtn && S.emojiBtn.contains(e.target))) closeEmoji();
+});
 $('q').addEventListener('input', e => { S.q = e.target.value.trim(); S.results = null; renderFeed(); });
 $('q').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing && S.q) searchAll(S.q); });
 $('loginBtn').addEventListener('click', () => login($('token').value.trim()).then(start, e => toast(e.message)));

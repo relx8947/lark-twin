@@ -5,6 +5,7 @@
 (令牌放在 # 片段里, 不会进 nginx 访问日志); 改动类请求还要带 X-Larkx 请求头, 防跨站伪造。
 """
 import hmac
+import inspect
 import json
 import re
 import secrets
@@ -58,19 +59,40 @@ def _authorized(request: Request) -> bool:
 
 
 def api(fn):
-    """数据接口统一做鉴权; 改动类请求要求自定义请求头, 浏览器跨站提交带不上它。"""
-    def endpoint(request: Request):
+    """数据接口统一做鉴权; 改动类请求要求自定义请求头, 浏览器跨站提交带不上它。
+    fn 可以是普通函数(在线程池里跑), 也可以是 async 函数(要边收边处理请求体的上传接口)。"""
+    def guard(request: Request):
         if not _authorized(request):
             return _json({'error': '未登录'}, 401)
         if request.method != 'GET' and request.headers.get('x-larkx') != '1':
             return _json({'error': '缺少 X-Larkx 请求头'}, 403)
-        try:
-            result = fn(request)
-        except ValueError as e:
-            return _json({'error': str(e)}, 400)
-        except im.UpstreamError as e:
-            return _json({'error': str(e)}, 502)
+        return None
+
+    def done(result):
         return result if isinstance(result, Response) else _json(result)
+
+    def failed(e: Exception):
+        return _json({'error': str(e)}, 400 if isinstance(e, ValueError) else 502)
+
+    if inspect.iscoroutinefunction(fn):
+        async def async_endpoint(request: Request):
+            denied = guard(request)
+            if denied is not None:
+                return denied
+            try:
+                return done(await fn(request))
+            except (ValueError, im.UpstreamError) as e:
+                return failed(e)
+        return async_endpoint
+
+    def endpoint(request: Request):
+        denied = guard(request)
+        if denied is not None:
+            return denied
+        try:
+            return done(fn(request))
+        except (ValueError, im.UpstreamError) as e:
+            return failed(e)
     return endpoint
 
 
@@ -432,13 +454,18 @@ class _Static(StaticFiles):
 
 
 class _JSONBody:
-    """把请求体解析成 dict 放进 request.state.body, 供同步接口使用。"""
+    """把 JSON 请求体解析成 dict 放进 request.state.body, 供同步接口使用。
+    其他类型的请求体(上传图片和文件时是原始字节)不在这里读, 原样交给接口自己边收边处理。"""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http' or scope['method'] in ('GET', 'HEAD'):
+            return await self.app(scope, receive, send)
+        ctype = dict(scope.get('headers') or []).get(b'content-type', b'').split(b';')[0].strip().lower()
+        if ctype not in (b'', b'application/json', b'text/plain'):
+            scope.setdefault('state', {})['body'] = {}
             return await self.app(scope, receive, send)
         chunks, more = [], True
         while more:
@@ -448,7 +475,7 @@ class _JSONBody:
         raw = b''.join(chunks)
         try:
             body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
+        except ValueError:  # 不是 JSON, 或者不是 UTF-8
             body = {}
         scope.setdefault('state', {})['body'] = body if isinstance(body, dict) else {}
 
