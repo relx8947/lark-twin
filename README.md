@@ -78,7 +78,7 @@ larkx service status | logs -f   # 运行状态
 | `LARKX_CLAUDE_CLI` / `LARKX_CODEX_CLI` | 你平时启动 agent 的命令，比如 `claude`、`ccd`、`codex`，认证沿用你自己的配置 |
 | `LARKX_AGENT_FALLBACK_MODEL` | 用 Claude 时，主模型被安全策略拦截后改用的备用模型 |
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认是 `/ai` |
-| `LARKX_REPLY_SIGNATURE` | 每条回复末尾的标注，比如 `🤖 lark-twin · 数字分身` |
+| `LARKX_REPLY_SIGNATURE` | 每条回复末尾的署名，比如 `🤖 lark-twin · 数字分身`，会和正文空一行、前面加"——" |
 | `LARKX_ALERT_CMD` | 飞书登录失效时的备用告警命令，比如用 lark-cli 机器人身份发给你 |
 | `LARKX_WEB_URL` | 网页控制台的对外地址（Nginx 入口），用来生成登录链接 |
 

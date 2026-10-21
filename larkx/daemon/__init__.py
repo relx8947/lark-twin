@@ -11,7 +11,7 @@ from loguru import logger
 from .. import state
 from ..agent import SessionCrashed, create_session, ensure_agent_home
 from ..agent.home import commit_agent_home
-from ..config import CREDENTIALS_PATH, DATA_DIR, load_config
+from ..config import CREDENTIALS_PATH, DATA_DIR, load_config, with_signature
 from ..notify import Notifier
 from ..protocol import AuthExpired, LarkAuth, LarkClient
 from ..storage import Storage
@@ -297,8 +297,7 @@ class Daemon:
         return n
 
     async def _reply(self, chat_id, text, root_id=None):
-        if self.cfg.get('reply_signature'):
-            text = f"{text}\n{self.cfg['reply_signature']}"
+        text = with_signature(text, self.cfg)
         msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id)
         if not msg_id:
             logger.error(f'控制回执发送失败 [{chat_id}]: {text}')

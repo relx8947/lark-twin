@@ -43,7 +43,7 @@ DEFAULTS = {
     "memory_review_hour": 4,
     # 上下文用到自动压缩阈值的这个比例时, 先让数字人把要记的内容写进记忆(仅 claude 后端)
     "memory_flush_ratio": 0.85,
-    # 数字人发出的消息末尾自动加上的签名, 如 "（AI 代回）"; 留空不加
+    # 数字人发出的消息末尾自动加上的签名, 如 "🤖 lark-twin · 数字分身"; 和正文隔一个空行, 前面加 "—— "。留空不加
     "reply_signature": "",
     # 数字人在别的会话以本人名义发消息时, 抄送一份到本人私聊
     "mirror": True,
@@ -138,3 +138,9 @@ def load_config() -> dict:
 
 def is_agent_actor() -> bool:
     return os.environ.get(ACTOR_ENV) == "agent"
+
+
+def with_signature(text: str, cfg: dict) -> str:
+    """数字人发出的消息加上签名: 空一行再署名, 一眼能看出是后缀而不是正文的最后一句。"""
+    sig = (cfg.get("reply_signature") or "").strip()
+    return f"{text.rstrip()}\n\n—— {sig}" if sig else text

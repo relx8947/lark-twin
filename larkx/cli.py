@@ -4,7 +4,7 @@ import sys
 from datetime import datetime, timedelta
 from loguru import logger
 from . import state
-from .config import is_agent_actor, load_config
+from .config import is_agent_actor, load_config, with_signature
 from .protocol import REGIONS, AuthExpired, LarkAuth, LarkClient, get_region
 from .storage import Storage
 
@@ -203,8 +203,7 @@ def cmd_send(args):
             Notifier(cfg, client).alert(f'拦下了数字人发往「{name}」的消息: {denied}\n内容: {text[:200]}',
                                         key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
             return _fail(args, denied)
-        if cfg.get('reply_signature'):
-            text = f"{text}\n{cfg['reply_signature']}"
+        text = with_signature(text, cfg)
     msg_id = client.send_msg(text, args.chat_id, root_id=args.root)
     _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
     if not msg_id:

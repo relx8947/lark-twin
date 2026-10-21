@@ -51,7 +51,7 @@ def test_agent_send_mirrors_to_owner(tmp_path, monkeypatch, fake_client):
     st = _agent_cli(monkeypatch, tmp_path, fake_client, turn(chat='g1'))
     st.update_chat_name('g1', '项目群')
     assert cli.cmd_send(_send_args('g1', ['收到'])) == 0
-    assert fake_client.sent[0] == ('g1', '收到\n🤖 sig')
+    assert fake_client.sent[0] == ('g1', '收到\n\n—— 🤖 sig')
     assert fake_client.sent[1][0] == 'self' and '项目群' in fake_client.sent[1][1]
     fake_client.sent.clear()
     monkeypatch.setattr(state, 'read_turn', lambda: turn(chat='g1', owner=True))

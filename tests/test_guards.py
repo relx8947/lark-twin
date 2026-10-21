@@ -39,3 +39,22 @@ def test_agent_reply_cannot_start_with_prefix(tmp_path, monkeypatch, capsys, fak
     assert [(a.actor, a.ok) for a in st.list_actions()] == [('agent', 0), ('agent', 0)]
     # 被拦下时只给本人私聊发告警, 不会发到目标会话
     assert {c for c, _ in fake_client.sent} == {'self'} and '拦下' in fake_client.sent[0][1]
+
+
+def test_agent_reply_signature_is_set_apart(tmp_path, monkeypatch, fake_client):
+    from larkx import state
+    from larkx.storage import Storage
+    st = Storage(f'sqlite:///{tmp_path}/t.db')
+    monkeypatch.setattr(cli, 'Storage', lambda: st)
+    monkeypatch.setattr(cli, 'LarkClient', lambda *a, **k: fake_client)
+    monkeypatch.setattr(cli, 'LarkAuth', lambda *a, **k: None)
+    monkeypatch.setattr(state, 'read_turn', lambda: {'kind': 'message', 'chat_id': 'c1', 'is_owner': True, 'ref': 'm1'})
+    monkeypatch.setenv('LARKX_ACTOR', 'agent')
+    monkeypatch.setenv('LARKX_MIRROR', 'false')
+    monkeypatch.setenv('LARKX_REPLY_SIGNATURE', '🤖 lark-twin · 数字分身')
+    assert cli.cmd_send(_send_args(['收到\n'])) == 0
+    assert fake_client.sent[-1] == ('c1', '收到\n\n—— 🤖 lark-twin · 数字分身')
+    # 本人自己用 larkx send 发的消息不加签名
+    monkeypatch.delenv('LARKX_ACTOR')
+    assert cli.cmd_send(_send_args(['收到'])) == 0
+    assert fake_client.sent[-1] == ('c1', '收到')
