@@ -224,6 +224,18 @@ class Storage:
         finally:
             s.close()
 
+    def recalled_ids(self, msg_ids) -> set:
+        """这些消息里已经成功撤回的。"""
+        ids = [str(m) for m in msg_ids if m]
+        if not ids:
+            return set()
+        s = self.Session()
+        try:
+            rows = s.query(Action.msg_id).filter(Action.action == 'recall', Action.ok == 1, Action.msg_id.in_(ids)).all()
+            return {r[0] for r in rows}
+        finally:
+            s.close()
+
     def recent_chats(self, since: datetime, limit=30):
         s = self.Session()
         try:

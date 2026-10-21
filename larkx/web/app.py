@@ -174,9 +174,11 @@ def activity(request: Request):
     names = _chat_names(st)
     rows = st.list_actions(limit=int(request.query_params.get('limit', 100)))
     rows.reverse()
+    recalled = st.recalled_ids(r.msg_id for r in rows if r.action == 'send')
     return _json([{'id': r.id, 'time': r.created_at, 'actor': r.actor, 'action': r.action, 'chat_id': r.chat_id,
                    'chat_name': names.get(r.chat_id, ''), 'msg_id': r.msg_id, 'content': r.content, 'ok': bool(r.ok),
-                   'error': r.error, 'turn_kind': r.turn_kind, 'turn_ref': r.turn_ref} for r in rows])
+                   'error': r.error, 'turn_kind': r.turn_kind, 'turn_ref': r.turn_ref,
+                   'recalled': r.action == 'send' and r.msg_id in recalled} for r in rows])
 
 
 @api
@@ -198,10 +200,12 @@ def conversations(request: Request):
                     'body': p.get('body', ''), 'takeover': bool(p.get('note') and '接管' in p.get('note', '')),
                     'content': m.get('content', ''), 'replies': []})
     by_ref = {c['msg_id']: c for c in out}
-    for a in st.actions_for_turns(list(by_ref)):
-        if a.action == 'send':
-            by_ref[a.turn_ref]['replies'].append({'time': a.created_at, 'chat_id': a.chat_id, 'chat_name': names.get(a.chat_id, ''),
-                                                  'content': a.content, 'ok': bool(a.ok), 'error': a.error, 'msg_id': a.msg_id})
+    sends = [a for a in st.actions_for_turns(list(by_ref)) if a.action == 'send']
+    recalled = st.recalled_ids(a.msg_id for a in sends)
+    for a in sends:
+        by_ref[a.turn_ref]['replies'].append({'time': a.created_at, 'chat_id': a.chat_id, 'chat_name': names.get(a.chat_id, ''),
+                                              'content': a.content, 'ok': bool(a.ok), 'error': a.error, 'msg_id': a.msg_id,
+                                              'recalled': a.msg_id in recalled})
     return _json(out)
 
 

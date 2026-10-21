@@ -257,9 +257,12 @@ function clamp(text) {
   return el;
 }
 
-function recallBtn(msgId) {
-  return h('button', { class: 'btn small danger', onclick: () => confirm('撤回这条消息?') &&
-    act(() => api('/api/recall', { method: 'POST', body: { msg_id: msgId } }), '已撤回') }, '撤回');
+// 已撤回的显示灰色标签; 没撤回的给一个悬停才出现的撤回按钮, 免得满屏红字看着像状态
+function recallCtl(r) {
+  if (r.recalled) return h('span', { class: 'tag' }, '已撤回');
+  if (!r.ok || !r.msg_id) return null;
+  return h('button', { class: 'btn small recall', title: '在飞书里撤回这条消息', onclick: () => confirm('撤回这条消息?') &&
+    act(() => api('/api/recall', { method: 'POST', body: { msg_id: r.msg_id } }), '已撤回').then(route) }, '撤回');
 }
 
 function convItem(c) {
@@ -270,8 +273,8 @@ function convItem(c) {
     h('div', { class: 'body' }, c.body),
     c.replies.map(r => h('div', { class: 'reply' },
       h('div', { class: 'meta' }, '↳ ' + fmt(r.time, false), r.chat_id !== c.chat_id ? h('span', { class: 'tag' }, '发到 ' + chatLabel(r.chat_id, r.chat_name)) : null,
-        r.ok ? null : h('span', { class: 'tag bad' }, '被拦截'), r.ok && r.msg_id ? recallBtn(r.msg_id) : null),
-      h('div', { class: 'body' + (r.ok ? '' : ' muted') }, r.ok ? r.content : `${r.content}\n(${r.error})`))));
+        r.ok ? null : h('span', { class: 'tag bad' }, '被拦截'), recallCtl(r)),
+      h('div', { class: 'body' + (r.ok && !r.recalled ? '' : ' muted') }, r.ok ? r.content : `${r.content}\n(${r.error})`))));
 }
 
 async function viewConversations() {
@@ -290,14 +293,14 @@ async function viewActivity() {
     const rows = await api('/api/activity?limit=150');
     put(c, rows.length ? h('table', {},
       h('thead', {}, h('tr', {}, ['时间', '谁', '动作', '会话', '内容', '结果', ''].map(t => h('th', {}, t)))),
-      h('tbody', {}, rows.map(r => h('tr', {},
+      h('tbody', {}, rows.map(r => h('tr', { class: 'act' },
         h('td', { class: 'muted nowrap' }, fmt(r.time)),
         h('td', { class: 'nowrap' }, r.actor === 'agent' ? '数字人' : '本人', r.turn_kind ? h('div', { class: 'muted', style: 'font-size:11.5px' }, KIND[r.turn_kind] || r.turn_kind) : null),
         h('td', { class: 'nowrap' }, { send: '发消息', recall: '撤回' }[r.action] || r.action),
         h('td', { style: 'min-width:120px;max-width:220px' }, h('div', { class: 'lines2', title: chatLabel(r.chat_id, r.chat_name) }, chatLabel(r.chat_id, r.chat_name))),
-        h('td', { style: 'width:50%' }, clamp(r.content)),
+        h('td', { style: 'width:50%', class: r.recalled ? 'muted' : null }, clamp(r.content)),
         h('td', { class: 'nowrap' }, r.ok ? '✓' : h('span', { class: 'tag bad', title: r.error }, '✗ ' + (r.error || '').slice(0, 40))),
-        h('td', { class: 'nowrap' }, r.action === 'send' && r.ok && r.msg_id ? recallBtn(r.msg_id) : null))))) : h('div', { class: 'empty' }, '还没有记录'));
+        h('td', { class: 'nowrap' }, r.action === 'send' ? recallCtl(r) : null))))) : h('div', { class: 'empty' }, '还没有记录'));
   });
 }
 

@@ -41,3 +41,14 @@ def test_writes_need_header(client):
 
 def test_bearer_token(client):
     assert client.get('/api/tasks', headers={'Authorization': f'Bearer {web.get_token()}'}).status_code == 200
+
+
+def test_activity_marks_recalled(client):
+    from larkx.storage import Storage
+    st = Storage()
+    st.log_action(actor='agent', action='send', chat_id='c1', msg_id='11', content='发错了')
+    st.log_action(actor='agent', action='send', chat_id='c1', msg_id='12', content='留着')
+    st.log_action(actor='human', action='recall', chat_id='c1', msg_id='12', content='撤回失败', ok=0, error='x')
+    st.log_action(actor='human', action='recall', chat_id='c1', msg_id='11', content='撤回 11')
+    rows = client.get('/api/activity', headers={'Authorization': f'Bearer {web.get_token()}'}).json()
+    assert {r['msg_id']: r['recalled'] for r in rows if r['action'] == 'send'} == {'11': True, '12': False}

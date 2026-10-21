@@ -95,6 +95,12 @@ main { padding: 24px 28px 48px; max-width: 1180px; width: 100%; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.danger { color: var(--critical); }
 .btn.small { padding: 2px 8px; font-size: 12px; white-space: nowrap; }
+.btn.recall { color: var(--text-secondary); }
+.btn.recall:hover { color: var(--critical); }
+@media (hover: hover) {
+  .btn.recall { visibility: hidden; }
+  .reply:hover .btn.recall, tr.act:hover .btn.recall, .btn.recall:focus-visible { visibility: visible; }
+}
 .btn:disabled { opacity: .5; cursor: default; }
 
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
