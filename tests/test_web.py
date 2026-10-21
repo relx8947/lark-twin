@@ -20,6 +20,8 @@ def test_login_url_keeps_token_out_of_query(tmp_path, monkeypatch):
 
 def test_api_needs_login(client):
     assert client.get('/').status_code == 200
+    r = client.get('/static/feishu.svg')
+    assert r.status_code == 200 and r.headers['content-type'].startswith('image/svg') and r.headers['cache-control'] == 'no-cache'
     assert client.get('/api/tasks').status_code == 401
     assert client.post('/login', json={'token': 'wrong'}).status_code == 401
     assert client.get('/login').status_code == 405

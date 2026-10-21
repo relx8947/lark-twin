@@ -410,6 +410,15 @@ def recall(request: Request):
     return _json({'ok': True})
 
 
+class _Static(StaticFiles):
+    """静态文件每次都向服务器确认(有 ETag, 没改动时返回 304), 升级后浏览器不会用旧的 js/css。"""
+
+    def file_response(self, *args, **kwargs) -> Response:
+        resp = super().file_response(*args, **kwargs)
+        resp.headers['Cache-Control'] = 'no-cache'
+        return resp
+
+
 class _JSONBody:
     """把请求体解析成 dict 放进 request.state.body, 供同步接口使用。"""
 
@@ -450,7 +459,7 @@ def create_app() -> Starlette:
         Route('/api/history', history), Route('/api/history/{sha}', history_item),
         Route('/api/logs', logs), Route('/api/control', control, methods=['POST']),
         Route('/api/restart', restart, methods=['POST']), Route('/api/recall', recall, methods=['POST']),
-        Mount('/static', StaticFiles(directory=str(STATIC)), name='static'),
+        Mount('/static', _Static(directory=str(STATIC)), name='static'),
     ]
     app = Starlette(routes=routes)
     return _JSONBody(app)
