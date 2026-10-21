@@ -13,7 +13,7 @@ dependencies = [
     "websockets==15.0.1",
     "protobuf==5.29.3",
     "protobuf3-to-dict==0.1.5",
-    "SQLAlchemy==2.0.30",
+    "SQLAlchemy==2.0.44",
     "qrcode[pil]==8.2",
     "python-dotenv==1.1.0",
     "questionary==2.1.0",
