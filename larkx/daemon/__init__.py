@@ -133,6 +133,8 @@ class Daemon:
         return n
 
     async def _reply(self, chat_id, text, root_id=None):
+        if self.cfg.get('reply_signature'):
+            text = f"{text}\n{self.cfg['reply_signature']}"
         msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id)
         if not msg_id:
             logger.error(f'控制回执发送失败 [{chat_id}]: {text}')
