@@ -186,7 +186,8 @@ def cmd_send(args):
     st = Storage()
     if is_agent_actor():
         # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
-        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and text.lstrip().startswith(prefix) else ''
+        from .daemon.triggers import strip_mentions
+        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(text).startswith(prefix) else ''
         denied = denied or state.send_denied(args.chat_id, state.read_turn())
         if denied:
             _audit(st, 'send', args.chat_id, text, ok=False, error=denied)

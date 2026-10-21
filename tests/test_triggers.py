@@ -51,3 +51,13 @@ def test_build_prompt_escapes_and_reply_hint():
     assert "larkx send c1 --root a9 - <<'EOF'" in p
     p2 = build_prompt(msg('x'), 'hi', note='重试')
     assert '--root' not in p2 and '(重试)' in p2 and 'owner="false"' in p2
+
+
+def test_leading_mentions_before_prefix():
+    c = cfg(prefix='/ai')
+    assert should_handle(msg('@耿宇贺 /ai 你喜欢喝什么咖啡？', chat_type=2), c, ME)
+    assert should_handle(msg('@张三 @李四 /ai 看一下', chat_type=2), c, ME)
+    assert should_handle(msg('@所有人/ai 通知', chat_type=2), c, ME)
+    assert strip_prefix('@耿宇贺 /ai 你喜欢喝什么咖啡？', '/ai') == '你喜欢喝什么咖啡？'
+    assert not should_handle(msg('@耿宇贺 帮我看下 /ai', chat_type=2), c, ME)
+    assert parse_command(strip_prefix('@耿宇贺 /ai /stop', '/ai')) == ('stop', '')

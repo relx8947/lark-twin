@@ -32,4 +32,5 @@ def test_agent_reply_cannot_start_with_prefix(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, 'LarkClient', lambda *a, **k: (_ for _ in ()).throw(AssertionError('不应发送')))
     assert cli.cmd_send(_send_args(['/ai', '回声'])) == 1
     assert '触发前缀' in capsys.readouterr().out
-    assert [(a.actor, a.ok) for a in st.list_actions()] == [('agent', 0)]
+    assert cli.cmd_send(_send_args(['@张三', '/ai', '回声'])) == 1  # 开头带 @ 也会被 daemon 当成触发
+    assert [(a.actor, a.ok) for a in st.list_actions()] == [('agent', 0), ('agent', 0)]

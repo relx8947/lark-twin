@@ -1,9 +1,16 @@
 """哪些消息交给数字人、控制命令解析、每条消息喂给 agent 的提示词。"""
+import re
 from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
 
 CHAT_TYPE_NAMES = {1: 'p2p', 2: 'group', 3: 'topic_group'}
 COMMANDS = ('clear', 'stop')
+# 群里常见"@某人 /ai ..."的写法: 判断前缀前先去掉开头的 @提及(可以有多个)
+LEADING_MENTIONS = re.compile(r'^(?:@[^\s/@]+\s*)+')
+
+
+def strip_mentions(content: str) -> str:
+    return LEADING_MENTIONS.sub('', (content or '').strip())
 
 
 def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
@@ -11,7 +18,7 @@ def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
     if (not cfg.get('allow_self')) and str(msg.get('from_id')) == str(my_user_id):
         return False
     t = cfg.get('triggers') or {}
-    content = (msg.get('content') or '').strip()
+    content = strip_mentions(msg.get('content'))
     chat_id = str(msg.get('chat_id'))
     sender_id = str(msg.get('from_id'))
     type_name = CHAT_TYPE_NAMES.get(msg.get('chat_type'), '')
@@ -38,7 +45,7 @@ def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
 
 
 def strip_prefix(content: str, prefix: str) -> str:
-    c = (content or '').strip()
+    c = strip_mentions(content)
     if prefix and c.startswith(prefix):
         c = c[len(prefix):].lstrip()
     return c
