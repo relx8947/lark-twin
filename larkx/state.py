@@ -41,6 +41,11 @@ def read_turn():
     return data
 
 
+def is_guest(turn) -> bool:
+    """访客发起的这一轮: 别人的消息(含被接管会话)、别人安排的任务。本人发起、终端指令、维护任务都不算。"""
+    return bool(turn) and turn.get('kind') in ('message', 'task') and not turn.get('is_owner')
+
+
 def send_denied(target_chat: str, turn) -> str:
     """数字人给 target_chat 发消息是否越权; 越权时返回原因, 允许时返回空串。"""
     if not turn:

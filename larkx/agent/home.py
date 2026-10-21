@@ -9,7 +9,8 @@ from loguru import logger
 TEMPLATES = Path(__file__).parent / 'templates'
 # 历次发布的人设模板。数字人目录里的 CLAUDE.md 和其中某一版完全相同(用户没改过)时, 自动升级到当前模板
 OLD_TEMPLATE_SHA256 = {'6927812ddbec998de7f1785c415889ed74adb266f83768a6a5647216dad11bca',
-                       'de2a5b963785a90cbcd3e8e3ae5a0f627804a044352d36d5d8eed506a97337a6'}
+                       'de2a5b963785a90cbcd3e8e3ae5a0f627804a044352d36d5d8eed506a97337a6',
+                       '3e39cab454487972a823ba89b2b290b2019ee01882bf6edab2d46bcc632519a0'}
 GITIGNORE = 'downloads/\n'
 MEMORY_INDEX = '# 记忆索引\n\n每行一条: - [标题](文件名.md) — 一句话说明。具体内容写在对应文件里。\n'
 

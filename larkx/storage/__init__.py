@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import create_engine, desc, func, or_
 from sqlalchemy.orm import sessionmaker
 from ..config import load_config
-from .models import Action, AgentSession, Base, Chat, InboxItem, Message, Takeover, Task
+from .models import Action, AgentSession, Base, Chat, Control, InboxItem, Message, Takeover, Task
 
 
 def _json_default(o):
@@ -345,3 +345,55 @@ class Storage:
             return out
         finally:
             s.close()
+
+    def control_add(self, action: str) -> int:
+        s = self.Session()
+        try:
+            row = Control(action=action)
+            s.add(row)
+            s.commit()
+            return row.id
+        finally:
+            s.close()
+
+    def control_get(self, control_id: int):
+        s = self.Session()
+        try:
+            return s.get(Control, control_id)
+        finally:
+            s.close()
+
+    def control_pending(self):
+        s = self.Session()
+        try:
+            return s.query(Control).filter(Control.status == 'pending').order_by(Control.id).all()
+        finally:
+            s.close()
+
+    def control_done(self, control_id: int, result: str, status: str = 'done'):
+        s = self.Session()
+        try:
+            row = s.get(Control, control_id)
+            if row:
+                row.status, row.result = status, result
+                s.commit()
+        finally:
+            s.close()
+
+    def list_inbox(self, limit=50):
+        s = self.Session()
+        try:
+            rows = s.query(InboxItem).order_by(desc(InboxItem.id)).limit(limit).all()
+            return rows
+        finally:
+            s.close()
+
+    def actions_for_turns(self, refs):
+        s = self.Session()
+        try:
+            return s.query(Action).filter(Action.turn_ref.in_([str(r) for r in refs])).order_by(Action.id).all() if refs else []
+        finally:
+            s.close()
+
+    def count_actions_since(self, since: datetime, actor: str = 'agent', action: str = 'send') -> int:
+        return self.count_actions(actor, action, since)

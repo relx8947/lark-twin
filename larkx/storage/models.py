@@ -106,3 +106,13 @@ class Takeover(Base):
     creator = Column(String(16), default='')
     active = Column(Integer, default=1)
 
+
+class Control(Base):
+    """网页等外部入口给 daemon 的控制请求(打断、重置会话), daemon 每秒取一次执行。"""
+    __tablename__ = 'controls'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.now)
+    action = Column(String(32), default='')
+    status = Column(String(16), default='pending', index=True)
+    result = Column(Text, default='')
+

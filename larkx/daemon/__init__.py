@@ -88,7 +88,7 @@ class Daemon:
         self.listener = Listener(self.client, self.storage, self.cfg, self.auth.user_id, on_stored=self._from_listener,
                                  on_disconnect=self._on_disconnect)
         workers = [asyncio.create_task(self._consume()), asyncio.create_task(self._schedule()),
-                   asyncio.create_task(self._catch_up_loop())]
+                   asyncio.create_task(self._catch_up_loop()), asyncio.create_task(self._control_loop())]
         try:
             await self.listener.run_forever()
         finally:
@@ -212,6 +212,28 @@ class Daemon:
             restored += 1
         if restored or expired:
             logger.info(f'收件箱: {restored} 条重启前没处理完的消息接着处理, {expired} 条太久远已放弃')
+
+    # ---- 外部控制(网页) ----
+
+    async def _control_loop(self):
+        while True:
+            try:
+                for c in self.storage.control_pending():
+                    self.storage.control_done(c.id, await self.control(c.action))
+            except Exception as e:
+                logger.warning(f'处理控制请求失败: {e!r}')
+            await asyncio.sleep(1)
+
+    async def control(self, action: str) -> str:
+        if action == 'interrupt':
+            n = self._drain_inbox()
+            stopped = await self.session.interrupt()
+            return ('已停止当前任务' if stopped else '当前没有在处理的任务') + (f', 清空 {n} 条排队消息' if n else '')
+        if action == 'clear':
+            self._drain_inbox()
+            await self.session.reset()
+            return '已开启新会话(长期记忆保留)'
+        return f'未知的控制动作 {action}'
 
     # ---- 漏收检查与断线告警 ----
 

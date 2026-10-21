@@ -58,7 +58,7 @@ class ClaudeSession:
             system_prompt={'type': 'preset', 'preset': 'claude_code'},
             permission_mode='bypassPermissions',
             env=env,
-            hooks=build_hooks(),
+            hooks=build_hooks(str(self.home), on_alert=self.events.append),
         )
         if self.cfg.get('claude_cli'):
             kw['cli_path'] = resolve_agent_cli(self.cfg['claude_cli'])

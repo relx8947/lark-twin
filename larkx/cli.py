@@ -773,7 +773,29 @@ def main():
         args.text += extra
     elif extra:
         parser.error(f'无法识别的参数: {" ".join(extra)}')
+    if is_agent_actor():
+        denied = _guest_denied(args)
+        if denied:
+            sys.exit(_fail(args, denied, code=3))
     sys.exit(args.fn(args))
+
+
+def _guest_denied(args) -> str:
+    """访客发起的这一轮(不是本人发起): 只能用少数子命令, 只能看当前会话; 被拦下时通知本人。"""
+    from . import guest
+    turn = state.read_turn()
+    if not guest.is_guest(turn):
+        return ''
+    st = Storage()
+    denied = guest.cli_denied(args.cmd, args, turn, st)
+    if denied:
+        from .notify import Notifier
+        st.log_action(actor='agent', action=args.cmd, chat_id=turn.get('chat_id', ''), content=' '.join(sys.argv[1:])[:300],
+                      ok=0, error=denied, turn_kind=turn.get('kind', ''), turn_ref=turn.get('ref', ''))
+        Notifier(load_config(), LarkClient(LarkAuth())).alert(
+            f'访客发起的请求({turn.get("ref")})想让数字人执行 larkx {args.cmd}, 已拦截: {denied}',
+            key=f'guest:{args.cmd}:{turn.get("ref")}', cooldown=600)
+    return denied
 
 
 if __name__ == '__main__':
