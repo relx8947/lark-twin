@@ -8,5 +8,7 @@ qrcode[pil]==8.2
 python-dotenv==1.1.0
 questionary==2.1.0
 claude-agent-sdk==0.2.168
+starlette==1.9.0
+uvicorn==0.54.0
 # 可选: MySQL 存储后端
 # PyMySQL==1.1.0

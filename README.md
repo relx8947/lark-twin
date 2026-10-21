@@ -15,6 +15,7 @@
 - **替你聊**：接管某个会话一段时间，由它代你和对方往来，结束后给你一份总结。
 - **有边界**：没有你的指令，不会去别的会话发消息。它在外面说的话会实时抄送给你，异常时会告警，每次发送都有审计记录。
 - **不丢消息**：消息先落库再处理；重启后会接着处理没回完的消息，并从服务器补收长连接漏推的消息。
+- **看得见**：网页控制台里能看到它在做什么、和谁聊了什么，也能管理任务、接管、记忆和人设，必要时一键打断。
 
 ## 快速开始
 
@@ -57,7 +58,15 @@ larkx recall <msg_id>            # 撤回一条
 larkx service status | logs -f   # 运行状态
 ```
 
+**在浏览器里**
+
+`larkx service install` 会同时装上网页控制台（`lark-twin-web.service`，只监听 `127.0.0.1:18341`），对外由你自己的 Nginx 反向代理。`larkx web url` 打印带令牌的登录链接，打开一次即可；`larkx web reset-token` 让所有已登录的浏览器失效。
+
 执行 `larkx skill install` 之后，直接对你的 Claude Code 或 Codex 说"给张三发个消息""看看某个群在聊什么"就可以。完整命令见 `larkx --help`。
+
+## 配套 skill
+
+`skills/` 下有三个：`lark-twin`（在本仓库里部署运维）、`larkx`（装进你的 Claude Code / Codex，用来操作飞书）、`larkx-agent`（数字人自己用的 CLI 手册）。说明见 [skills/README.md](skills/README.md)。
 
 ## 配置
 
@@ -71,13 +80,14 @@ larkx service status | logs -f   # 运行状态
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认是 `/ai` |
 | `LARKX_REPLY_SIGNATURE` | 每条回复末尾的标注，比如 `🤖 lark-twin · 数字分身` |
 | `LARKX_ALERT_CMD` | 飞书登录失效时的备用告警命令，比如用 lark-cli 机器人身份发给你 |
+| `LARKX_WEB_URL` | 网页控制台的对外地址（Nginx 入口），用来生成登录链接 |
 
 数字人的人设在 `~/.larkx/agent/CLAUDE.md`，记忆在 `~/.larkx/agent/memory/`，都可以直接修改。
 
 ## 注意
 
 - 用的是非官方协议，飞书一升级就可能失效，也有被风控的可能。如果是公司账号，先确认公司规定是否允许。
-- `~/.larkx/credentials.json` 就是你账号的完整登录态，务必妥善保管。
+- `~/.larkx/credentials.json` 就是你账号的完整登录态，务必妥善保管。控制台的令牌 `~/.larkx/web_token` 能看到你的聊天和记忆，同样不要外传。
 - 边界由 CLI 在代码里拦截，但数字人拥有完整的 shell 权限，所以这些限制只能防住误操作，不能当作安全隔离。
 
 ## 开发

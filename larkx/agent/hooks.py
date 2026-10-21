@@ -12,7 +12,7 @@ from loguru import logger
 from .. import guest, state
 
 # 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务、以本人身份下指令、改 skill: 都不该由数字人自己做
-FORBIDDEN_CMD = re.compile(r'\b(larkx|lark)\s+(api|auth|listen|daemon|service|doctor|say|skill)\b')
+FORBIDDEN_CMD = re.compile(r'\b(larkx|lark)\s+(api|auth|listen|daemon|service|doctor|say|skill|web)\b')
 
 
 def _deny(reason: str) -> dict:
@@ -23,10 +23,10 @@ def _deny(reason: str) -> dict:
 def check_tool_use(tool_name: str, tool_input: dict):
     """返回拒绝原因; 放行时返回 None。"""
     blob = json.dumps(tool_input or {}, ensure_ascii=False)
-    if 'credentials.json' in blob:
-        return '数字人不能读取或修改飞书登录凭证'
+    if 'credentials.json' in blob or 'web_token' in blob:
+        return '数字人不能读取或修改飞书登录凭证和网页控制台令牌'
     if tool_name == 'Bash' and FORBIDDEN_CMD.search((tool_input or {}).get('command', '')):
-        return '数字人不能调用 larkx api / auth / listen / daemon / service / doctor / say / skill; 需要的能力请用 larkx 的其他子命令'
+        return '数字人不能调用 larkx api / auth / listen / daemon / service / doctor / say / skill / web; 需要的能力请用 larkx 的其他子命令'
     return None
 
 

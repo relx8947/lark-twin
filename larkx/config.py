@@ -60,6 +60,10 @@ DEFAULTS = {
     "catchup_interval": 900,
     # /ai /takeover 不写时长时, 默认接管多久(秒)
     "takeover_default": 3600,
+    # 网页控制台: 只监听 127.0.0.1 的这个端口, 由系统 Nginx 反向代理出去
+    "web_port": 18341,
+    # 浏览器访问控制台的地址(Nginx 入口), 用于生成登录链接
+    "web_url": "",
     "triggers": {
         "prefix": "",
         "chat_types": [],
@@ -113,7 +117,7 @@ def load_config() -> dict:
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
     cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
     cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
-    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default"):
+    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default", "web_port"):
         cfg[key] = int(cfg[key])
     for key in ("agent_home", "agent_claude_dir", "agent_codex_dir"):
         cfg[key] = os.path.expanduser(cfg[key])

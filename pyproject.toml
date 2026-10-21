@@ -18,11 +18,13 @@ dependencies = [
     "python-dotenv==1.1.0",
     "questionary==2.1.0",
     "claude-agent-sdk==0.2.168",
+    "starlette==1.9.0",
+    "uvicorn==0.54.0",
 ]
 
 [project.optional-dependencies]
 mysql = ["PyMySQL==1.1.0"]
-dev = ["pytest"]
+dev = ["pytest", "httpx"]
 
 [project.scripts]
 larkx = "larkx.cli:main"
@@ -35,3 +37,4 @@ include = ["larkx*"]
 [tool.setuptools.package-data]
 "larkx.protocol.proto" = ["cmd_map.json"]
 "larkx.agent" = ["templates/CLAUDE.md", "templates/skills/larkx/SKILL.md", "templates/skills/larkx-owner/SKILL.md"]
+"larkx.web" = ["static/*"]

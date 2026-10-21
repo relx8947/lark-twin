@@ -10,7 +10,7 @@ from .storage import Storage
 
 # 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务、
 # 以本人身份给自己下指令(say)、改本机 agent 的 skill
-AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor', 'say', 'skill'}
+AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor', 'say', 'skill', 'web'}
 
 
 def _print_json(obj):
@@ -605,35 +605,53 @@ def cmd_service(args):
     from . import service
     if not service.available():
         return _fail(args, '本机没有 systemd, 无法托管为服务; 可以直接运行 larkx daemon')
+    kinds = service.kinds(args.unit)
     if args.action == 'install':
-        path = service.install()
-        print(f'已安装并设为开机自启: {path}\n启动: larkx service start')
+        for path in service.install(args.unit):
+            print(f'已安装并设为开机自启: {path}')
+        print('启动: larkx service start')
         return 0
     if args.action == 'uninstall':
-        service.uninstall()
+        service.uninstall(args.unit)
         print('已停止并卸载服务')
         return 0
     if args.action in ('start', 'stop', 'restart'):
-        if not service.unit_path().exists():
-            return _fail(args, '服务未安装, 先运行 larkx service install')
-        r = service.systemctl(args.action, service.UNIT)
-        if r.returncode != 0:
-            return _fail(args, f'systemctl {args.action} 失败: {r.stderr.strip()}')
+        for kind in kinds:
+            if not service.unit_path(kind).exists():
+                return _fail(args, f'{service.UNITS[kind]} 未安装, 先运行 larkx service install')
+            r = service.systemctl(args.action, service.UNITS[kind])
+            if r.returncode != 0:
+                return _fail(args, f'systemctl {args.action} {service.UNITS[kind]} 失败: {r.stderr.strip()}')
     if args.action == 'logs':
         from .daemon import LOG_PATH
         if not LOG_PATH.exists():
             return _fail(args, f'还没有日志文件 {LOG_PATH}, 服务可能从未成功启动; 可以试试 journalctl --user -u {service.UNIT}')
         cmd = ['tail', '-n', str(args.lines)] + (['-F'] if args.follow else []) + [str(LOG_PATH)]
         return subprocess.run(cmd).returncode
-    st = service.status()
-    st['stray_daemons'] = service.stray_daemons()
+    info = {kind: service.status(kind) for kind in kinds}
+    stray = service.stray_daemons()
     if args.json:
-        _print_json(st)
-    else:
-        state = '运行中' if st['active'] else ('已停止' if st['installed'] else '未安装')
-        print(f"{service.UNIT}: {state}  pid={st['main_pid'] or '-'}  开机自启={st['enabled']}")
-        if st['stray_daemons']:
-            print(f"注意: 还有不归 systemd 管的 larkx daemon 进程 {st['stray_daemons']}, 同一账号会出现两个数字人")
+        _print_json({'units': info, 'stray_daemons': stray})
+        return 0
+    for kind, st in info.items():
+        label = '运行中' if st['active'] else ('已停止' if st['installed'] else '未安装')
+        print(f"{st['unit']}: {label}  pid={st['main_pid'] or '-'}  开机自启={st['enabled']}")
+    if stray:
+        print(f"注意: 还有不归 systemd 管的 larkx daemon 进程 {stray}, 同一账号会出现两个数字人")
+    return 0
+
+
+def cmd_web(args):
+    from .web.app import get_token, login_url, run_web
+    cfg = load_config()
+    if args.action == 'url':
+        print(login_url(cfg))
+        return 0
+    if args.action == 'reset-token':
+        get_token(reset=True)
+        print('令牌已重置, 之前登录的浏览器都需要重新打开登录链接:\n' + login_url(cfg))
+        return 0
+    run_web()
     return 0
 
 
@@ -715,6 +733,7 @@ def main():
     p.set_defaults(fn=cmd_daemon)
     p = sub.add_parser('service', help='用 systemd 用户服务托管 daemon')
     p.add_argument('action', choices=['install', 'uninstall', 'start', 'stop', 'restart', 'status', 'logs'])
+    p.add_argument('--unit', choices=['all', 'daemon', 'web'], default='all', help='操作哪个服务, 默认两个都操作')
     p.add_argument('-n', '--lines', type=int, default=100, help='logs 显示的行数')
     p.add_argument('-f', '--follow', action='store_true', help='logs 持续输出')
     p.add_argument('--json', action='store_true')
@@ -759,6 +778,9 @@ def main():
     p.add_argument('action', choices=['install'])
     p.add_argument('--target', choices=['claude', 'codex', 'all'], default='all')
     p.set_defaults(fn=cmd_skill)
+    p = sub.add_parser('web', help='网页控制台: 默认启动服务; url 打印登录链接; reset-token 重置令牌')
+    p.add_argument('action', nargs='?', choices=['serve', 'url', 'reset-token'], default='serve')
+    p.set_defaults(fn=cmd_web)
     p = sub.add_parser('doctor', help='检查登录、配置、模型调用和服务状态')
     p.add_argument('--skip-model', action='store_true', help='跳过模型调用检查')
     p.add_argument('--json', action='store_true')

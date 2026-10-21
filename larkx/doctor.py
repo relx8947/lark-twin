@@ -129,6 +129,12 @@ def check_service():
         out.append(_check('后台服务', WARN, '已安装但未运行', '运行 larkx service start, 失败时看 larkx service logs'))
     else:
         out.append(_check('后台服务', OK, f'运行中 pid={st["main_pid"]} 开机自启={st["enabled"]}'))
+    web = service.status('web')
+    if not web['installed'] or not web['active']:
+        out.append(_check('网页控制台', WARN, '未安装' if not web['installed'] else '已安装但未运行',
+                          '运行 larkx service install && larkx service start, 再用 larkx web url 获取登录链接'))
+    else:
+        out.append(_check('网页控制台', OK, f'运行中 pid={web["main_pid"]}'))
     stray = service.stray_daemons()
     if stray:
         out.append(_check('重复进程', WARN, f'还有不归 systemd 管的 larkx daemon: {stray}, 同一账号会出现两个数字人',

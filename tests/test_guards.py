@@ -9,6 +9,8 @@ def test_hook_blocks_raw_api_and_credentials():
     assert check_tool_use('Bash', {'command': 'larkx api chats.PullChatsByIdsRequest {}'})
     assert check_tool_use('Bash', {'command': 'cd /tmp && lark auth import --cookie x'})
     assert check_tool_use('Read', {'file_path': '/home/u/.larkx/credentials.json'})
+    assert check_tool_use('Bash', {'command': 'larkx web url'})
+    assert check_tool_use('Bash', {'command': 'cat ~/.larkx/web_token'})
     assert check_tool_use('Bash', {'command': "larkx send c1 --json - <<'EOF'\nhi\nEOF"}) is None
     assert check_tool_use('Bash', {'command': 'larkx messages c1 --json'}) is None
 
