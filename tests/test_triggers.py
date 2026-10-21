@@ -53,11 +53,38 @@ def test_build_prompt_escapes_and_reply_hint():
     assert '--root' not in p2 and '(重试)' in p2 and 'owner="false"' in p2
 
 
-def test_leading_mentions_before_prefix():
+def rich(*parts):
+    """构造带富文本的消息内容: parts 是 ('at', user_id, 显示名) 或 ('text', 文本)。"""
+    from larkx.protocol.proto import proto_pb2 as P
+    dictionary, content = {}, ''
+    for i, part in enumerate(parts):
+        if part[0] == 'at':
+            prop = P.AtProperty(userId=part[1], content=part[2]).SerializeToString()
+            dictionary[str(i)] = {'tag': 5, 'property': prop}
+            content += part[2]
+        else:
+            dictionary[str(i)] = {'tag': 1, 'property': P.TextProperty(content=part[1]).SerializeToString()}
+            content += part[1]
+    data = {'richText': {'elementIds': list(dictionary), 'elements': {'dictionary': dictionary}}}
+    return content, data
+
+
+def test_leading_mentions_must_include_me():
     c = cfg(prefix='/ai')
-    assert should_handle(msg('@耿宇贺 /ai 你喜欢喝什么咖啡？', chat_type=2), c, ME)
-    assert should_handle(msg('@张三 @李四 /ai 看一下', chat_type=2), c, ME)
-    assert should_handle(msg('@所有人/ai 通知', chat_type=2), c, ME)
-    assert strip_prefix('@耿宇贺 /ai 你喜欢喝什么咖啡？', '/ai') == '你喜欢喝什么咖啡？'
-    assert not should_handle(msg('@耿宇贺 帮我看下 /ai', chat_type=2), c, ME)
+    content, data = rich(('at', ME, '@耿宇贺'), ('text', ' /ai 你喜欢喝什么咖啡？'))
+    assert should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    assert strip_prefix(content, '/ai') == '你喜欢喝什么咖啡？'
+    content, data = rich(('at', '999', '@江勇涛'), ('text', ' /ai 你喜欢耿宇贺吗'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    content, data = rich(('at', '999', '@张三'), ('at', ME, '@耿宇贺'), ('text', ' /ai 看一下'))
+    assert should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    content, data = rich(('at', 'all', '@所有人'), ('text', '/ai 通知'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    # 开头没有 @、@ 在指令后面: 照常触发
+    content, data = rich(('text', '/ai 问问 '), ('at', '999', '@张三'))
+    assert should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    # 解析不出富文本时退回 at_me
+    assert should_handle(msg('@耿宇贺 /ai x', chat_type=2, at_me=True), c, ME)
+    assert not should_handle(msg('@江勇涛 /ai x', chat_type=2), c, ME)
+    assert not should_handle(msg('@耿宇贺 帮我看下 /ai', chat_type=2, at_me=True), c, ME)
     assert parse_command(strip_prefix('@耿宇贺 /ai /stop', '/ai')) == ('stop', '')

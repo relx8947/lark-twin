@@ -3,14 +3,60 @@ import re
 from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
 
+from ..protocol.proto import proto_pb2 as P
+
 CHAT_TYPE_NAMES = {1: 'p2p', 2: 'group', 3: 'topic_group'}
 COMMANDS = ('clear', 'stop')
 # 群里常见"@某人 /ai ..."的写法: 判断前缀前先去掉开头的 @提及(可以有多个)
 LEADING_MENTIONS = re.compile(r'^(?:@[^\s/@]+\s*)+')
 
 
+# 富文本里的元素类型: 5 是 @; 这些是纯文本类
+AT_TAG = 5
+TEXT_TAGS = (1, 3, 7, 8, 9, 17)
+
+
 def strip_mentions(content: str) -> str:
     return LEADING_MENTIONS.sub('', (content or '').strip())
+
+
+def leading_mention_ids(msg: dict):
+    """消息开头 @ 的人的 user_id(@所有人 是 'all'); 拿不到富文本时返回 None。"""
+    data = msg.get('content_data')
+    rich = data.get('richText') if isinstance(data, dict) else None
+    try:
+        dictionary = rich['elements']['dictionary']
+    except (TypeError, KeyError):
+        return None
+    ids = []
+    for key in rich.get('elementIds') or sorted(dictionary, key=lambda k: int(k) if str(k).isdigit() else 0):
+        el = dictionary.get(key) or {}
+        prop = el.get('property')
+        if not isinstance(prop, (bytes, bytearray)):
+            return None
+        tag = el.get('tag', 1)
+        if tag == AT_TAG:
+            ap = P.AtProperty()
+            ap.ParseFromString(prop)
+            ids.append(ap.userId)
+        elif tag in TEXT_TAGS:
+            tp = P.TextProperty()
+            tp.ParseFromString(prop)
+            if tp.content.strip():
+                break
+        else:
+            break
+    return ids
+
+
+def addressed_to_me(msg: dict, my_user_id: str) -> bool:
+    """开头带 @ 的消息, 只有 @ 到本人才算叫本人的数字人; 群里"@某人 /ai"多半是在叫那个人的数字人。"""
+    if not (msg.get('content') or '').strip().startswith('@'):
+        return True
+    ids = leading_mention_ids(msg)
+    if ids is None:
+        return bool(msg.get('at_me'))
+    return str(my_user_id) in ids
 
 
 def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
@@ -23,6 +69,8 @@ def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
     sender_id = str(msg.get('from_id'))
     type_name = CHAT_TYPE_NAMES.get(msg.get('chat_type'), '')
     if t.get('prefix') and (not content.startswith(t['prefix'])):
+        return False
+    if not addressed_to_me(msg, my_user_id):
         return False
     chat_types = t.get('chat_types') or []
     if chat_types and type_name not in chat_types:
