@@ -237,6 +237,23 @@ class Storage:
         finally:
             s.close()
 
+    def messages_after(self, chat_id: str, position: int, limit: int = 50):
+        """会话里 position 在这之后的消息, 按 position 排好。"""
+        s = self.Session()
+        try:
+            return (s.query(Message).filter(Message.chat_id == str(chat_id), Message.position > int(position))
+                    .order_by(Message.position).limit(limit).all())
+        finally:
+            s.close()
+
+    def latest_message_id(self) -> int:
+        """最新入库的那条消息的自增序号, 没有消息时是 0。"""
+        s = self.Session()
+        try:
+            return int(s.query(func.max(Message.id)).scalar() or 0)
+        finally:
+            s.close()
+
     def recalled_ids(self, msg_ids) -> set:
         """这些消息里已经成功撤回的。"""
         ids = [str(m) for m in msg_ids if m]

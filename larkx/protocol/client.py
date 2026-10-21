@@ -11,6 +11,12 @@ from .proto import builders, decoders, proto_pb2 as P
 from .proto.ids import generate_access_key, generate_long_request_id, generate_request_cid, generate_request_id
 
 
+# 请求里声明的客户端版本。服务端按它裁剪返回的消息: 默认的旧版本拉到的卡片会被降级成"请升级客户端"的提示,
+# 带上和 WS 连接一致的新版本才拿得到完整卡片(jsonCard)。daemon 一直用默认版本, 网页版飞书看消息时用新版本。
+DEFAULT_COMMAND_VERSION = '5.7.0'
+MODERN_COMMAND_VERSION = '7.72.0'
+
+
 class LarkClient:
     def __init__(self, auth: LarkAuth):
         self.auth = auth
@@ -127,7 +133,7 @@ class LarkClient:
         except Exception as e:
             logger.error(f'消息回调异常: {e}')
 
-    def _gateway_post(self, packet: P.Packet) -> bytes:
+    def _gateway_post(self, packet: P.Packet, command_version: str=None) -> bytes:
         headers = {
             'content-type': 'application/x-protobuf',
             'accept': '*/*',
@@ -136,7 +142,7 @@ class LarkClient:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
             'x-appid': self.auth.gateway_app_id,
             'x-command': str(packet.cmd),
-            'x-command-version': '5.7.0',
+            'x-command-version': command_version or DEFAULT_COMMAND_VERSION,
             'x-lgw-os-type': '1',
             'x-lgw-terminal-type': '2',
             'x-source': 'web',
@@ -273,14 +279,15 @@ class LarkClient:
         except Exception:
             return None
 
-    def api(self, type_or_cmd, data: dict=None, raw: bytes=None):
+    def api(self, type_or_cmd, data: dict=None, raw: bytes=None, command_version: str=None):
+        """command_version: 请求声明的客户端版本, 默认 DEFAULT_COMMAND_VERSION; 拉消息要新版格式时传 MODERN_COMMAND_VERSION。"""
         from .proto import gateway
         cmd, req_cls, resp_cls = gateway.resolve_cmd(type_or_cmd)
         req_msg = None
         if req_cls is not None:
             req_msg = gateway.request_from_dict(req_cls, data or {})
         pkt = gateway.build_packet(cmd, generate_long_request_id(), req_msg=req_msg, req_bytes=raw if req_msg is None else None)
-        content = self._gateway_post(pkt)
+        content = self._gateway_post(pkt, command_version) if command_version else self._gateway_post(pkt)
         resp_pkt = P.Packet()
         resp_pkt.ParseFromString(content)
         if resp_cls is not None and resp_pkt.payload:
@@ -308,18 +315,14 @@ class LarkClient:
             self._thread_chats[chat_id] = decoders.is_thread_chat(info)
         return self._thread_chats[chat_id]
 
-    def pull_history(self, chat_id: str, positions, save_storage=None):
-        resp = self.api('messages.PullMessagesByPositionsRequest', {'chatId': str(chat_id), 'positions': [int(p) for p in positions]})
+    def pull_history(self, chat_id: str, positions, save_storage=None, command_version: str=None):
+        resp = self.api('messages.PullMessagesByPositionsRequest', {'chatId': str(chat_id), 'positions': [int(p) for p in positions]},
+                        command_version=command_version)
         messages = (resp or {}).get('messages') or {}
         thread_chat = self.is_thread_chat(chat_id)
         out = []
         for pos_key, v in sorted(messages.items(), key=lambda kv: int(kv[0])):
-            message_type = decoders.enum_to_int(v.get('type', 0))
-            chat_type = decoders.enum_to_int(v.get('chatType', 0))
-            summary, data = decoders.decode_message_content(message_type, v.get('content', b''))
-            root_id = v.get('rootId') or ''
-            scope, anchor = decoders.resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '', thread_chat)
-            msg = {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type, 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or int(pos_key), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data, 'recalled': v.get('status') == 2 or bool(v.get('isRemoved'))}
+            msg = self._message_dict(v, chat_id, thread_chat, int(pos_key))
             out.append(msg)
             if save_storage is not None:
                 try:
@@ -327,3 +330,28 @@ class LarkClient:
                 except Exception:
                     pass
         return out
+
+    def pull_messages(self, message_ids, command_version: str=None) -> list:
+        """按消息 id 批量取消息(只读), 格式和 pull_history 一样; 取不到的(没有权限、已被清理)不在结果里。"""
+        ids = [str(m) for m in message_ids if m]
+        out = []
+        for i in range(0, len(ids), 50):
+            resp = self.api('messages.PullMessagesByIdsRequest', {'messageIds': ids[i:i + 50]}, command_version=command_version)
+            for v in ((resp or {}).get('messages') or {}).values():
+                chat_id = str(v.get('chatId') or v.get('channelId') or '')
+                out.append(self._message_dict(v, chat_id, self.is_thread_chat(chat_id) if chat_id else False, 0))
+        return out
+
+    @staticmethod
+    def _message_dict(v: dict, chat_id: str, thread_chat: bool, position: int) -> dict:
+        message_type = decoders.enum_to_int(v.get('type', 0))
+        chat_type = decoders.enum_to_int(v.get('chatType', 0))
+        summary, data = decoders.decode_message_content(message_type, v.get('content', b''))
+        root_id = v.get('rootId') or ''
+        scope, anchor = decoders.resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '', thread_chat)
+        return {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)),
+                'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type,
+                'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False,
+                'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or position,
+                'create_time': v.get('createTime'), 'content': summary, 'content_data': data,
+                'recalled': v.get('status') == 2 or bool(v.get('isRemoved')), 'remover_id': str(v.get('removerId') or '')}

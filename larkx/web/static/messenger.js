@@ -32,6 +32,8 @@ const ICONS = {
   eye: '<path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><path d="M4 20L20 4"/>',
   back: '<path d="M15 5l-7 7 7 7"/>',
   chat: '<path d="M4.5 4.5h15a1.5 1.5 0 0 1 1.5 1.5v10a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3.5v-3.5h-1A1.5 1.5 0 0 1 3 16V6a1.5 1.5 0 0 1 1.5-1.5z"/>',
+  file: '<path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/>',
+  video: '<rect x="3" y="5.5" width="13" height="13" rx="2"/><path d="M16 10l5-3v10l-5-3z"/>',
 };
 function icon(name, cls) {
   const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -108,19 +110,39 @@ function avatar(url, name, size = 32) {
 
 // ---- 状态 ----
 
-const S = { feed: [], cursor: '', filter: 'all', q: '', results: null,
-  chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, seq: 0, poll: 0, me: null };
+const S = { feed: [], cursor: '', filter: 'all', q: '', results: null, latest: null, feedAt: 0, feedDirty: false, feedBusy: false,
+  chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, seq: 0, poll: 0, me: null,
+  readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false };
+// 新消息: 每秒先问本地库(daemon 收到推送就入库), 本地没有时最多每 3 秒去服务端拉一次; 页面在后台时放慢
+const POLL_MS = 1000, SERVER_MS = 3000, SERVER_HIDDEN_MS = 10000;
 const KIND = { p2p: '单聊', group: '群组', topic: '话题群' };
 const FILTERS = [['all', '全部'], ['unread', '未读'], ['p2p', '单聊'], ['group', '群组']];
 
 // ---- 会话列表 ----
 
 async function refreshFeed() {
-  const d = await api('/api/im/feed');
-  const fresh = new Set(d.items.map(i => i.chat_id));
-  S.feed = d.items.concat(S.feed.filter(i => !fresh.has(i.chat_id)));
-  if (!S.cursor) S.cursor = d.next_cursor;
-  renderFeed();
+  if (S.feedBusy) return;
+  S.feedBusy = true; S.feedAt = Date.now();
+  try {
+    const d = await api('/api/im/feed');
+    const fresh = new Set(d.items.map(i => i.chat_id));
+    S.feed = d.items.concat(S.feed.filter(i => !fresh.has(i.chat_id)));
+    if (!S.cursor) S.cursor = d.next_cursor;
+    renderFeed();
+  } finally { S.feedBusy = false; }
+}
+
+// 本地库有新消息入库就尽快刷新会话列表(最多每 3 秒一次), 不用等 8 秒一次的定时刷新
+async function checkChanges() {
+  if (document.hidden) return;
+  const d = await api('/api/im/changes').catch(() => null);
+  if (!d) return;
+  if (S.latest != null && d.latest !== S.latest) S.feedDirty = true;
+  S.latest = d.latest;
+  if (S.feedDirty && !S.feedBusy && Date.now() - S.feedAt >= 3000) {
+    S.feedDirty = false;
+    refreshFeed().catch(() => {});
+  }
 }
 
 async function moreFeed() {
@@ -198,9 +220,11 @@ async function openChat(chatId) {
   const d = await act(() => api(`/api/im/chat/${chatId}`));
   if (seq !== S.seq) return;
   if (!d) { emptyChat('打不开这个会话'); return; }
-  Object.assign(S, { chat: d.chat, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more });
+  // 已读位置只在打开时记一次: "以下为新消息"标在打开时就未读的第一条前, 之后来的新消息不再挪动它
+  Object.assign(S, { chat: d.chat, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more,
+    readPos: d.chat.read_position || 0, unreadUpTo: d.end, lastServer: Date.now(), polling: false });
   renderChat();
-  S.poll = setInterval(() => pollChat(seq), 3000);
+  S.poll = setInterval(() => pollTick(seq), POLL_MS);
 }
 
 function closeChat() {
@@ -211,11 +235,28 @@ function closeChat() {
   renderFeed();
 }
 
+async function pollTick(seq) {
+  if (S.polling || seq !== S.seq) return;
+  S.polling = true;
+  try {
+    const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}&local=1`).catch(() => null);
+    if (seq !== S.seq) return;
+    if (d && d.messages.length) {
+      addMsgs(d.messages); S.end = Math.max(S.end, d.end); renderMsgs('keep-bottom');
+      return;
+    }
+    if (Date.now() - S.lastServer >= (document.hidden ? SERVER_HIDDEN_MS : SERVER_MS)) await pollChat(seq);
+  } finally { if (seq === S.seq) S.polling = false; }
+}
+
 async function pollChat(seq) {
+  S.lastServer = Date.now();
   const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}`).catch(() => null);
   if (!d || seq !== S.seq) return;
   S.chat = d.chat;
-  if (d.messages.length) { addMsgs(d.messages); S.end = Math.max(S.end, d.end); renderMsgs('keep-bottom'); }
+  if (d.messages.length) addMsgs(d.messages);
+  S.end = Math.max(S.end, d.end);
+  if (d.messages.length) renderMsgs('keep-bottom');
   renderHead();
 }
 
@@ -247,7 +288,7 @@ function renderChat() {
   put($('chat'), S.head, S.body,
     h('div', { class: 'composer' }, S.replyBar, input,
       h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)));
-  renderHead(); renderMsgs('bottom');
+  renderHead(); renderMsgs('unread');
   input.focus();
 }
 
@@ -264,25 +305,90 @@ function renderHead() {
 }
 
 function msgRow(m, prev) {
-  if (m.type === 'SYSTEM') return h('div', { class: 'sys-msg' }, m.content.replace(/^\[系统消息\]\s*/, ''));
+  if (m.kind === 'system' || m.kind === 'recalled') return h('div', { class: 'sys-msg' + (m.kind === 'recalled' ? ' recalled' : '') }, m.content);
   // 同一个人 5 分钟内的连续消息不重复显示头像和名字, 和客户端一样
-  const grouped = prev && prev.type !== 'SYSTEM' && prev.from_id === m.from_id && m.time - prev.time < 300;
-  const bubble = m.image_key
-    ? h('div', { class: 'bubble img' }, chatImage(m))
-    : h('div', { class: 'bubble' }, m.root_id ? h('div', { class: 'bubble-reply' }, '回复话题') : null, m.content);
+  const grouped = prev && prev.kind !== 'system' && prev.kind !== 'recalled' && prev.from_id === m.from_id && m.time - prev.time < 300;
   return h('div', { class: 'msg' + (m.me ? ' me' : '') },
     grouped ? h('span', { class: 'msg-avatar-gap' }) : avatar(m.avatar, m.sender, 32),
     h('div', { class: 'msg-main' },
       grouped ? null : h('div', { class: 'msg-meta' }, m.me ? null : h('span', {}, m.sender || '未知'), h('time', {}, msgTime(m.time))),
-      bubble),
+      m.quote ? h('div', { class: 'msg-quote', title: (m.quote.sender ? m.quote.sender + '：' : '') + m.quote.text },
+        m.quote.sender ? h('span', { class: 'msg-quote-who' }, m.quote.sender + '：') : null, m.quote.text) : null,
+      msgBody(m)),
     h('div', { class: 'msg-ops' }, h('button', { title: '回复', onclick: () => setReply(m) }, icon('reply'), '回复')));
 }
 
-function chatImage(m) {
-  const img = h('img', { src: `/api/im/media?chat=${S.chatId}&msg=${m.msg_id}&key=${encodeURIComponent(m.image_key)}`, alt: '图片', loading: 'lazy' });
-  img.addEventListener('click', () => window.open(img.src, '_blank'));
-  img.addEventListener('error', () => img.replaceWith(h('div', { class: 'bubble' }, '[图片]')));
-  return img;
+function msgBody(m) {
+  if (m.kind === 'image') return h('div', { class: 'bubble img' }, chatImage(m, m.image, 260, true));
+  if (m.kind === 'sticker') return h('div', { class: 'bubble img sticker' }, chatImage(m, m.image, 140, false));
+  if (m.kind === 'file') return fileCard(m);
+  if (m.kind === 'card') return cardBubble(m);
+  return h('div', { class: 'bubble' },
+    m.root_id && !m.quote ? h('div', { class: 'bubble-reply' }, '回复话题') : null,
+    m.title ? h('div', { class: 'bubble-title' }, m.title) : null,
+    segments(m.segments, m));
+}
+
+// 后端整理好的片段: 文字一律走 textContent, 链接只认 http/https, 新窗口打开且不带 opener/referrer
+const SEG_STYLES = ['bold', 'italic', 'underline', 'strike', 'code'];
+const SAFE_HREF = /^https?:\/\//i;
+function segments(list, m) {
+  return (list || []).map(s => {
+    if (s.type === 'link' && SAFE_HREF.test(s.href || '')) return h('a', { href: s.href, target: '_blank', rel: 'noopener noreferrer', title: s.href }, s.text || s.href);
+    if (s.type === 'at') return h('span', { class: 'at' + (s.me ? ' at-me' : '') }, s.name);
+    if (s.type === 'image') return chatImage(m, s, 260, true, 'inline-img');
+    const cls = SEG_STYLES.filter(k => s[k]).map(k => 'seg-' + k).join(' ');
+    return cls ? h('span', { class: cls }, s.text || '') : document.createTextNode(s.text || '');
+  });
+}
+
+function mediaUrl(m, key) {
+  return `/api/im/media?chat=${S.chatId}&msg=${encodeURIComponent(m.msg_id)}&key=${encodeURIComponent(key)}`;
+}
+
+// 按原图比例先占好位置, 图片加载完成前后高度不变, 定位到"以下为新消息"时不会被挤开
+function fitStyle(w, hgt, max) {
+  if (!(w > 0 && hgt > 0)) return null;
+  const k = Math.min(1, max / Math.max(w, hgt));
+  return `width:${Math.max(1, Math.round(w * k))}px;aspect-ratio:${w}/${hgt}`;
+}
+
+function chatImage(m, img, max, zoom, cls) {
+  const el = h('img', { src: mediaUrl(m, img.key), alt: m.kind === 'sticker' ? '表情包' : '图片', loading: 'lazy',
+    class: cls || null, style: fitStyle(img.w, img.h, max) });
+  if (zoom) el.addEventListener('click', () => window.open(el.src, '_blank', 'noopener'));
+  el.addEventListener('error', () => el.replaceWith(document.createTextNode(m.kind === 'sticker' ? '[表情包]' : '[图片]')));
+  return el;
+}
+
+function fmtSize(n) {
+  if (!n) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0; while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(n < 10 ? 1 : 0) : n) + ' ' + units[i];
+}
+function fmtDuration(ms) {
+  const sec = Math.round((ms || 0) / 1000);
+  return sec ? `${Math.floor(sec / 60)}:${pad(sec % 60)}` : '';
+}
+
+function fileCard(m) {
+  const f = m.file;
+  const meta = [fmtSize(f.size), f.video ? fmtDuration(f.duration) : ''].filter(Boolean).join(' · ');
+  return h('a', { class: 'bubble file', href: mediaUrl(m, f.key) + '&dl=1&name=' + encodeURIComponent(f.name), download: f.name,
+    title: '下载 ' + f.name },
+    icon(f.video ? 'video' : 'file', 'file-icon'),
+    h('span', { class: 'file-main' }, h('span', { class: 'file-name' }, f.name),
+      h('span', { class: 'file-meta' }, meta ? `${meta} · 点击下载` : '点击下载')));
+}
+
+const CARD_THEMES = new Set(['blue', 'wathet', 'turquoise', 'green', 'yellow', 'orange', 'red', 'carmine', 'violet', 'purple', 'indigo', 'grey']);
+function cardBubble(m) {
+  const theme = CARD_THEMES.has(m.theme) ? ' theme-' + m.theme : '';
+  return h('div', { class: 'bubble card' },
+    m.title ? h('div', { class: 'card-head' + theme }, h('div', { class: 'card-title' }, m.title),
+      m.subtitle ? h('div', { class: 'card-sub' }, m.subtitle) : null) : null,
+    m.segments && m.segments.length ? h('div', { class: 'card-body' }, segments(m.segments, m)) : null);
 }
 
 function setReply(m) {
@@ -299,21 +405,32 @@ function renderReply() {
     h('button', { title: '取消回复', onclick: () => { S.replyTo = null; renderReply(); } }, '×')] : null);
 }
 
+// 打开时就未读的第一条(别人发的): 在它前面画"以下为新消息"。只是显示, 不会标已读
+function isFirstUnread(m) {
+  return S.readPos > 0 && m.position > S.readPos && m.position <= S.unreadUpTo && !m.me && m.kind !== 'system';
+}
+
 function renderMsgs(mode) {
   const box = S.body;
   if (!box) return;
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const fromBottom = box.scrollHeight - box.scrollTop;
   const rows = [];
-  let prev = null;
+  let prev = null, divider = null;
   for (const m of S.msgs) {
+    if (m.kind === 'system' && !m.content) continue;  // 没有提示文字的系统消息
+    if (!divider && isFirstUnread(m)) {
+      divider = h('div', { class: 'unread-divider' }, h('span', {}, '以下为新消息'));
+      rows.push(divider); prev = null;
+    }
     if (!prev || m.time - prev.time > 300) { rows.push(h('div', { class: 'time-divider' }, msgTime(m.time))); prev = null; }
     rows.push(msgRow(m, prev));
     prev = m;
   }
   put(box, S.hasMore ? h('div', { class: 'chat-older' }, h('button', { onclick: olderMsgs }, '查看更早的消息')) : null,
     rows.length ? rows : h('div', { class: 'sys-msg' }, '还没有消息'));
-  if (mode === 'bottom' || (mode === 'keep-bottom' && nearBottom)) box.scrollTop = box.scrollHeight;
+  if (mode === 'unread' && divider) box.scrollTop = Math.max(0, divider.offsetTop - 12);
+  else if (mode === 'bottom' || mode === 'unread' || (mode === 'keep-bottom' && nearBottom)) box.scrollTop = box.scrollHeight;
   else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
 }
 
@@ -362,6 +479,7 @@ async function start() {
   renderFeed();
   act(refreshFeed);
   setInterval(() => refreshFeed().catch(() => {}), 8000);
+  setInterval(checkChanges, 2000);
   route();
 }
 

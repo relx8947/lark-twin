@@ -5,20 +5,29 @@
 发消息也不改已读: 普通发送不会给别人的消息产生已读回执, 但会清掉本人在这个会话的未读, 所以有未读时经本人私聊
 转发过去(见 LarkClient.send_msg 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动。回复某条(话题回复)
 会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息, 有变化的如实告诉页面。
+
+消息怎么显示(富文本片段、卡片、图片、文件)由 render.message_view 整理成纯数据, 前端只用 textContent 渲染。
+打开会话时带上本人的已读位置(readPosition), 页面据此画"以下为新消息", 只是显示, 不会改已读。
+新消息优先从本地库取(daemon 收到的 WS 推送都会入库), 取不到再去服务端拉。
 """
+import json
 import re
 import threading
 import time
+from urllib.parse import quote
 
 from loguru import logger
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
+from .. import state
 from ..config import CREDENTIALS_PATH
 from ..protocol import LarkAuth, LarkClient
-from ..protocol.media import download, extract_resource_key, message_resource_url
+from ..protocol.client import MODERN_COMMAND_VERSION
+from ..protocol.media import download, message_resource_url, open_stream
 from ..protocol.proto import decoders
 from ..storage import Storage
+from . import render
 
 OWNER_CHAT_NAME = '我自己（私聊）'
 MAX_TEXT = 10000
@@ -30,6 +39,13 @@ _client = {'obj': None, 'mtime': 0.0}
 _profiles = {}   # user_id -> {'name', 'avatar'}
 _p2p_names = {}
 _p2p_peers = {}  # 私聊 chat_id -> 对方 user_id
+_quotes = {}     # 被引用的消息 id -> {'from_id', 'text'}, 消息内容不会变, 查过就记住
+MAX_QUOTES = 5000
+# 打开会话时除了最近 count 条, 还往前多带到第一条未读(最多这么多条), 好在页面上定位到"以下为新消息"
+MAX_INITIAL = 100
+# 图片文件头: 有的图片(比如表情包)服务端按 application/octet-stream 返回, 认出来的才按图片显示
+IMAGE_MAGIC = ((b'\x89PNG\r\n\x1a\n', 'image/png'), (b'\xff\xd8\xff', 'image/jpeg'), (b'GIF87a', 'image/gif'),
+               (b'GIF89a', 'image/gif'))
 
 
 class UpstreamError(Exception):
@@ -178,6 +194,9 @@ def _clean(summary: str) -> str:
     if "current version doesn't support viewing this message" in summary:
         return '[暂不支持显示这类消息，请在飞书客户端查看]'
     summary = re.sub(r'^\[(图片|表情包)\].*$', r'[\1]', summary, flags=re.S)
+    summary = re.sub(r'^\[语音\] 时长([\d.]+)s.*$', r'[语音] \1 秒', summary, flags=re.S)
+    # 系统消息(入群、改群名等)只留提示文字, 没有文字的显示成 [系统消息]
+    summary = re.sub(r'^\[系统消息\]\s*(?:type=\S*)?\s*(.*)$', lambda m: m.group(1).strip() or '[系统消息]', summary, flags=re.S)
     return re.sub(r'^(\[(?:文件|视频)\] [^(]*?) \(.*$', r'\1', summary, flags=re.S)
 
 
@@ -212,24 +231,86 @@ def feed(request: Request):
 
 def _message_out(c: LarkClient, m: dict, chat_id: str) -> dict:
     me = str(c.auth.user_id)
-    key = extract_resource_key(m.get('msg_type', 0), m.get('content_data') or {}) if m.get('msg_type') == 5 else ''
     who = _profile(c, m.get('from_id'), chat_id)
+    content = _clean(m.get('content', ''))
+    view = render.message_view(m, me, content)
+    if view['kind'] == 'recalled':
+        remover = m.get('remover_id') or m.get('from_id')
+        name = '你' if str(remover) == me else (_profile(c, remover, chat_id)['name'] or '对方')
+        content = f'{name} 撤回了一条消息'
+    elif view['kind'] == 'system' and content == '[系统消息]':
+        content = ''  # 没有提示文字的系统消息, 页面上不显示
+    parent = str(m.get('parent_id') or '')
+    quote = None
+    if parent and parent != '0' and view['kind'] not in ('recalled', 'system'):
+        q = _quotes.get(parent)
+        quote = {'sender': _user_name(c, q['from_id'], chat_id) if q and q['from_id'] else '',
+                 'text': q['text'] if q else '引用的消息'}
     return {'msg_id': str(m.get('msg_id') or ''), 'position': int(m.get('position') or 0),
             'from_id': str(m.get('from_id') or ''), 'sender': who['name'], 'avatar': _avatar(c, who['avatar']),
             'me': str(m.get('from_id')) == me, 'time': int(m.get('create_time') or 0),
-            'type': m.get('msg_type_name', ''), 'content': _clean(m.get('content', '')),
-            'root_id': str(m.get('root_id') or ''), 'image_key': key}
+            'type': m.get('msg_type_name', ''), 'content': content, 'root_id': str(m.get('root_id') or ''),
+            'parent_id': parent if parent != '0' else '', 'quote': quote, **view}
+
+
+def _load_quotes(c: LarkClient, msgs: list, st: Storage):
+    """查好这批消息引用的那些消息的摘要和发送人: 同一批里有的直接用, 其余用 PullMessagesByIdsRequest 一次批量查。"""
+    me = str(c.auth.user_id)
+    by_id = {str(m.get('msg_id')): m for m in msgs}
+    wanted = {str(m.get('parent_id')) for m in msgs if m.get('parent_id') and str(m.get('parent_id')) != '0'}
+    missing = [i for i in wanted if i not in _quotes and i not in by_id]
+    found = list(by_id[i] for i in wanted if i in by_id and i not in _quotes)
+    if missing:
+        try:
+            found += c.pull_messages(missing, command_version=MODERN_COMMAND_VERSION)
+        except Exception as e:
+            logger.warning(f'查被引用的消息失败: {e}')
+    if len(_quotes) > MAX_QUOTES:
+        _quotes.clear()
+    for m in found:
+        content = _clean(m.get('content', ''))
+        _quotes[str(m.get('msg_id'))] = {'from_id': str(m.get('from_id') or ''),
+                                          'text': render.brief(render.message_view(m, me, content), content) or '引用的消息'}
+    _people(c, [q['from_id'] for i, q in _quotes.items() if i in wanted], st)
+
+
+def _local_messages(st: Storage, chat_id: str, after: int, limit: int = 50):
+    """本地库里 position 在 after 之后的消息(daemon 收到的 WS 推送), 格式同 pull_history。
+
+    返回 (消息, 连续到的 position): 中间缺了的(没推送到、中转消息不入库)和卡片(可能是流式输出的中间状态)
+    之后的留给服务端拉, 页面的 end 只前进到连续的那一段。
+    """
+    out, end = [], after
+    for r in st.messages_after(chat_id, after, limit):
+        if r.position != end + 1 or r.msg_type == 14:
+            break
+        try:
+            data = json.loads(r.content_data) if r.content_data else None
+        except ValueError:
+            break  # 太长的 content_data 入库时被截断过, 这条也留给服务端拉
+        end = r.position
+        out.append({'msg_id': r.msg_id, 'msg_type': r.msg_type, 'msg_type_name': r.msg_type_name, 'from_id': r.sender_id,
+                    'chat_id': r.chat_id, 'position': r.position, 'create_time': r.create_time, 'content': r.content,
+                    'content_data': data, 'root_id': r.root_id, 'parent_id': r.parent_id, 'recalled': False})
+    return out, end
 
 
 def chat(request: Request):
-    """一个会话的消息。默认最近 count 条; before=<position> 往前翻, after=<position> 取新消息。"""
+    """一个会话的消息。默认最近 count 条(有未读时往前带到第一条未读); before=<position> 往前翻,
+    after=<position> 取新消息; 再加 local=1 只查本地库, 不访问飞书。"""
     c = client()
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     q = request.query_params
     count = min(int(q.get('count') or 30), 100)
+    st = Storage()
+    if q.get('after') and q.get('local'):
+        after = int(_digits(q['after'], 'after'))
+        msgs, end = _local_messages(st, chat_id, after)
+        return _chat_out(c, chat_id, None, msgs, after + 1, end, None, st)
     info = _call(c.get_chat_info, chat_id) or {}
     last = int(info.get('lastMessagePosition') or 0)
     first = max(int(info.get('firstChatMessagePosition') or 1), 1)
+    read = int(info.get('readPosition') or 0)
     if q.get('after'):
         start = int(_digits(q['after'], 'after')) + 1
         end = min(last, start + 49)
@@ -238,15 +319,32 @@ def chat(request: Request):
         start = max(first, end - count + 1)
     else:
         end, start = last, max(first, last - count + 1)
-    msgs = _call(c.pull_history, chat_id, range(start, end + 1)) if end >= start else []
-    st = Storage()
+        if 0 < read < last and read + 1 < start + 3:
+            # 未读多于一屏: 往前带到第一条未读之前两条, 但总数不超过 MAX_INITIAL
+            start = max(first, min(start, read - 2), last - MAX_INITIAL + 1)
+    msgs = _call(c.pull_history, chat_id, range(start, end + 1), command_version=MODERN_COMMAND_VERSION) if end >= start else []
+    return _chat_out(c, chat_id, info, msgs, start, end, start > first, st, read)
+
+
+def _chat_out(c: LarkClient, chat_id: str, info, msgs: list, start: int, end: int, has_more, st: Storage, read: int = 0):
+    # 本人私聊里匿名发送留下的中转消息(已撤回)不显示
+    msgs = [m for m in msgs if not state.is_relay(m)]
     _people(c, [m.get('from_id') for m in msgs] + [c.auth.user_id], st)
+    _load_quotes(c, msgs, st)
+    out = {'messages': [_message_out(c, m, chat_id) for m in msgs], 'start': start, 'end': end}
+    if info is None:
+        return {**out, 'chat': None, 'local': True}
     known = {chat_id: st.get_chat_name(chat_id)}
-    return {'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known), 'kind': _kind(info),
-                     'avatar': _chat_avatar(c, chat_id, info),
-                     'unread': _badge(info), 'last_position': last, 'member_count': int(info.get('memberCount') or 0)},
-            'messages': [_message_out(c, m, chat_id) for m in msgs],
-            'start': start, 'end': end, 'has_more': start > first}
+    last = int(info.get('lastMessagePosition') or 0)
+    return {**out, 'has_more': has_more,
+            'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known), 'kind': _kind(info),
+                     'avatar': _chat_avatar(c, chat_id, info), 'unread': _badge(info), 'last_position': last,
+                     'read_position': read, 'member_count': int(info.get('memberCount') or 0)}}
+
+
+def changes(request: Request):
+    """本地库最新一条消息的序号: 页面每隔一两秒问一次, 变了就马上刷新会话列表, 不用等定时刷新。"""
+    return {'latest': Storage().latest_message_id()}
 
 
 def me(request: Request):
@@ -329,26 +427,47 @@ def open_p2p(request: Request):
 
 
 def media(request: Request):
-    """图片代理: 浏览器拿不到飞书的登录态, 由这里带上 cookie 去取。"""
+    """图片和文件代理: 浏览器拿不到飞书的登录态, 由这里带上 cookie 去取。
+
+    默认按图片显示: 只有认得出的普通图片按图片返回, 其他类型(包括可以带脚本的 svg)一律当附件下载, 不在本站点渲染。
+    dl=1 是下载文件: 边取边转发(文件可能很大), 一律当附件, name 是保存时的文件名。
+    """
     q = request.query_params
     chat_id, msg_id = _digits(q.get('chat'), 'chat'), _digits(q.get('msg'), 'msg')
     key = q.get('key') or ''
     if not re.fullmatch(r'[\w\-.]{1,200}', key):
         raise ValueError('key 不合法')
     auth = client().auth
-    data, ctype = _call(download, auth, message_resource_url(msg_id, key, chat_id, host=auth.region.file_host),
-                        max_bytes=20 * 1024 * 1024)
+    url = message_resource_url(msg_id, key, chat_id, host=auth.region.file_host)
     headers = {'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff'}
-    # 只有普通图片按图片返回; 其他类型(包括可以带脚本的 svg)一律当附件下载, 不在本站点渲染
+    if q.get('dl'):
+        chunks, length = _call(open_stream, auth, url)
+        headers['Content-Disposition'] = _attachment(q.get('name') or '')
+        if length:
+            headers['Content-Length'] = str(length)
+        return StreamingResponse(chunks, media_type='application/octet-stream', headers=headers)
+    data, ctype = _call(download, auth, url, max_bytes=20 * 1024 * 1024)
     if not ctype.startswith('image/') or 'svg' in ctype:
-        ctype = 'application/octet-stream'
+        sniffed = next((t for magic, t in IMAGE_MAGIC if data.startswith(magic)), '')
+        if not sniffed and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            sniffed = 'image/webp'
+        ctype = sniffed or 'application/octet-stream'
+    if ctype == 'application/octet-stream':
         headers['Content-Disposition'] = 'attachment'
     return Response(data, media_type=ctype, headers=headers)
+
+
+def _attachment(name: str) -> str:
+    """下载时的文件名: 去掉路径和控制字符; 中文等按 RFC 5987 编码。"""
+    name = re.sub(r'[\x00-\x1f\x7f/\\"]', '_', name).strip(' .')[:200] or 'download'
+    ascii_name = re.sub(r'[^\w\-. ]', '_', name.encode('ascii', 'replace').decode()) or 'download'
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name, safe="")}'
 
 
 ROUTES = [
     ('/api/im/me', me, ['GET']),
     ('/api/im/feed', feed, ['GET']),
+    ('/api/im/changes', changes, ['GET']),
     ('/api/im/chat/{chat_id}', chat, ['GET']),
     ('/api/im/chat/{chat_id}/send', send, ['POST']),
     ('/api/im/search', search, ['GET']),
