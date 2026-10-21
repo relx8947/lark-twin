@@ -2,9 +2,9 @@
 
 会话列表用 feed.PullFeedCardsRequest, 消息用 PullMessagesByPositionsRequest, 都是只读接口;
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
-发消息也不改已读: 普通发送会被服务端把会话之前的消息都算作已读, 所以有未读时改用"回复话题并同时发送到会话"
-(见 LarkClient.send_msg 的 keep_unread), 对方在主会话照常看到, 已读位置不动。被回复的那条会变成已读,
-所以默认挂在自己发的消息下面; 发出后再逐条核对别人的未读消息, 有变成已读的如实告诉页面。
+发消息也不改已读: 普通发送不会给别人的消息产生已读回执, 但会清掉本人在这个会话的未读, 所以有未读时经本人私聊
+转发过去(见 LarkClient.send_msg 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动。回复某条(话题回复)
+会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息, 有变化的如实告诉页面。
 """
 import re
 import threading
@@ -22,7 +22,7 @@ from ..storage import Storage
 
 OWNER_CHAT_NAME = '我自己（私聊）'
 MAX_TEXT = 10000
-# 被回复的那条要过一会儿才在服务端变成已读(实测 0.3 秒内), 发出后等这么久再核对
+# 已读状态要过一会儿才在服务端更新(实测 0.3 秒内), 发出后等这么久再核对
 READ_CHECK_DELAY = 1.5
 _lock = threading.Lock()
 _client = {'obj': None, 'mtime': 0.0}
@@ -275,7 +275,7 @@ def send(request: Request):
         except Exception as e:
             logger.warning(f'发送前查询未读消息失败: {e}')
             watch = None
-    # 网页版一律匿名发送: 有未读时挂在自己发的消息下面, 同时发送到会话, 已读位置不动
+    # 网页版一律匿名发送: 有未读时经本人私聊转发, 已读位置不动; 转发不成会退回普通发送, 下面的核对会如实报告
     msg_id = _call(c.send_msg, text, chat_id, root_id=root_id, keep_unread=True)
     Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''), content=text,
                          ok=1 if msg_id else 0, error='' if msg_id else '发送失败', turn_kind='web')
@@ -283,7 +283,7 @@ def send(request: Request):
         raise UpstreamError('发送失败: 飞书没有确认收到这条消息')
     kept, newly = _check_unread(c, chat_id, read, watch) if read < last else (True, 0)
     if kept is False:
-        logger.warning(f'匿名发送后会话 {chat_id} ' + (f'有 {newly} 条别人的消息变成了已读' if newly else '的已读位置前进了'))
+        logger.warning(f'匿名发送后会话 {chat_id} ' + (f'有 {newly} 条别人的消息变成了已读' if newly else '的已读位置前进了, 本人的未读被清掉'))
     return {'ok': True, 'msg_id': str(msg_id), 'kept_unread': kept, 'newly_read': newly}
 
 

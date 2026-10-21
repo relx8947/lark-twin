@@ -8,6 +8,7 @@ def _isolate_local_state(monkeypatch, tmp_path):
     monkeypatch.setenv('LARKX_STORAGE_URL', f'sqlite:///{tmp_path}/default.db')
     monkeypatch.setattr(state, 'STATE_DIR', tmp_path / 'state')
     monkeypatch.setattr(state, 'TURN_PATH', tmp_path / 'state' / 'turn.json')
+    monkeypatch.setattr(state, 'RELAY_DIR', tmp_path / 'state' / 'relay')
     monkeypatch.setattr(notify, 'NOTIFY_STATE', tmp_path / 'state' / 'notify.json')
     monkeypatch.setattr(daemon, 'DAEMON_STATE', tmp_path / 'state' / 'daemon.json')
 
@@ -26,6 +27,12 @@ class FakeClient:
 
     def create_chat(self, user_id):
         return self._owner_chat
+
+    def get_user_name(self, user_id, chat_id):
+        return None
+
+    def get_group_name(self, chat_id):
+        return None
 
     def api(self, type_or_cmd, data=None):
         self.api_calls.append((type_or_cmd, data))

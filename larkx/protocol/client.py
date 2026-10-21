@@ -5,9 +5,10 @@ from urllib.parse import urlencode
 import requests
 import websockets
 from loguru import logger
+from .. import state
 from .auth import LarkAuth
 from .proto import builders, decoders, proto_pb2 as P
-from .proto.ids import generate_access_key, generate_long_request_id, generate_request_id
+from .proto.ids import generate_access_key, generate_long_request_id, generate_request_cid, generate_request_id
 
 
 class LarkClient:
@@ -20,6 +21,7 @@ class LarkClient:
         self.loop = asyncio.new_event_loop()
         self._loop_started = False
         self._thread_chats = {}
+        self._self_chat = ''
 
     def build_ws_url(self) -> str:
         device_id = self.auth.device_id
@@ -148,22 +150,25 @@ class LarkClient:
     def send_msg(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False):
         """返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
 
-        keep_unread: 会话里还有未读时, 以"回复话题并同时发送到会话"的方式发出, 对方在主会话照常看到这条消息,
-        但本人的已读位置不动。被回复的那条会被标成已读, 所以没指定 root_id 时挂在不会泄露的消息下面
-        (见 _unread_anchor); 指定了 root_id 就回复那条, 那一条对对方显示已读, 这是"回复"本身的意思。
+        普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执。
+        root_id 是话题回复, 被回复的那条会对对方显示已读, 这是"回复"本身的意思。
+        keep_unread: 会话里还有本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条
+        普通消息, 本人的已读位置不动; 转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
         """
         chat_id = str(chat_id)
-        thread_chat = (bool(root_id) or keep_unread) and self.is_thread_chat(chat_id)
-        sync = False
-        if keep_unread and not thread_chat:
-            if not root_id:
-                root_id, leaks = self._unread_anchor(chat_id)
-                if leaks:
-                    logger.warning(f'会话 {chat_id} 最近没有自己发的或已读过的消息可挂靠, 这次挂在对方的 {root_id} 下面, '
-                                   '这一条会对对方显示已读')
-            sync = bool(root_id)
+        if keep_unread and not root_id:
+            read, last = self.read_state(chat_id)
+            # 本人私聊里只有本人, 普通发送不涉及别人
+            if read < last and chat_id != self._relay_chat():
+                msg_id = self._send_via_relay(text, chat_id)
+                if msg_id:
+                    return msg_id
+                logger.warning(f'经本人私聊转发到会话 {chat_id} 没成功, 已退回普通发送: 本人在这个会话的未读会被清掉, 对方看不到已读')
+        return self._put_message(text, chat_id, root_id=root_id, thread_chat=bool(root_id) and self.is_thread_chat(chat_id))
+
+    def _put_message(self, text: str, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
         pkt = builders.build_send_message_packet(text, chat_id, generate_long_request_id(), root_id=root_id,
-                                                 thread_chat=thread_chat, sync_to_chat=sync)
+                                                 thread_chat=thread_chat, cid=cid)
         try:
             content = self._gateway_post(pkt)
         except Exception as e:
@@ -175,10 +180,51 @@ class LarkClient:
             logger.error(f'服务端已接受发送请求,但响应解析失败,无法确认是否发出: {e}')
             return None
         if not msg_id or msg_id.startswith('-'):
-            # 拒收时(比如回复了不能当话题根的消息)返回的 id 是 -1, 主会话里也没有这条
+            # 拒收时(比如回复了不能当话题根的消息)返回的 id 是 -1, 会话里也没有这条
             logger.error(f'服务端已接受发送请求,但响应里没有有效的消息 id({msg_id or "空"}),消息没有发出')
             return None
         return msg_id
+
+    def _relay_chat(self) -> str:
+        """本人和自己的私聊(成员只有本人), 匿名发送的中转站。"""
+        if not self._self_chat:
+            try:
+                self._self_chat = str(self.create_chat(self.auth.user_id) or '')
+            except Exception as e:
+                logger.warning(f'获取本人私聊失败: {e}')
+                return ''
+        return self._self_chat
+
+    def _send_via_relay(self, text: str, chat_id: str):
+        """先发到本人私聊, 再转发到 chat_id, 然后撤回中转的那条。返回目标会话里那条的 id, 不成返回 None。
+
+        实测转发不动本人在目标会话的已读位置, 也不给任何人的消息产生已读回执, 目标会话里是一条普通消息。
+        中转消息发出前先登记它的 cid(state.mark_relay), daemon 收到它时跳过, 不会当成本人在私聊里下的指令。
+        """
+        relay = self._relay_chat()
+        if not relay:
+            return None
+        cid = generate_request_cid()
+        state.mark_relay(cid, relay)
+        relay_id = self._put_message(text, relay, cid=cid)
+        if not relay_id:
+            return None
+        msg_id = ''
+        try:
+            resp = self.api('messages.PutTransmitMessageRequest',
+                            {'chatIds': [chat_id], 'messageId': relay_id, 'cids': {chat_id: generate_request_cid()}}) or {}
+            msg_id = str((((resp.get('messages') or {}).get(chat_id)) or {}).get('id') or '')
+        except Exception as e:
+            logger.error(f'转发到会话 {chat_id} 失败: {e}')
+        if msg_id.startswith('-'):
+            msg_id = ''
+        if not msg_id:
+            logger.error(f'转发到会话 {chat_id} 没有拿到有效的消息 id, 消息没有发出')
+        try:
+            self.api('messages.DeleteMessageRequest', {'id': relay_id})
+        except Exception as e:
+            logger.warning(f'撤回本人私聊里的中转消息 {relay_id} 失败: {e}')
+        return msg_id or None
 
     def read_state(self, chat_id: str):
         """(本人已读到的 position, 会话最新 position)。"""
@@ -193,45 +239,6 @@ class LarkClient:
             r = self.api('messages.PullMessageMeReadStateRequest', {'messageIds': ids[i:i + 50]}) or {}
             out.update({str(k): bool(v) for k, v in (r.get('readStatus') or {}).items()})
         return out
-
-    def _unread_anchor(self, chat_id: str):
-        """会话里有未读时, 匿名发送挂在哪条消息下面: 返回 (msg_id, 这次是否会让一条别人的未读消息变成已读)。
-
-        实测被回复的那条会被服务端标成"我已读", 所以依次找: 本人自己最近发的一条 > 已经是"我已读"的最近一条
-        (已读位置以下的也要逐条查, 实测有的仍是未读) > 实在没有才挂在对方最近的一条下面, 这一条会泄露已读。
-        没有未读返回空, 照常发送不会改变任何已读状态。
-        """
-        read, last = self.read_state(chat_id)
-        if read >= last:
-            return '', False
-        me = str(self.auth.user_id)
-
-        def pull(start, end):
-            return [m for m in self.pull_history(chat_id, range(max(1, start), end + 1))
-                    if m.get('msg_id') and m.get('msg_type') != 6 and not m.get('recalled')]
-
-        def target(m):
-            # "同时发送到会话"在主会话的那份不能当话题根(服务端拒收), 要挂在它所在话题的根上
-            return str(m.get('sync_root_id') or m['msg_id'])
-
-        # 本身是回复的(带 rootId)不挑, 免得连带把它回复的那条标成已读。自己那份的话题根是上次挂靠的那条, 已经读过
-        recent = pull(last - 49, last)
-        own = [m for m in recent if str(m.get('from_id')) == me and not m.get('root_id')]
-        if own:
-            return target(own[-1]), False
-        # 最近没有自己发的: 连同已读位置附近的几条, 挑已经是"我已读"的; 别人"同时发送到会话"的话题根不一定读过, 不挑
-        cands = (pull(read - 19, read) if 0 < read < last - 49 else []) + recent
-        plain = [m for m in cands if not m.get('root_id') and (str(m.get('from_id')) == me or not m.get('sync_root_id'))]
-        try:
-            done = self.my_read_status([m['msg_id'] for m in plain])
-        except Exception as e:
-            logger.warning(f'查询消息已读状态失败, 按已读位置估计: {e}')
-            done = {str(m['msg_id']): int(m.get('position') or 0) <= read for m in plain}
-        safe = [m for m in plain if str(m.get('from_id')) == me or done.get(str(m['msg_id']))]
-        if safe:
-            return target(safe[-1]), False
-        pick = ([m for m in cands if str(m.get('from_id')) != me] or cands)[-1:]
-        return (target(pick[0]), True) if pick else ('', False)
 
     def search(self, query: str):
         pkt = builders.build_search_packet(query, generate_long_request_id(), self.auth.region.locale)
@@ -312,7 +319,7 @@ class LarkClient:
             summary, data = decoders.decode_message_content(message_type, v.get('content', b''))
             root_id = v.get('rootId') or ''
             scope, anchor = decoders.resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '', thread_chat)
-            msg = {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type, 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or int(pos_key), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data, 'recalled': v.get('status') == 2 or bool(v.get('isRemoved')), 'sync_root_id': str(v.get('syncToChatThreadRootId') or '')}
+            msg = {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type, 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or int(pos_key), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data, 'recalled': v.get('status') == 2 or bool(v.get('isRemoved'))}
             out.append(msg)
             if save_storage is not None:
                 try:

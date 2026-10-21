@@ -15,8 +15,8 @@ class FakeIMClient:
         self.sent = []
         self.read_pos = 95
         self.done = set()     # 对我已是"已读"的消息
-        self.leak = []        # 发出时会被连带标成已读的消息
-        self.advance = False  # 发出时已读位置前进
+        self.leak = []        # 发出时被连带标成已读的消息(经本人私聊转发不该有, 用来验证核对逻辑)
+        self.advance = False  # 转发不成、退回了普通发送: 本人的已读位置前进到最新
         self.status_error = False
 
     def api(self, cmd, data=None):
@@ -49,7 +49,7 @@ class FakeIMClient:
 
     def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text, root_id, keep_unread))
-        # 和服务端一样: 被回复的那条变成已读
+        # 和服务端一样: 话题回复时被回复的那条变成已读; 经本人私聊转发不动已读位置
         self.done.update(self.leak + ([root_id] if root_id else []))
         if self.advance:
             self.read_pos = 100
@@ -133,10 +133,14 @@ def test_send_reports_others_messages_turned_read(ctx):
     assert send(root_id='98')['newly_read'] == 2
 
 
-def test_send_reports_read_position_moved_and_unknown(ctx):
+def test_send_reports_fallback_and_unknown(ctx):
     c, fake = ctx
+    # 经本人私聊转发: 已读位置不动, 别人的未读也都还在
+    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
+    assert fake.sent[-1] == ('5', 'hi', None, True)
     fake.status_error = True
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json()['kept_unread'] is None
+    # 转发不成退回普通发送: 本人的未读被清掉, 如实告诉页面
     fake.status_error, fake.advance = False, True
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': False, 'newly_read': 0}
 

@@ -3,6 +3,7 @@ import sys
 
 from loguru import logger
 
+from .. import state
 from ..protocol import AuthExpired
 
 
@@ -22,7 +23,12 @@ class Listener:
         self.name_cache = {}
 
     async def on_message(self, msg) -> bool:
-        """返回这条消息是否是第一次入库(重复推送、补收到已有的消息返回 False)。"""
+        """返回这条消息是否是第一次入库(重复推送、补收到已有的消息、中转消息返回 False)。"""
+        if state.is_relay(msg):
+            # 匿名发送经本人私聊中转的那条: 马上会被撤回, 不入库也不触发, 免得当成本人在私聊里下的指令;
+            # 转发到目标会话的那份 cid 不同, 照常处理
+            logger.info(f'跳过本人私聊里的中转消息 {msg.get("msg_id")}')
+            return False
         client, st, cache = self.client, self.storage, self.name_cache
         chat_id = msg['chat_id']
         chat_type = msg.get('chat_type', 0)

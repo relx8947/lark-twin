@@ -1,7 +1,9 @@
-"""daemon 和 CLI 之间共享的"当前这一轮"上下文, 以及时间解析。
+"""daemon 和 CLI、网页之间共享的状态, 以及时间解析。
 
 daemon 每轮开始前写入 turn.json, 结束后删除。数字人调用 larkx 时, CLI 据此判断
 这次发消息、建任务是否越权: 默认只能作用于触发这一轮的会话, 本人发起时才能跨会话。
+
+relay/ 下登记经本人私聊中转的消息(见 LarkClient.send_msg 的 keep_unread), daemon 收到它们时跳过。
 """
 import json
 import os
@@ -13,6 +15,9 @@ from .config import DATA_DIR
 
 STATE_DIR = DATA_DIR / 'state'
 TURN_PATH = STATE_DIR / 'turn.json'
+RELAY_DIR = STATE_DIR / 'relay'
+# 补收漏推消息只看 7 天内有动静的会话, 登记留得比它久, 中转消息无论什么时候补收到都认得出来
+RELAY_TTL = 8 * 86400
 KINDS = ('message', 'task', 'say', 'system')
 
 
@@ -39,6 +44,30 @@ def read_turn():
     except (OSError, ValueError):
         return None  # 写入它的 daemon 已经退出
     return data
+
+
+def mark_relay(cid: str, chat_id: str):
+    """发中转消息前登记它的 cid: 每条一个文件(内容是中转会话 id), 多个进程同时写也不会互相覆盖。顺带清掉过期的。"""
+    RELAY_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for p in RELAY_DIR.iterdir():
+        try:
+            if now - p.stat().st_mtime > RELAY_TTL:
+                p.unlink()
+        except FileNotFoundError:
+            pass
+    (RELAY_DIR / cid).write_text(str(chat_id), encoding='utf-8')
+
+
+def is_relay(msg: dict) -> bool:
+    """这条消息是不是登记过的中转消息(cid 和所在会话都对得上); 转发到目标会话的那份 cid 不同, 不算。"""
+    cid = str(msg.get('cid') or '')
+    if not re.fullmatch(r'[\w-]{1,128}', cid):
+        return False
+    try:
+        return (RELAY_DIR / cid).read_text(encoding='utf-8') == str(msg.get('chat_id'))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
 
 
 def is_guest(turn) -> bool:

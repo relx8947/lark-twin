@@ -152,6 +152,30 @@ def test_catch_up_feeds_missed_messages(tmp_path, monkeypatch, fake_client):
     assert asyncio.run(obj.catch_up()) == 2 and fed == ['p11', 'p12']
 
 
+def test_daemon_skips_relay_but_handles_forwarded_copy(tmp_path, monkeypatch, fake_client):
+    from larkx.daemon.listener import Listener
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    listener = Listener(fake_client, obj.storage, obj.cfg, '100', on_stored=obj.on_message)
+    state.mark_relay('relaycid', 'self')
+    now = int(time.time())
+    msg = {'msg_id': 'r1', 'chat_id': 'self', 'chat_type': 1, 'from_id': '100', 'cid': 'relaycid', 'position': 5,
+           'content': '/ai 帮我看看', 'create_time': now}
+
+    async def run():
+        # 本人私聊里的中转消息(以及撤回后再推一次)都跳过: 不入库, 不触发
+        assert await listener.on_message(msg) is False
+        assert await listener.on_message(dict(msg, content='')) is False
+        assert obj.storage.get_messages('self') == [] and obj.inbox.qsize() == 0
+        # 转发到目标会话的那份 cid 不同, 照常入库、照常判断触发
+        assert await listener.on_message(dict(msg, msg_id='f1', chat_id='c1', cid='other')) is True
+        # 本人在私聊里自己发的 /ai 指令照常触发
+        assert await listener.on_message(dict(msg, msg_id='own', cid='mine')) is True
+        return obj.inbox.qsize()
+
+    assert asyncio.run(run()) == 2
+    assert [m.msg_id for m in obj.storage.get_messages('c1')] == ['f1']
+
+
 def test_reconnect_storm_alerts_once(tmp_path, monkeypatch, fake_client):
     obj = _daemon(tmp_path, fake_client, monkeypatch)
     for _ in range(5):

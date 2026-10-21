@@ -246,7 +246,7 @@ function renderChat() {
   S.input = input; S.grow = grow;
   put($('chat'), S.head, S.body,
     h('div', { class: 'composer' }, S.replyBar, input,
-      h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送，发出消息也不会把这个会话标为已读'), sendBtn)));
+      h('div', { class: 'composer-bar' }, h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)));
   renderHead(); renderMsgs('bottom');
   input.focus();
 }
@@ -325,7 +325,7 @@ async function sendMsg() {
   const r = await act(() => api(`/api/im/chat/${S.chatId}/send`, { method: 'POST', body: { text, root_id: S.replyTo ? S.replyTo.root_id : null } }));
   input.disabled = false;
   if (!r) return;
-  if (r.kept_unread === false) toast(r.newly_read ? `已发出，但有 ${r.newly_read} 条别人的消息变成了已读` : '已发出，但会话的已读位置前进了：这类会话不支持匿名发送');
+  if (r.kept_unread === false) toast(r.newly_read ? `已发出，但有 ${r.newly_read} 条别人的消息变成了已读` : '已发出，但这次没能匿名发送：你在这个会话的未读被清掉了，对方看不到已读');
   else if (r.kept_unread == null) toast('已发出，但没能核对别人的消息是否仍是未读');
   input.value = ''; S.grow(); S.replyTo = null; renderReply(); input.focus();
   await pollChat(S.seq);
