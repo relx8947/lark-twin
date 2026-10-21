@@ -20,6 +20,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import service, state
+from . import im
 from ..agent.home import commit_agent_home
 from ..config import DATA_DIR, load_config
 from ..storage import Storage
@@ -64,9 +65,12 @@ def api(fn):
         if request.method != 'GET' and request.headers.get('x-larkx') != '1':
             return _json({'error': '缺少 X-Larkx 请求头'}, 403)
         try:
-            return fn(request)
+            result = fn(request)
         except ValueError as e:
             return _json({'error': str(e)}, 400)
+        except im.UpstreamError as e:
+            return _json({'error': str(e)}, 502)
+        return result if isinstance(result, Response) else _json(result)
     return endpoint
 
 
@@ -88,12 +92,8 @@ def login(request: Request):
 
 # ---- 只读接口 ----
 
-OWNER_CHAT_NAME = '我自己（私聊）'
-
-
-def _owner_chat() -> str:
-    from ..notify import _load
-    return _load().get('owner_chat', '')
+OWNER_CHAT_NAME = im.OWNER_CHAT_NAME
+_owner_chat = im._owner_chat
 
 
 def _chat_names(st: Storage) -> dict:
@@ -463,6 +463,7 @@ def create_app() -> Starlette:
         Route('/api/history', history), Route('/api/history/{sha}', history_item),
         Route('/api/logs', logs), Route('/api/control', control, methods=['POST']),
         Route('/api/restart', restart, methods=['POST']), Route('/api/recall', recall, methods=['POST']),
+        *[Route(path, api(fn), methods=methods) for path, fn, methods in im.ROUTES],
         Mount('/static', _Static(directory=str(STATIC)), name='static'),
     ]
     app = Starlette(routes=routes)

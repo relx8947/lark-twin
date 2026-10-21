@@ -224,6 +224,19 @@ class Storage:
         finally:
             s.close()
 
+    def sender_names(self, user_ids) -> dict:
+        """消息库里见过的发送人名字: {user_id: name}。"""
+        ids = [str(u) for u in user_ids if u]
+        if not ids:
+            return {}
+        s = self.Session()
+        try:
+            rows = (s.query(Message.sender_id, Message.sender_name)
+                    .filter(Message.sender_id.in_(ids), Message.sender_name != '').distinct().all())
+            return {sid: name for sid, name in rows if name}
+        finally:
+            s.close()
+
     def recalled_ids(self, msg_ids) -> set:
         """这些消息里已经成功撤回的。"""
         ids = [str(m) for m in msg_ids if m]

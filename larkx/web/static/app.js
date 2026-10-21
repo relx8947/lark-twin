@@ -106,7 +106,7 @@ async function loadChats() {
 }
 const chatLabel = (id, name) => name || chatNames[id] || (id ? `会话 ${id}` : '');
 
-const KIND = { message: '消息', task: '任务', say: '终端指令', system: '维护' };
+const KIND = { message: '消息', task: '任务', say: '终端指令', system: '维护', web: '网页' };
 const STATUS = { pending: '排队中', running: '处理中', done: '已完成', failed: '失败', cancelled: '已取消', expired: '已过期' };
 
 // ---- 登录 ----
@@ -472,14 +472,224 @@ async function viewCommand() {
 
 // ---- 路由 ----
 
+// ---- 网页版飞书: 看消息不标已读 ----
+
+const IM = { root: null, list: null, pane: null, items: [], cursor: '', filter: '', results: null,
+  chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, poll: 0, seq: 0 };
+
+function shortTime(ts) {
+  const d = toDate(ts);
+  if (!d || isNaN(d)) return '';
+  return d.toDateString() === new Date().toDateString() ? fmt(ts, false) : fmt(ts).slice(0, 5);
+}
+
+const IM_KIND = { p2p: '私聊', group: '群聊', topic: '话题群' };
+
+async function viewIm(chatId) {
+  const search = h('input', { type: 'text', placeholder: '筛选会话；回车搜索联系人和群', class: 'im-q' });
+  search.addEventListener('input', () => { IM.filter = search.value.trim(); IM.results = null; renderFeed(); });
+  search.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing && search.value.trim()) imSearch(search.value.trim()); });
+  IM.list = h('div', { class: 'im-list' });
+  IM.pane = h('div', { class: 'im-chat' }, h('div', { class: 'im-empty' }, '选一个会话。在这里看消息不会标为已读。'));
+  IM.root = h('div', { class: 'im' }, h('div', { class: 'im-side' }, h('div', { class: 'im-search' }, search), IM.list), IM.pane);
+  put($main, IM.root);
+  Object.assign(IM, { items: [], cursor: '', chatId: '', filter: '', results: null });
+  renderFeed();
+  every(10000, refreshFeed);
+  if (chatId) imOpen(chatId);
+}
+
+async function refreshFeed() {
+  const d = await api('/api/im/feed');
+  const fresh = new Set(d.items.map(i => i.chat_id));
+  // 只刷新第一页; 之前"加载更多"拿到的会话保留在后面
+  IM.items = d.items.concat(IM.items.filter(i => !fresh.has(i.chat_id)));
+  if (!IM.cursor) IM.cursor = d.next_cursor;
+  renderFeed();
+}
+
+async function moreFeed() {
+  if (!IM.cursor) return;
+  const d = await api('/api/im/feed?cursor=' + encodeURIComponent(IM.cursor));
+  const have = new Set(IM.items.map(i => i.chat_id));
+  IM.items = IM.items.concat(d.items.filter(i => !have.has(i.chat_id)));
+  IM.cursor = d.next_cursor;
+  renderFeed();
+}
+
+function feedItem(i) {
+  return h('div', { class: 'im-item' + (i.chat_id === IM.chatId ? ' on' : '') + (i.unread ? ' unread' : ''),
+    onclick: () => { location.hash = '#im/' + i.chat_id; } },
+    h('div', { class: 'n', title: i.name }, i.name),
+    h('div', { class: 't' }, shortTime(i.time)),
+    h('div', { class: 'p', title: i.preview }, i.kind !== 'p2p' && !i.preview ? IM_KIND[i.kind] : i.preview),
+    i.unread ? h('span', { class: 'badge' + (i.muted ? ' mute' : ''), title: `${i.unread} 条未读` }, i.unread > 99 ? '99+' : i.unread) : h('span'));
+}
+
+function renderFeed() {
+  if (!IM.list) return;
+  if (IM.results) {
+    put(IM.list, h('div', { class: 'im-hint' }, '搜索结果', h('a', { href: '#', onclick: e => { e.preventDefault(); IM.results = null; renderFeed(); } }, '返回会话列表')),
+      IM.results.length ? IM.results.map(r => h('div', { class: 'im-item', onclick: () => imOpenResult(r) },
+        h('div', { class: 'n' }, r.name), h('div', { class: 't' }, r.kind === 'user' ? '联系人' : '群'))) : h('div', { class: 'empty im-hint' }, '没有找到'));
+    return;
+  }
+  const f = IM.filter.toLowerCase();
+  const rows = f ? IM.items.filter(i => i.name.toLowerCase().includes(f)) : IM.items;
+  put(IM.list, rows.map(feedItem),
+    !f && IM.cursor ? h('button', { class: 'btn small im-more', onclick: () => act(moreFeed) }, '加载更多会话') : null,
+    !rows.length ? h('div', { class: 'empty im-hint' }, IM.items.length ? '没有匹配的会话，回车搜索联系人和群' : '加载中…') : null);
+}
+
+async function imSearch(q) {
+  IM.results = await act(() => api('/api/im/search?q=' + encodeURIComponent(q))) || [];
+  renderFeed();
+}
+
+async function imOpenResult(r) {
+  if (r.kind !== 'user') { location.hash = '#im/' + r.id; return; }
+  const d = await act(() => api('/api/im/open', { method: 'POST', body: { user_id: r.id } }));
+  if (d) location.hash = '#im/' + d.chat_id;
+}
+
+async function imOpen(chatId) {
+  clearInterval(IM.poll);
+  const seq = ++IM.seq;
+  Object.assign(IM, { chatId, chat: null, msgs: [], replyTo: null });
+  renderFeed();
+  IM.root.classList.add('has-chat');
+  put(IM.pane, h('div', { class: 'im-empty' }, '加载中…'));
+  const d = await act(() => api(`/api/im/chat/${chatId}`));
+  if (seq !== IM.seq) return;
+  if (!d) { put(IM.pane, h('div', { class: 'im-empty' }, '打不开这个会话')); return; }
+  Object.assign(IM, { chat: d.chat, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more });
+  renderChat(true);
+  IM.poll = setInterval(() => imPoll(seq), 4000);
+  timers.push(IM.poll);
+}
+
+async function imPoll(seq) {
+  const d = await api(`/api/im/chat/${IM.chatId}?after=${IM.end}`).catch(() => null);
+  if (!d || seq !== IM.seq) return;
+  IM.chat = d.chat;
+  if (d.messages.length) { addMsgs(d.messages); IM.end = Math.max(IM.end, d.end); renderMsgs('keep-bottom'); }
+  renderHead();
+}
+
+async function imOlder() {
+  const seq = IM.seq;
+  const d = await act(() => api(`/api/im/chat/${IM.chatId}?before=${IM.start}&count=30`));
+  if (!d || seq !== IM.seq) return;
+  addMsgs(d.messages); IM.start = d.start; IM.hasMore = d.has_more;
+  renderMsgs('keep-offset');
+}
+
+function addMsgs(list) {
+  const have = new Set(IM.msgs.map(m => m.msg_id));
+  IM.msgs = IM.msgs.concat(list.filter(m => !have.has(m.msg_id))).sort((a, b) => a.position - b.position);
+}
+
+function renderChat(scrollBottom) {
+  const box = h('div', { class: 'im-msgs' });
+  const input = h('textarea', { rows: 3, placeholder: '输入消息，Enter 发送，Shift+Enter 换行' });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); imSend(input); }
+  });
+  IM.box = box; IM.input = input;
+  IM.head = h('div', { class: 'im-head' });
+  IM.replyBar = h('div', { class: 'im-reply' });
+  put(IM.pane, IM.head, box,
+    h('div', { class: 'im-compose' }, IM.replyBar,
+      h('div', { class: 'row', style: 'align-items:flex-end' }, input, h('button', { class: 'btn primary', onclick: () => imSend(input) }, '发送')),
+      h('div', { class: 'im-note' }, '看消息不会标为已读；在这个会话发出消息后，飞书会把它之前的消息都算作已读。')));
+  renderHead(); renderReply(); renderMsgs(scrollBottom ? 'bottom' : '');
+}
+
+function renderHead() {
+  const c = IM.chat;
+  if (!c || !IM.head) return;
+  put(IM.head,
+    h('a', { href: '#im', class: 'im-back', title: '返回会话列表' }, '‹'),
+    h('b', { class: 'im-title', title: c.name }, c.name),
+    h('span', { class: 'tag' }, IM_KIND[c.kind] || c.kind),
+    c.member_count && c.kind !== 'p2p' ? h('span', { class: 'muted' }, `${c.member_count} 人`) : null,
+    h('div', { class: 'grow' }),
+    c.unread ? h('span', { class: 'pill' }, h('i'), `还有 ${c.unread} 条未读（你在这里看过也不变）`) : h('span', { class: 'muted' }, '没有未读'));
+}
+
+function renderReply() {
+  const r = IM.replyTo;
+  put(IM.replyBar, r ? [h('span', { class: 'muted' }, `回复 ${r.sender || ''}：`), h('span', { class: 'im-quote' }, r.content),
+    h('a', { href: '#', onclick: e => { e.preventDefault(); IM.replyTo = null; renderReply(); } }, '取消')] : null);
+}
+
+function imImage(m) {
+  const holder = h('span', { class: 'im-img' });
+  const show = () => {
+    const img = h('img', { src: `/api/im/media?chat=${IM.chatId}&msg=${m.msg_id}&key=${encodeURIComponent(m.image_key)}`, alt: '图片' });
+    img.addEventListener('error', () => put(holder, h('span', { class: 'muted' }, '[图片无法预览，可能已加密]')));
+    img.addEventListener('click', () => window.open(img.src, '_blank'));
+    put(holder, img);
+  };
+  put(holder, h('a', { href: '#', onclick: e => { e.preventDefault(); show(); } }, '[图片] 点击查看'));
+  return holder;
+}
+
+function msgRow(m) {
+  if (m.type === 'SYSTEM') return h('div', { class: 'im-msg sys' }, m.content.replace(/^\[系统消息\]\s*/, ''));
+  const body = m.image_key ? imImage(m) : m.content;
+  const reply = h('a', { href: '#', class: 'ops', onclick: e => {
+    e.preventDefault();
+    IM.replyTo = { root_id: m.root_id || m.msg_id, sender: m.sender, content: (m.content || '').slice(0, 60) };
+    renderReply(); IM.input && IM.input.focus();
+  } }, '回复');
+  return h('div', { class: 'im-msg' + (m.me ? ' me' : '') },
+    h('div', { class: 'who' }, m.me ? '' : (m.sender || m.from_id), ' ', shortTime(m.time), m.root_id ? h('span', { class: 'tag' }, '话题回复') : null, reply),
+    h('div', { class: 'bub' }, body));
+}
+
+function renderMsgs(mode) {
+  const box = IM.box;
+  if (!box) return;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const fromBottom = box.scrollHeight - box.scrollTop;
+  put(box, IM.hasMore ? h('div', { class: 'im-older' }, h('button', { class: 'btn small', onclick: imOlder }, '更早的消息')) : null,
+    IM.msgs.length ? IM.msgs.map(msgRow) : h('div', { class: 'im-empty' }, '这个会话还没有消息'));
+  if (mode === 'bottom' || (mode === 'keep-bottom' && nearBottom)) box.scrollTop = box.scrollHeight;
+  else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
+}
+
+async function imSend(input) {
+  const text = input.value.trim();
+  if (!text || !IM.chat) return;
+  if (IM.chat.unread && !confirm(`发出后，这个会话里 ${IM.chat.unread} 条未读会变成已读，对方能看到。继续发送？`)) return;
+  const body = { text, root_id: IM.replyTo ? IM.replyTo.root_id : null };
+  input.disabled = true;
+  const r = await act(() => api(`/api/im/chat/${IM.chatId}/send`, { method: 'POST', body }));
+  input.disabled = false;
+  if (!r) return;
+  input.value = ''; IM.replyTo = null; renderReply(); input.focus();
+  imPoll(IM.seq).then(() => { if (IM.box) IM.box.scrollTop = IM.box.scrollHeight; });
+}
+
 const VIEWS = { overview: viewOverview, conversations: viewConversations, activity: viewActivity, tasks: viewTasks,
-  takeovers: viewTakeovers, memory: viewMemory, persona: viewPersona, logs: viewLogs, command: viewCommand };
+  takeovers: viewTakeovers, memory: viewMemory, persona: viewPersona, logs: viewLogs, command: viewCommand, im: viewIm };
 
 async function route() {
+  const [name, ...rest] = (location.hash || '#overview').slice(1).split('/');
+  const arg = rest.join('/');
+  // 网页版飞书里切换会话不重建整页, 保留会话列表和滚动位置
+  if (name === 'im' && IM.root && $main.contains(IM.root)) {
+    if (arg) return imOpen(arg);
+    clearInterval(IM.poll); IM.seq++; IM.chatId = ''; IM.root.classList.remove('has-chat');
+    put(IM.pane, h('div', { class: 'im-empty' }, '选一个会话。在这里看消息不会标为已读。'));
+    return renderFeed();
+  }
   timers.forEach(clearInterval); timers = [];
-  const name = (location.hash || '#overview').slice(1);
+  IM.root = null; IM.seq++;
+  $main.classList.toggle('wide', name === 'im');
   document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + name));
-  try { await (VIEWS[name] || viewOverview)(); } catch (e) { if (e.message !== '未登录') toast('加载失败: ' + e.message); }
+  try { await (VIEWS[name] || viewOverview)(arg); } catch (e) { if (e.message !== '未登录') toast('加载失败: ' + e.message); }
 }
 
 document.getElementById('theme').addEventListener('click', e => {
