@@ -22,12 +22,8 @@ class FakeIMClient:
         self.auth = type('A', (), {'user_id': '100', 'region': get_region('feishu')})()
         self.sent = []
         self.messages = []    # 发出的消息描述(builders 的格式)
-        self.relay_fails = False  # 经本人私聊转发不成(网页版这时报发送失败)
-        self.read_pos = 95
-        self.done = set()     # 对我已是"已读"的消息
-        self.leak = []        # 发出时被连带标成已读的消息(经本人私聊转发不该有, 用来验证核对逻辑)
-        self.advance = False  # 转发不成、退回了普通发送: 本人的已读位置前进到最新
-        self.status_error = False
+        self.relay_fails = False  # 经本人私聊转发不成(打开 LARKX_KEEP_UNREAD 时网页版这时报发送失败)
+        self.read_pos = 95    # 本人的已读位置; 会话最新是 100, 也就是有未读
         self.chat_read = 0    # 会话信息里本人的已读位置
         self.history = {}     # position -> 消息, 覆盖默认生成的
         self.by_id = {}       # pull_messages 能查到的消息
@@ -131,16 +127,13 @@ class FakeIMClient:
 
     def send_message(self, msg, chat_id, root_id=None, keep_unread=False, fallback=True, parent_id=None, in_thread=None):
         from larkx.protocol.proto import builders
-        assert fallback is False, '网页版转发不成不能退回普通发送'
+        assert fallback is False, '网页版开着 keep_unread 时转发不成不能退回普通发送'
         self.reply_args.append((root_id, parent_id, in_thread))
-        if self.relay_fails and self.relays(chat_id, *self.read_state(chat_id), root_id):
+        # 和 LarkClient 一样: 开着 keep_unread、有未读、不是回复时才经本人私聊转发
+        if keep_unread and self.relay_fails and self.relays(chat_id, *self.read_state(chat_id), root_id):
             return None
         self.sent.append((chat_id, builders.plain_text(msg), root_id, keep_unread))
         self.messages.append(msg)
-        # 和服务端一样: 话题回复时被回复的那条变成已读; 经本人私聊转发不动已读位置
-        self.done.update(self.leak + [i for i in (root_id, parent_id) if i])
-        if self.advance:
-            self.read_pos = 100
         return '777'
 
     def relays(self, chat_id, read, last, root_id=None):
@@ -148,11 +141,6 @@ class FakeIMClient:
 
     def read_state(self, chat_id):
         return (self.read_pos, 100)
-
-    def my_read_status(self, ids):
-        if self.status_error:
-            raise RuntimeError('boom')
-        return {i: i in self.done for i in ids}
 
     def mark_read(self, *a, **k):
         raise AssertionError('网页版飞书不能标已读')
@@ -171,7 +159,8 @@ def ctx(tmp_path, monkeypatch):
     for cache in ('_profiles', '_name_tried', '_p2p_names', '_p2p_peers', '_quotes', '_chat_infos'):
         monkeypatch.setattr(im, cache, {})
     monkeypatch.setattr(im, '_feed', {'data': None, 'at': 0.0, 'flight': None})
-    monkeypatch.setattr(im, 'READ_CHECK_DELAY', 0)
+    # 发送方式按默认配置(普通发送), 不受本机 .env 影响
+    monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
     c = TestClient(web.create_app())
     c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
     return c, fake
@@ -207,7 +196,7 @@ def test_send_is_audited_as_owner(ctx):
     assert c.post('/api/im/chat/5/send', json={'text': '  '}).status_code == 400
     assert c.post('/api/im/chat/5/send', json={'text': 'hi', 'root_id': 'x'}).status_code == 400
     r = c.post('/api/im/chat/5/send', json={'text': '收到\n', 'root_id': '42'})
-    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0} and fake.sent == [('5', '收到', '42', True)]
+    assert r.json() == {'ok': True, 'msg_id': '777'} and fake.sent == [('5', '收到', '42', False)]
     # 网页上点"回复"是主会话里的引用回复: 引用点的那条(parent_id), 不回进话题; 没给 parent_id 时引用 root_id 那条
     assert fake.reply_args == [('42', '42', False)]
     c.post('/api/im/chat/5/send', json={'text': '好', 'root_id': '40', 'parent_id': '42'})
@@ -221,36 +210,23 @@ def test_send_is_audited_as_owner(ctx):
     assert c.post('/api/im/chat/5/send', json={'text': 'hi'}, headers={'X-Larkx': ''}).status_code == 403
 
 
-def test_send_reports_others_messages_turned_read(ctx):
+def test_send_is_a_normal_send_by_default(ctx):
     c, fake = ctx
-    send = lambda **b: c.post('/api/im/chat/5/send', json={'text': 'hi', **b}).json()
-    # 未读区间 96~100 里别人发的是 96、98、100; 发出后 98 变成了已读
-    fake.leak = ['98']
-    r = send()
-    assert (r['kept_unread'], r['newly_read']) == (False, 1)
-    # 98 发送前就已经是已读, 不再算; 96 是显式回复的
-    assert send(root_id='96')['kept_unread'] is True
-    # 显式回复的那条变成已读是"回复"本身的意思, 不算泄露
-    fake.leak, fake.done = [], set()
-    assert send(root_id='98') == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
-    fake.done = set()
-    fake.leak = ['96', '100']
-    assert send(root_id='98')['newly_read'] == 2
-    # 引用回复时被引用的那条(parent)变成已读也是"回复"本身的意思
-    fake.leak, fake.done = [], set()
-    assert send(root_id='90', parent_id='98')['newly_read'] == 0
+    # 默认普通发送: 会话里有未读(已读位置 95 < 100)也直接发到这个会话, 不经本人私聊转发, 也不再核对已读
+    fake.relay_fails = True  # 万一走了转发就会发不出去
+    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777'}
+    assert fake.sent == [('5', 'hi', None, False)]
 
 
-def test_send_reports_fallback_and_unknown(ctx):
+def test_keep_unread_switch_relays_plain_messages(ctx, monkeypatch):
     c, fake = ctx
-    # 经本人私聊转发: 已读位置不动, 别人的未读也都还在
-    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
-    assert fake.sent[-1] == ('5', 'hi', None, True)
-    fake.status_error = True
-    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json()['kept_unread'] is None
-    # 万一发出后本人的已读位置还是前进了(比如服务端行为变了), 如实告诉页面
-    fake.status_error, fake.advance = False, True
-    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777', 'kept_unread': False, 'newly_read': 0}
+    # 打开 LARKX_KEEP_UNREAD 后按配置匿名发送(有未读时经本人私聊转发由 LarkClient 判断)
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
+    assert c.post('/api/im/chat/5/send', json={'text': 'hi'}).json() == {'ok': True, 'msg_id': '777'}
+    assert fake.sent == [('5', 'hi', None, True)]
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'false')
+    c.post('/api/im/chat/5/send', json={'text': 'hi'})
+    assert fake.sent[-1] == ('5', 'hi', None, False)
 
 
 def test_media_only_renders_plain_images(ctx, monkeypatch):

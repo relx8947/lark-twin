@@ -1,5 +1,5 @@
 // 网页版飞书。只用只读接口看消息, 看过的仍是未读; 聊天内容一律用 textContent 渲染, 不拼 HTML。
-// 能发文字、表情(Unicode emoji)、@、图片和文件, 都由后端匿名发送(有未读时经本人私聊转发)并在发出后核对已读。
+// 能发文字、表情(Unicode emoji)、@、图片和文件, 由后端发出(默认普通发送, 直接发到这个会话)。
 // 话题群显示话题列表(每个话题的根消息和回复数), 点开一个话题在右侧看它的回复; 位置(position)都是话题位置。
 'use strict';
 
@@ -460,7 +460,7 @@ function renderChat() {
         h('div', { class: 'composer-tools' }, S.emojiBtn, tool('at', '@ 提及', () => insertText('@')),
           tool('image', '发送图片（也可以粘贴截图或拖进来）', () => imgInput.click()),
           tool('attach', '发送文件（不超过 100MB）', () => fileInput.click()), imgInput, fileInput),
-        h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)),
+        h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行'), sendBtn)),
     h('div', { class: 'drop-zone' }, icon('attach'), S.dropText = h('span', {}, `松开发送给 ${S.chat.name}`)));
   renderHead();
   input.focus();
@@ -479,7 +479,7 @@ function renderHead() {
     h('div', { class: 'chat-title', title: c.name }, c.name),
     c.kind !== 'p2p' && c.member_count ? h('span', { class: 'chat-sub' }, `${c.member_count} 人`) : null,
     h('div', { class: 'chat-grow' }),
-    h('span', { class: 'incognito', title: '在这里看消息不会标为已读' }, icon('eye'), c.unread ? `${c.unread} 条未读 · 不会标为已读` : '不会标为已读'));
+    h('span', { class: 'incognito', title: '在这里看消息不会标为已读，对方也看不到' }, icon('eye'), c.unread ? `${c.unread} 条未读 · 看消息不标已读` : '看消息不标已读'));
   if (S.input) S.input.placeholder = `发送给 ${c.name}`;
   if (S.dropText) S.dropText.textContent = `松开发送给 ${c.name}`;
 }
@@ -977,18 +977,6 @@ function onComposerKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
 }
 
-function confirmBox(text, okLabel) {
-  return new Promise(resolve => {
-    const done = v => { box.remove(); resolve(v); };
-    const ok = h('button', { class: 'primary', onclick: () => done(true) }, okLabel);
-    const box = h('div', { class: 'dialog', onkeydown: e => { if (e.key === 'Escape') done(false); } },
-      h('div', { class: 'dialog-card', role: 'dialog' }, h('p', {}, text),
-        h('div', { class: 'dialog-row' }, h('button', { onclick: () => done(false) }, '取消'), ok)));
-    document.body.append(box);
-    ok.focus();
-  });
-}
-
 // 上传一个图片或文件并发出: 浏览器到这里的进度用 XHR 的上传进度显示, 之后是这里上传到飞书和发送
 function sendAttachment(p, chatId, reply, show) {
   return new Promise((resolve, reject) => {
@@ -1012,24 +1000,6 @@ function sendAttachment(p, chatId, reply, show) {
   });
 }
 
-async function sendText(chatId, body) {
-  try {
-    return await api(`/api/im/chat/${chatId}/send`, { method: 'POST', body });
-  } catch (e) {
-    // 有未读时 @ 只能以普通文字发出(经私聊转发会去掉 @), 先问一下
-    if (!(e.data && e.data.confirm === 'plain_at')) throw e;
-    if (!await confirmBox(e.message + '\n\n仍然发送吗？', '以普通文字发送')) return null;
-    return api(`/api/im/chat/${chatId}/send`, { method: 'POST', body: { ...body, plain_at: true } });
-  }
-}
-
-function report(results) {
-  const leaked = results.filter(r => r.kept_unread === false), n = leaked.reduce((a, r) => a + (r.newly_read || 0), 0);
-  if (leaked.length) toast(n ? `已发出，但有 ${n} 条别人的消息变成了已读` : '已发出，但这次没能匿名发送：你在这个会话的未读被清掉了，对方看不到已读');
-  else if (results.some(r => r.kept_unread == null)) toast('已发出，但没能核对别人的消息是否仍是未读');
-  else if (results.some(r => r.at_plain)) toast('已发出：@ 以普通文字发出，对方不会收到 @ 提醒');
-}
-
 async function sendMsg() {
   const input = S.input;
   if (!input || !S.chat || S.sending) return;
@@ -1049,11 +1019,9 @@ async function sendMsg() {
       if (current()) renderPending();
     }
     if (text) {
-      const r = await sendText(chatId, { text, ...(reply || {}), mentions: current() ? S.mentions : [] });
-      if (r) {
-        results.push(r);
-        if (current()) { input.value = ''; S.mentions = []; }
-      }
+      const body = { text, ...(reply || {}), mentions: current() ? S.mentions : [] };
+      results.push(await api(`/api/im/chat/${chatId}/send`, { method: 'POST', body }));
+      if (current()) { input.value = ''; S.mentions = []; }
     }
     if (current() && !queue.length && !input.value.trim()) { S.replyTo = null; renderReply(); }
   } catch (e) {
@@ -1062,7 +1030,6 @@ async function sendMsg() {
     S.sending = false; input.disabled = false;
     if (current()) { S.grow(); renderPending(); input.focus(); }
   }
-  report(results);
   if (current() && results.length) {
     await pollChat(seq);
     S.body.scrollTop = S.body.scrollHeight;

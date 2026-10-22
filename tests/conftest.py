@@ -18,11 +18,13 @@ class FakeClient:
 
     def __init__(self, user_id='100', owner_chat='self'):
         self.sent, self.api_calls = [], []
+        self.keep_unread = []  # 每次发送带的 keep_unread
         self.auth = type('A', (), {'user_id': user_id})()
         self._owner_chat = owner_chat
 
     def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text))
+        self.keep_unread.append(keep_unread)
         return f'm{len(self.sent)}'
 
     def create_chat(self, user_id):

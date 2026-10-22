@@ -169,9 +169,10 @@ class LarkClient:
         普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执。
         root_id 是回复, 被回复的那条会对对方显示已读, 这是"回复"本身的意思。普通群和私聊里默认是主会话里的引用回复,
         回的那条已经在话题里时回进那个话题; 话题群里回进话题(见 _reply_target)。parent_id、in_thread 见 _reply_target。
-        keep_unread: 会话里还有本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条
-        普通消息, 本人的已读位置不动; 转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
-        fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读(网页版用)。
+        keep_unread(默认关, 对应配置 LARKX_KEEP_UNREAD): 关着时就是普通发送, 直接发到目标会话。打开后, 会话里还有
+        本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条普通消息, 本人的已读位置不动;
+        转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
+        fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读(网页版开着 keep_unread 时用)。
         各种类型的消息都走同一套流程。
         """
         chat_id = str(chat_id)
@@ -244,7 +245,7 @@ class LarkClient:
         return msg_id
 
     def _relay_chat(self) -> str:
-        """本人和自己的私聊(成员只有本人), 匿名发送的中转站。"""
+        """本人和自己的私聊(成员只有本人), 匿名发送(keep_unread)的中转站。"""
         if not self._self_chat:
             try:
                 self._self_chat = str(self.create_chat(self.auth.user_id) or '')

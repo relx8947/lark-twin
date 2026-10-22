@@ -2,14 +2,12 @@
 
 会话列表用 feed.PullFeedCardsRequest, 消息用 PullMessagesByPositionsRequest, 都是只读接口;
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
-发消息也不改已读: 普通发送不会给别人的消息产生已读回执, 但会清掉本人在这个会话的未读, 所以有未读时经本人私聊
-转发过去(见 LarkClient.send_message 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动; 转发不成就报发送
-失败, 不退回普通发送。回复某条(主会话里的引用回复, 话题群里回进话题)会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息,
-有变化的如实告诉页面。
+发消息默认是普通发送(messages.PutMessageRequest 直接发到这个会话): 不会给别人的消息产生已读回执, 但会清掉本人在
+这个会话的未读。打开 LARKX_KEEP_UNREAD 时按配置匿名发送(见 _deliver)。回复某条(主会话里的引用回复, 话题群里回进话题)
+会让被回复的那条对对方显示已读。
 
-能发文字、带 @ 的文字、图片和文件, 各种类型都走同一套匿名发送和发后核对(_deliver)。图片和文件由浏览器把原始内容
-POST 过来, 这里存进临时文件再上传到飞书(media.upload_image / upload_file), 拿到 key 后发消息。@ 经本人私聊转发后
-会变成普通文字(对方收不到 @ 提醒), 所以有未读时带 @ 的消息要页面确认过才以文字发出。
+能发文字、带 @ 的文字、图片和文件, 各种类型都走同一个发送入口(_deliver)。图片和文件由浏览器把原始内容
+POST 过来, 这里存进临时文件再上传到飞书(media.upload_image / upload_file), 拿到 key 后发消息。
 
 消息怎么显示(富文本片段、卡片、图片、文件)由 render.message_view 整理成纯数据, 前端只用 textContent 渲染。
 打开会话时带上本人的已读位置(readPosition), 页面据此画"以下为新消息", 只是显示, 不会改已读。
@@ -40,7 +38,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
 from .. import state
-from ..config import CREDENTIALS_PATH
+from ..config import CREDENTIALS_PATH, load_config
 from ..protocol import LarkAuth, LarkClient
 from ..protocol.client import MODERN_COMMAND_VERSION
 from ..protocol.media import UploadError, download, message_resource_url, open_stream, upload_file, upload_image
@@ -50,8 +48,6 @@ from . import render
 
 OWNER_CHAT_NAME = '我自己（私聊）'
 MAX_TEXT = 10000
-# 已读状态要过一会儿才在服务端更新(实测 0.3 秒内), 发出后等这么久再核对
-READ_CHECK_DELAY = 1.5
 _lock = threading.Lock()
 _client = {'obj': None, 'mtime': 0.0}
 _reader = {'obj': None, 'base': None}
@@ -102,8 +98,6 @@ MEMBERS_TTL = 600
 MEMBERS_CAP = 2000
 _members = {}    # chat_id -> (查询时间, 成员列表, 是否完整)
 MAX_MENTIONS = 50
-AT_RELAY_NOTE = ('这个会话里你还有未读。为了不清掉未读，消息要经你和自己的私聊转发过去，'
-                 '转发会把 @ 变成普通文字，对方收不到 @ 提醒。')
 
 
 class UpstreamError(Exception):
@@ -785,8 +779,7 @@ def _text_message(text: str, mentions) -> dict:
 
 
 def send(request: Request):
-    """发文字。body: text, root_id/parent_id(回复时: 被回复那条的根消息和它自己, 可选), mentions(@ 了谁, 见 _text_message),
-    plain_at(有未读时同意把 @ 当普通文字发出, 见 _deliver)。"""
+    """发文字。body: text, root_id/parent_id(回复时: 被回复那条的根消息和它自己, 可选), mentions(@ 了谁, 见 _text_message)。"""
     c = client()
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     b = request.state.body
@@ -797,47 +790,27 @@ def send(request: Request):
         raise ValueError(f'消息太长(超过 {MAX_TEXT} 字)')
     root_id = _digits(b['root_id'], 'root_id') if b.get('root_id') else None
     parent_id = _digits(b['parent_id'], 'parent_id') if b.get('parent_id') and root_id else None
-    return _deliver(c, chat_id, _text_message(text, b.get('mentions')), root_id, plain_at=bool(b.get('plain_at')),
-                    parent_id=parent_id)
+    return _deliver(c, chat_id, _text_message(text, b.get('mentions')), root_id, parent_id=parent_id)
 
 
-def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, plain_at: bool = False, parent_id=None):
-    """发出一条消息(文字、图片、文件都走这里): 一律匿名发送, 发出后核对, 记审计。
+def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, parent_id=None):
+    """发出一条消息(文字、图片、文件都走这里), 记审计。
 
-    有未读时经本人私聊转发(见 LarkClient.send_message), 转发会把 @ 变成普通文字: 带 @ 的消息这时先返回 409 让页面
-    确认, plain_at 为真才以文字发出(结果里 at_plain 为真)。没有未读时照常发送, @ 是真的 @。
+    默认普通发送: 直接发到这个会话, @ 是真的 @; 对方看不到已读, 本人在这个会话的未读会清掉。
+    打开 LARKX_KEEP_UNREAD 时, 会话里有未读就经本人私聊转发(见 LarkClient.send_message), 本人的已读位置不动;
+    转发不成就算发送失败, 不退回普通发送(会清掉本人的未读)。转发会把 @ 变成普通文字, 所以带 @ 的消息总是普通发送。
+    回复: 网页上点"回复"是飞书常规的引用回复(留在主会话, 上方带被回复的那条), 不回进话题; 话题群里的回复照样进话题。
     """
-    read, last = _call(c.read_state, chat_id)
-    at_plain = builders.has_mentions(msg) and c.relays(chat_id, read, last, root_id)
-    if at_plain and not plain_at:
-        return Response(json.dumps({'error': AT_RELAY_NOTE, 'confirm': 'plain_at'}, ensure_ascii=False), status_code=409,
-                        media_type='application/json')
-    # 发送前记下别人发的、对我还是未读的消息, 发出后逐条核对; 显式回复的那条变成已读是"回复"本身的意思, 不算
-    watch = []
-    if read < last:
-        try:
-            watch = [i for i in _others_unread(c, chat_id, read, last) if i not in (root_id, parent_id)]
-        except Exception as e:
-            logger.warning(f'发送前查询未读消息失败: {e}')
-            watch = None
-    # 网页版一律匿名发送: 有未读时经本人私聊转发, 已读位置不动; 转发不成就算发送失败, 不退回普通发送(会清掉本人的未读)。
-    # 发出后照样核对, 万一有变化如实报告
-    # 回复: 网页上点"回复"是飞书常规的引用回复(留在主会话, 上方带被回复的那条), 不回进话题; 话题群里的回复照样进话题
+    keep = bool(load_config()['keep_unread']) and not builders.has_mentions(msg)
     reply = {'parent_id': parent_id or root_id, 'in_thread': False} if root_id else {}
-    msg_id = _call(c.send_message, msg, chat_id, root_id=root_id, keep_unread=True, fallback=False, **reply)
+    msg_id = _call(c.send_message, msg, chat_id, root_id=root_id, keep_unread=keep, fallback=False, **reply)
     Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''),
                          content=builders.plain_text(msg), ok=1 if msg_id else 0, error='' if msg_id else '发送失败',
                          turn_kind='web')
     if not msg_id:
-        raise UpstreamError('发送失败: 飞书没有确认收到这条消息' + ('(经私聊转发没成功; 为了不清掉你的未读, 没有改用普通发送)'
-                                                       if c.relays(chat_id, read, last, root_id) else ''))
-    kept, newly = _check_unread(c, chat_id, read, watch) if read < last else (True, 0)
-    if kept is False:
-        logger.warning(f'匿名发送后会话 {chat_id} ' + (f'有 {newly} 条别人的消息变成了已读' if newly else '的已读位置前进了, 本人的未读被清掉'))
-    out = {'ok': True, 'msg_id': str(msg_id), 'kept_unread': kept, 'newly_read': newly}
-    if at_plain:
-        out['at_plain'] = True
-    return out
+        raise UpstreamError('发送失败: 飞书没有确认收到这条消息'
+                            + ('(开着 LARKX_KEEP_UNREAD: 有未读时经私聊转发, 转发不成不会改用普通发送)' if keep else ''))
+    return {'ok': True, 'msg_id': str(msg_id)}
 
 
 def _sniff_image(data: bytes) -> str:
@@ -860,7 +833,7 @@ def _size_text(n: int) -> str:
 
 async def upload(request: Request):
     """发图片或文件。请求体是文件的原始内容(不是表单), query: kind=image|file, name=文件名, type=MIME,
-    root_id/parent_id=回复哪条(可选, 同 send)。边收边写进临时文件(超过上限立即停止), 上传到飞书后和文字一样匿名发出。"""
+    root_id/parent_id=回复哪条(可选, 同 send)。边收边写进临时文件(超过上限立即停止), 上传到飞书后和文字一样发出。"""
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     q = request.query_params
     kind = q.get('kind')
@@ -937,30 +910,6 @@ def members(request: Request):
             _members.clear()
         hit = _members[chat_id] = (time.time(), out, len(chatters) < MEMBERS_CAP)
     return {'members': hit[1], 'complete': hit[2]}
-
-
-def _others_unread(c: LarkClient, chat_id: str, read: int, last: int) -> list:
-    """未读区间(只看最近 100 条)里别人发的、目前对我仍是未读的消息 id。"""
-    me = str(c.auth.user_id)
-    ids = [str(m['msg_id']) for m in c.pull_history(chat_id, range(max(read + 1, last - 99), last + 1))
-           if m.get('msg_id') and str(m.get('from_id')) != me and m.get('msg_type') != 6]
-    status = c.my_read_status(ids) if ids else {}
-    return [i for i in ids if status.get(i) is False]
-
-
-def _check_unread(c: LarkClient, chat_id: str, read: int, watch):
-    """发出后核对: 返回 (是否仍保持未读, 变成已读的条数); 核对不了时第一项是 None。"""
-    time.sleep(READ_CHECK_DELAY)
-    try:
-        moved = c.read_state(chat_id)[0] > read
-        after = c.my_read_status(watch) if watch else {}
-    except Exception as e:
-        logger.warning(f'发送后核对已读状态失败: {e}')
-        return None, 0
-    newly = sum(1 for i in watch or [] if after.get(i))
-    if watch is None and not moved:
-        return None, 0
-    return not (moved or newly), newly
 
 
 def search(request: Request):

@@ -1,4 +1,4 @@
-"""发图片、文件、@ 的单元测试: 消息结构、匿名发送流程、上传协议、网页接口。都不访问网络。"""
+"""发图片、文件、@ 的单元测试: 消息结构、匿名发送(打开 keep_unread 时)流程、上传协议、网页接口。都不访问网络。"""
 import zlib
 
 import pytest
@@ -79,7 +79,7 @@ def test_segments_are_normalized():
     assert builders.plain_text({'kind': 'file', 'name': 'a.txt'}) == '[文件] a.txt'
 
 
-# ---- 匿名发送流程: 每种消息都经本人私聊转发 ----
+# ---- 匿名发送流程(打开 keep_unread 时): 每种消息都经本人私聊转发 ----
 
 def _client(monkeypatch, read=5, last=8, ids=None):
     c = object.__new__(LarkClient)
@@ -239,7 +239,8 @@ def sctx(tmp_path, monkeypatch):
     monkeypatch.setattr(im, '_owner_chat', lambda: 'self')
     for name in ('_profiles', '_p2p_names', '_quotes', '_members'):
         monkeypatch.setattr(im, name, {})
-    monkeypatch.setattr(im, 'READ_CHECK_DELAY', 0)
+    # 发送方式按默认配置(普通发送), 不受本机 .env 影响
+    monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
     c = TestClient(web.create_app())
     c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
     return c, fake
@@ -257,28 +258,28 @@ def test_text_message_splits_chosen_mentions():
     assert [s['user_id'] for s in two['segments'] if s['type'] == 'at'] == ['1', '2']
 
 
-def test_send_with_mentions_without_unread_is_a_real_at(sctx):
+def test_send_with_mentions_is_a_real_at(sctx):
     c, fake = sctx
-    fake.read_pos = 100
+    # 会话里有未读(已读位置 95 < 100)也一样: 普通发送, 不用确认, @ 是真的 @
     r = c.post('/api/im/chat/5/send', json={'text': '@张三 你好', 'mentions': [{'user_id': '200', 'name': '张三'}]})
-    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
+    assert r.status_code == 200 and r.json() == {'ok': True, 'msg_id': '777'}
     assert fake.messages[-1]['segments'][1] == {'type': 'at', 'user_id': '200', 'name': '张三'}
+    assert fake.sent == [('5', '@张三 你好', None, False)]
     assert Storage().list_actions()[-1].content == '@张三 你好'
 
 
-def test_send_with_mentions_and_unread_needs_confirmation(sctx):
+def test_mentions_are_sent_normally_even_with_keep_unread(sctx, monkeypatch):
     c, fake = sctx
+    # 打开 LARKX_KEEP_UNREAD 时转发会把 @ 变成文字, 所以带 @ 的消息照样普通发送; 不带 @ 的才按配置匿名发送
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
     body = {'text': '@张三 你好', 'mentions': [{'user_id': '200', 'name': '张三'}]}
-    r = c.post('/api/im/chat/5/send', json=body)
-    assert r.status_code == 409 and r.json()['confirm'] == 'plain_at' and '收不到 @ 提醒' in r.json()['error']
-    assert fake.sent == []
-    r = c.post('/api/im/chat/5/send', json={**body, 'plain_at': True}).json()
-    assert r['at_plain'] is True and r['kept_unread'] is True and fake.sent == [('5', '@张三 你好', None, True)]
-    # 回复不经转发, @ 照常是真的 @, 不用确认
-    assert c.post('/api/im/chat/5/send', json={**body, 'root_id': '42'}).json().get('at_plain') is None
+    assert c.post('/api/im/chat/5/send', json=body).json() == {'ok': True, 'msg_id': '777'}
+    assert fake.sent[-1] == ('5', '@张三 你好', None, False) and fake.messages[-1]['segments'][1]['type'] == 'at'
+    c.post('/api/im/chat/5/send', json={'text': '你好'})
+    assert fake.sent[-1] == ('5', '你好', None, True)
 
 
-def test_upload_image_and_file_are_sent_anonymously(sctx, monkeypatch):
+def test_upload_image_and_file_are_sent(sctx, monkeypatch):
     c, fake = sctx
     got = []
     monkeypatch.setattr(im, 'upload_image', lambda auth, data, name, mime: got.append(('image', data, name, mime)) or 'img_v3_k')
@@ -291,13 +292,13 @@ def test_upload_image_and_file_are_sent_anonymously(sctx, monkeypatch):
     up = lambda q, data, **kw: c.post('/api/im/chat/5/upload?' + q, content=data,
                                       headers={'Content-Type': 'application/octet-stream', **kw.get('headers', {})})
     r = up('kind=image&name=shot.png&type=image/png', png)
-    assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
+    assert r.json() == {'ok': True, 'msg_id': '777'}
     assert got[-1] == ('image', png, 'shot.png', 'image/png') and fake.messages[-1] == {'kind': 'image', 'key': 'img_v3_k', 'name': 'shot.png'}
-    assert fake.sent[-1] == ('5', '[图片]', None, True)
+    assert fake.sent[-1] == ('5', '[图片]', None, False)
     r = up('kind=file&name=' + '..%2F笔记.txt' + '&type=text/plain&root_id=40&parent_id=42', b'hello')
     assert r.json()['ok'] is True and got[-1] == ('file', b'hello', 5, '笔记.txt', 'text/plain')
     assert fake.messages[-1] == {'kind': 'file', 'key': 'file_v3_k', 'name': '笔记.txt', 'size': 5, 'mime': 'text/plain'}
-    assert fake.sent[-1] == ('5', '[文件] 笔记.txt', '40', True) and fake.reply_args[-1] == ('40', '42', False)
+    assert fake.sent[-1] == ('5', '[文件] 笔记.txt', '40', False) and fake.reply_args[-1] == ('40', '42', False)
     a = Storage().list_actions()[-1]
     assert (a.actor, a.action, a.content, a.turn_kind) == ('human', 'send', '[文件] 笔记.txt', 'web')
 
@@ -319,10 +320,12 @@ def test_upload_rejects_bad_input(sctx, monkeypatch):
 
 
 def test_relay_failure_is_reported_not_downgraded(sctx, monkeypatch):
+    # 只在打开 LARKX_KEEP_UNREAD 时才经私聊转发; 转发不成就报发送失败, 不退回普通发送
     c, fake = sctx
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
     fake.relay_fails = True
     r = c.post('/api/im/chat/5/send', json={'text': 'hi'})
-    assert r.status_code == 502 and '没有改用普通发送' in r.json()['error'] and fake.sent == []
+    assert r.status_code == 502 and '不会改用普通发送' in r.json()['error'] and fake.sent == []
     a = Storage().list_actions()[-1]
     assert (a.ok, a.error) == (0, '发送失败')
 

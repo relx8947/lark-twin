@@ -140,6 +140,37 @@ def test_self_chat_target_and_keep_unread_off_send_normally(monkeypatch):
     assert [_req(p).chatId for p in sent] == ['self', 'c1'] and calls == []
 
 
+def test_keep_unread_is_off_by_default(monkeypatch):
+    """已取消默认的匿名发送: 网页版、命令行、数字人默认都是普通发送, LARKX_KEEP_UNREAD=true 才打开。"""
+    from larkx.config import DEFAULTS, load_config
+    monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
+    assert DEFAULTS['keep_unread'] is False and load_config()['keep_unread'] is False
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
+    assert load_config()['keep_unread'] is True
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'false')
+    assert load_config()['keep_unread'] is False
+    # 看消息的行为不变: 仍然不标已读
+    assert DEFAULTS['mark_read'] is False
+
+
+def test_cli_send_follows_keep_unread(tmp_path, monkeypatch, fake_client):
+    import argparse
+
+    from larkx import cli
+    from larkx.storage import Storage
+    st = Storage(f'sqlite:///{tmp_path}/t.db')
+    monkeypatch.setattr(cli, 'Storage', lambda: st)
+    monkeypatch.setattr(cli, 'LarkClient', lambda *a, **k: fake_client)
+    monkeypatch.setattr(cli, 'LarkAuth', lambda *a, **k: None)
+    monkeypatch.delenv('LARKX_ACTOR', raising=False)
+    monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
+    args = argparse.Namespace(text=['hi'], json=True, chat_id='c1', root=None)
+    assert cli.cmd_send(args) == 0
+    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
+    assert cli.cmd_send(args) == 0
+    assert fake_client.sent == [('c1', 'hi'), ('c1', 'hi')] and fake_client.keep_unread == [False, True]
+
+
 def test_rejected_send_is_a_failure(monkeypatch):
     c, _, _, _ = _client(monkeypatch, ids=['-1'])
     assert c.send_msg('hi', 'c1') is None

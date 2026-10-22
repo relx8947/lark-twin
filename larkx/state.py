@@ -3,7 +3,8 @@
 daemon 每轮开始前写入 turn.json, 结束后删除。数字人调用 larkx 时, CLI 据此判断
 这次发消息、建任务是否越权: 默认只能作用于触发这一轮的会话, 本人发起时才能跨会话。
 
-relay/ 下登记经本人私聊中转的消息(见 LarkClient.send_msg 的 keep_unread), daemon 收到它们时跳过。
+relay/ 下登记经本人私聊中转的消息(匿名发送, 默认关, 打开 LARKX_KEEP_UNREAD 才有; 见 LarkClient.send_msg 的
+keep_unread), daemon 收到它们时跳过。
 """
 import json
 import os

@@ -326,14 +326,6 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .drop-zone svg { width: 36px; height: 36px; }
 .chat.dragging .drop-zone { display: flex; }
 
-/* 确认框 */
-.dialog { position: fixed; inset: 0; z-index: 25; background: rgba(0, 0, 0, 0.35); display: flex; align-items: center; justify-content: center; }
-.dialog-card { width: 420px; max-width: calc(100% - 32px); background: var(--bg-body); border-radius: 12px; box-shadow: var(--shadow); padding: 24px; }
-.dialog-card p { margin: 0 0 20px; line-height: 22px; white-space: pre-wrap; }
-.dialog-row { display: flex; justify-content: flex-end; gap: 8px; }
-.dialog-row button { height: 32px; padding: 0 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg-body); cursor: pointer; }
-.dialog-row button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-
 /* 登录与提示 */
 .login { position: fixed; inset: 0; background: var(--bg-rail); display: flex; align-items: center; justify-content: center; z-index: 20; }
 .login-card { width: 400px; background: var(--bg-body); border-radius: 12px; box-shadow: var(--shadow); padding: 32px; text-align: center; }

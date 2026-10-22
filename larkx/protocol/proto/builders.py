@@ -21,7 +21,7 @@ def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id:
 
 
 # 要发出的消息统一用一个 dict 描述(LarkClient.send_message 收的就是它), 和发到哪个会话、是不是回复无关,
-# 匿名发送时同一条先发到本人私聊、再转发过去:
+# 匿名发送(打开 keep_unread 时)同一条先发到本人私聊、再转发过去:
 #   {'kind': 'text', 'text'}                               纯文字
 #   {'kind': 'text', 'segments': [...]}                    带 @ 的文字, 片段是 {'type': 'text', 'text'} 或
 #                                                          {'type': 'at', 'user_id', 'name'}

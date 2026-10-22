@@ -299,7 +299,7 @@ class Daemon:
 
     async def _reply(self, chat_id, text, root_id=None):
         text = with_signature(text, self.cfg)
-        msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id, self.cfg.get('keep_unread', True))
+        msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id, self.cfg.get('keep_unread', False))
         if not msg_id:
             logger.error(f'控制回执发送失败 [{chat_id}]: {text}')
 
