@@ -27,6 +27,32 @@ def enum_to_int(value):
     return 0
 
 
+def from_type(value) -> int:
+    """消息的 fromType: 1 是用户, 2 是机器人(应用); 解码结果可能是数字也可能是枚举名。
+    实测机器人发的私聊也标成 1, 要确认是不是机器人用 LarkClient.is_bot。"""
+    if isinstance(value, int):
+        return value
+    names = {'USER': 1, 'BOT': 2}
+    if isinstance(value, str):
+        if value in names:
+            return names[value]
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def chatter_is_bot(value) -> bool:
+    """Chatter.type: 1 是用户, 2 是机器人, 3 是 AI 助手; 解码结果可能是数字也可能是枚举名。"""
+    if isinstance(value, str):
+        value = {'USER': 1, 'BOT': 2, 'AI': 3}.get(value, value)
+    try:
+        return int(value) in (2, 3)
+    except (TypeError, ValueError):
+        return False
+
+
 def is_thread_chat(chat_info: dict) -> bool:
     """话题群里每条根消息自成一个话题。chat_info 为 chats.PullChatsByIdsRequest 返回的单个会话。"""
     return enum_to_int(chat_info.get('chatMode', 0)) in THREAD_CHAT_MODES or enum_to_int(chat_info.get('type', 0)) == 3
@@ -255,5 +281,5 @@ def decode_push_messages(raw: bytes):
         summary, data = decode_message_content(message_type, v.get('content', b''))
         root_id = v.get('rootId') or ''
         scope, anchor = resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '')
-        out.append({'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId'), 'chat_type': chat_type, 'chat_type_name': CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': bool(at_me_map.get(v.get('id')) or at_me_map.get(k)), 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position'), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data})
+        out.append({'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'from_type': from_type(v.get('fromType')), 'chat_id': v.get('chatId') or v.get('channelId'), 'chat_type': chat_type, 'chat_type_name': CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': bool(at_me_map.get(v.get('id')) or at_me_map.get(k)), 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position'), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data})
     return out

@@ -85,6 +85,10 @@ def mentions_me(msg: dict, my_user_id: str) -> bool:
     return False
 
 
+# 消息的 fromType: 2 是机器人(应用)发的
+FROM_TYPE_BOT = 2
+
+
 def should_handle(msg: dict, cfg: dict, my_user_id: str, whitelist=()) -> bool:
     """whitelist: 唤起白名单里的 user_id。"""
     t = cfg.get('triggers') or {}
@@ -96,6 +100,30 @@ def should_handle(msg: dict, cfg: dict, my_user_id: str, whitelist=()) -> bool:
     # 不能唤起的人发的(私聊、群聊, 包括 @ 本人的)一律不触发; 接管中的会话、定时任务、larkx say 不经过这里, 不受影响
     if not is_own and not may_invoke(msg.get('from_id'), t, whitelist):
         return False
+    return _matches(msg, t, my_user_id, is_own)
+
+
+def denied_attempt(msg: dict, cfg: dict, my_user_id: str, whitelist=()) -> bool:
+    """别人想唤起数字人但没有权限: 换成有权限的人发同一条就会触发(私聊里以 /ai 开头; 群里以 /ai 开头并且 @ 了本人)。
+
+    daemon 据此马上回一句"没有权限"(LARKX_DENY_REPLY), 不经过 agent。本人、机器人发的不算; 没有触发前缀时
+    什么消息都能触发, 也就无所谓"想唤起", 不算; 群里没 @ 本人的 /ai 多半是在叫别的机器人, 不管 group_at_only 开没开都不算。
+    """
+    t = cfg.get('triggers') or {}
+    if str(msg.get('from_id')) == str(my_user_id) or msg.get('from_type') == FROM_TYPE_BOT:
+        return False
+    if not t.get('prefix') or may_invoke(msg.get('from_id'), t, whitelist):
+        return False
+    type_name = CHAT_TYPE_NAMES.get(msg.get('chat_type'), '')
+    if type_name not in ('p2p', 'group', 'topic_group'):
+        return False
+    if type_name != 'p2p' and not mentions_me(msg, my_user_id):
+        return False
+    return _matches(msg, t, my_user_id, is_own=False)
+
+
+def _matches(msg: dict, t: dict, my_user_id: str, is_own: bool) -> bool:
+    """不看发送人有没有权限, 这条消息本身合不合触发规则(前缀、@ 谁、会话和发送人过滤、关键词、群里要 @ 本人)。"""
     content = strip_mentions(msg.get('content'))
     chat_id = str(msg.get('chat_id'))
     sender_id = str(msg.get('from_id'))

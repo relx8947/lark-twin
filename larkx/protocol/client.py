@@ -21,6 +21,7 @@ class LarkClient:
         self.loop = asyncio.new_event_loop()
         self._loop_started = False
         self._thread_chats = {}
+        self._bots = {}
         self._self_chat = ''
 
     def build_ws_url(self) -> str:
@@ -347,6 +348,22 @@ class LarkClient:
             return chat
         return None
 
+    def is_bot(self, user_id: str) -> bool:
+        """发消息的这个 id 是不是机器人(应用、AI 助手)。消息上的 fromType 不可靠(机器人发的私聊也是 USER),
+        只读地查一下 chatter 的类型(chatters.PullChattersByIdsRequest), 查过的记住; 查不到时当成不是。"""
+        uid = str(user_id)
+        if uid not in self._bots:
+            try:
+                resp = self.api('chatters.PullChattersByIdsRequest', {'chatterIds': [uid]}) or {}
+            except Exception as e:
+                logger.warning(f'查询 {uid} 是不是机器人失败, 按真人处理: {e}')
+                return False
+            v = (resp.get('chatters') or {}).get(uid)
+            if not v:
+                return False
+            self._bots[uid] = decoders.chatter_is_bot(v.get('type'))
+        return self._bots[uid]
+
     def is_thread_chat(self, chat_id: str) -> bool:
         chat_id = str(chat_id)
         if chat_id not in self._thread_chats:
@@ -383,7 +400,8 @@ class LarkClient:
         root_id = v.get('rootId') or ''
         scope, anchor = decoders.resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '', thread_chat)
         return {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': decoders.MSG_TYPE_NAMES.get(message_type, str(message_type)),
-                'from_id': v.get('fromId'), 'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type,
+                'from_id': v.get('fromId'), 'from_type': decoders.from_type(v.get('fromType')),
+                'chat_id': v.get('chatId') or v.get('channelId') or str(chat_id), 'chat_type': chat_type,
                 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False,
                 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or position,
                 'create_time': v.get('createTime'), 'content': summary, 'content_data': data,

@@ -64,6 +64,11 @@ DEFAULTS = {
     "catchup_interval": 900,
     # /ai /takeover 不写时长时, 默认接管多久(秒)
     "takeover_default": 3600,
+    # 没权限的人想唤起数字人(私聊发 /ai、群里 @ 本人发 /ai, 但不在白名单里或只有本人能唤起)时, 马上自动回的一句话,
+    # 不经过 agent。{owner} 换成本人的名字; 设成空字符串关掉, 不回复
+    "deny_reply": "你没有权限唤起{owner}的 lark-twin",
+    # 同一会话里同一个人, 多少秒内只回一次上面那句话(防刷屏、防两边自动回复互相循环); 0 不限
+    "deny_reply_cooldown": 600,
     # 网页控制台: 只监听 127.0.0.1 的这个端口, 由系统 Nginx 反向代理出去
     "web_port": 18341,
     # 浏览器访问控制台的地址(Nginx 入口), 用于生成登录链接
@@ -125,8 +130,12 @@ def load_config() -> dict:
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
     cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
     cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
-    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default", "web_port"):
+    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default", "web_port",
+                "deny_reply_cooldown"):
         cfg[key] = int(cfg[key])
+    # LARKX_DENY_REPLY 写成空的是关掉这个功能, 不能像别的配置一样当成没写、退回默认值
+    if os.environ.get("LARKX_DENY_REPLY") is not None:
+        cfg["deny_reply"] = os.environ["LARKX_DENY_REPLY"]
     for key in ("agent_home", "agent_claude_dir", "agent_codex_dir"):
         cfg[key] = os.path.expanduser(cfg[key])
     triggers = dict(DEFAULTS["triggers"])

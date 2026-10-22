@@ -89,6 +89,34 @@ def send_denied(target_chat: str, turn) -> str:
     return f'只能发到触发这一轮的会话 {turn["chat_id"] or "(无)"}; 给其他会话发消息需要本人发起'
 
 
+def deny_cooling(chat_id: str, sender_id: str, cooldown: int, now: float = None) -> bool:
+    """没权限回复的冷却: 同一会话里的同一个人 cooldown 秒内已经回过时返回 True; 否则记下这次, 返回 False。
+
+    记在 state/deny_reply.json(只有 daemon 写), daemon 重启后照样算数; 每次写入时顺带清掉已经过了冷却的记录。
+    """
+    if cooldown <= 0:
+        return False
+    path = STATE_DIR / 'deny_reply.json'
+    now = time.time() if now is None else now
+    try:
+        sent = json.loads(path.read_text(encoding='utf-8'))
+    except (FileNotFoundError, json.JSONDecodeError):
+        sent = {}
+    if not isinstance(sent, dict):
+        sent = {}
+    key = f'{chat_id}:{sender_id}'
+    last = sent.get(key)
+    if isinstance(last, (int, float)) and 0 <= now - last < cooldown:
+        return True
+    sent = {k: v for k, v in sent.items() if isinstance(v, (int, float)) and 0 <= now - v < cooldown}
+    sent[key] = now
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(sent), encoding='utf-8')
+    tmp.replace(path)
+    return False
+
+
 DURATION_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
 
 

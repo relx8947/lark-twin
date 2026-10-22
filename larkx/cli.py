@@ -631,20 +631,33 @@ def _pick_person(args, people: list, what: str, rerun: str):
     return None
 
 
+def _owner_name(st) -> str:
+    """本人的名字(从本地消息记录里取, 不联网); 拿不到时返回空字符串。"""
+    try:
+        uid = LarkAuth().user_id
+    except Exception:
+        return ''
+    return st.owner_name(uid) if uid else ''
+
+
 def cmd_whitelist(args):
     from . import whitelist as wl
     from .config import inside_twin
     st = Storage()
-    triggers = load_config()['triggers']
+    cfg = load_config()
+    triggers = cfg['triggers']
     query = ' '.join(args.target).strip()
     if args.action == 'list':
         rows = st.whitelist_list()
         rule = wl.rule_sentence(len(rows), triggers, below=False)
+        deny = wl.deny_sentence(cfg, len(rows), _owner_name(st) if '{owner}' in (cfg.get('deny_reply') or '') else '')
         if args.json:
-            _print_json({'rule': rule, 'owner_only': bool(triggers.get('owner_only')),
+            _print_json({'rule': rule, 'deny': deny, 'owner_only': bool(triggers.get('owner_only')),
                          'group_at_only': bool(triggers.get('group_at_only')), 'entries': [wl.entry_dict(r) for r in rows]})
             return 0
         print(rule)
+        if deny:
+            print(deny)
         for r in rows:
             print(f'{r.user_id}\t{r.name or "-"}\t{r.department or "-"}\t添加于 {r.added_at:%Y-%m-%d %H:%M}')
         return 0

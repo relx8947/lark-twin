@@ -11,6 +11,9 @@ def _isolate_local_state(monkeypatch, tmp_path):
     monkeypatch.setattr(state, 'RELAY_DIR', tmp_path / 'state' / 'relay')
     monkeypatch.setattr(notify, 'NOTIFY_STATE', tmp_path / 'state' / 'notify.json')
     monkeypatch.setattr(daemon, 'DAEMON_STATE', tmp_path / 'state' / 'daemon.json')
+    # 本机 .env 里可能改过没权限回复的文字, 测试一律从代码默认值出发
+    monkeypatch.delenv('LARKX_DENY_REPLY', raising=False)
+    monkeypatch.delenv('LARKX_DENY_REPLY_COOLDOWN', raising=False)
 
 
 class FakeClient:
@@ -18,6 +21,8 @@ class FakeClient:
 
     def __init__(self, user_id='100', owner_chat='self'):
         self.sent, self.api_calls = [], []
+        self.replies = []     # send_message 带的回复目标
+        self.bots = set()     # is_bot 认作机器人的 id
         self.keep_unread = []  # 每次发送带的 keep_unread
         self.auth = type('A', (), {'user_id': user_id})()
         self._owner_chat = owner_chat
@@ -29,6 +34,13 @@ class FakeClient:
         self.sent.append((chat_id, text))
         self.keep_unread.append(keep_unread)
         return f'm{len(self.sent)}'
+
+    def send_message(self, msg, chat_id, root_id=None, keep_unread=False, fallback=True, parent_id=None, in_thread=None):
+        self.replies.append({'chat_id': chat_id, 'text': msg.get('text'), 'root_id': root_id, 'parent_id': parent_id})
+        return self.send_msg(msg.get('text'), chat_id, root_id=root_id, keep_unread=keep_unread)
+
+    def is_bot(self, user_id):
+        return str(user_id) in self.bots
 
     def create_chat(self, user_id):
         return self._owner_chat

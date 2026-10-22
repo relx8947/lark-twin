@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from loguru import logger
 
 from .. import state
+from .. import whitelist as wl
 from ..agent import SessionCrashed, create_session, ensure_agent_home
 from ..agent.home import commit_agent_home
 from ..config import CREDENTIALS_PATH, DATA_DIR, load_config, with_signature
@@ -16,8 +17,8 @@ from ..notify import Notifier
 from ..protocol import AuthExpired, LarkAuth, LarkClient
 from ..storage import Storage
 from .listener import Listener
-from .triggers import (build_prompt, build_say_prompt, build_system_prompt, build_task_prompt, parse_command,
-                       parse_takeover, should_handle, strip_prefix, takeover_note)
+from .triggers import (build_prompt, build_say_prompt, build_system_prompt, build_task_prompt, denied_attempt,
+                       parse_command, parse_takeover, should_handle, strip_mentions, strip_prefix, takeover_note)
 
 LOG_PATH = DATA_DIR / 'logs' / 'daemon.log'
 DAEMON_STATE = state.STATE_DIR / 'daemon.json'
@@ -76,6 +77,9 @@ class Daemon:
         print(f'  触发前缀: {t.get("prefix") or "(全部消息)"}  允许自己触发: {self.cfg.get("allow_self")}', flush=True)
         print(f'  群里别人需 @我: {bool(t.get("group_at_only"))}  只有本人能唤起: {bool(t.get("owner_only"))}', flush=True)
         print(f'  唤起白名单: {len(self.storage.whitelist_ids())} 人(非空时只有本人和白名单里的人能唤起, 改了立即生效)', flush=True)
+        deny = self._deny_text()
+        print(f'  没权限的人唤起时回复: {deny or "(不回复)"}'
+              + (f'  同一会话同一人 {self.cfg["deny_reply_cooldown"]}s 内只回一次' if deny else ''), flush=True)
         print('─' * 56, flush=True)
 
     async def run(self):
@@ -111,8 +115,11 @@ class Daemon:
         chat_id = str(msg['chat_id'])
         tk = None if is_owner else self.storage.takeover_get(chat_id, time.time())
         # 白名单每条都现查: 命令行、网页改了立即生效, 不用重启
-        if not tk and not should_handle(msg, self.cfg, self.auth.user_id,
-                                        whitelist=() if is_owner else self.storage.whitelist_ids()):
+        whitelist = () if is_owner else self.storage.whitelist_ids()
+        if not tk and not should_handle(msg, self.cfg, self.auth.user_id, whitelist=whitelist):
+            # 没权限的人想唤起: 马上回一句"没有权限", 不交给数字人
+            if not is_owner and denied_attempt(msg, self.cfg, self.auth.user_id, whitelist):
+                await self._deny(msg, chat_name, sender_name)
             return
         age = time.time() - float(msg.get('create_time') or time.time())
         if age > self.cfg['inbox_max_age']:
@@ -164,6 +171,55 @@ class Daemon:
         if not rest:
             return
         await self._enqueue_message(msg, rest, chat_name, sender_name, is_owner)
+
+    def _owner_name(self) -> str:
+        """本人在飞书上的名字(LARKX_DENY_REPLY 里的 {owner}); 查到一次就记住。"""
+        name = getattr(self, '_owner_display_name', '')
+        if not name:
+            try:
+                name = self.client.get_user_name(str(self.auth.user_id), '0') or ''
+            except Exception as e:
+                logger.warning(f'查本人的名字失败: {e!r}')
+            name = name or self.storage.owner_name(self.auth.user_id)
+            self._owner_display_name = name
+        return name
+
+    def _deny_text(self) -> str:
+        raw = self.cfg.get('deny_reply') or ''
+        return wl.deny_text(self.cfg, self._owner_name() if '{owner}' in raw else '')
+
+    async def _deny(self, msg, chat_name='', sender_name=''):
+        """没权限的人想唤起数字人: 引用回复一句 LARKX_DENY_REPLY(不加签名, 不经过 agent), 同一会话同一人冷却时间内只回一次。"""
+        try:
+            chat_id, sender_id, msg_id = str(msg['chat_id']), str(msg.get('from_id')), str(msg.get('msg_id') or '')
+            age = time.time() - float(msg.get('create_time') or time.time())
+            if age > self.cfg['inbox_max_age'] or not msg_id or not (self.cfg.get('deny_reply') or '').strip():
+                return
+            text = await asyncio.to_thread(self._deny_text)
+            if self.prefix and strip_mentions(text).startswith(self.prefix):
+                # 以触发前缀开头的回复会再次触发本人自己的数字人, 不发
+                logger.warning(f'LARKX_DENY_REPLY 不能以触发前缀 {self.prefix} 开头, 没有回复')
+                return
+            who = f'{sender_name or sender_id}({sender_id})'
+            where = chat_name or chat_id
+            if await asyncio.to_thread(self.client.is_bot, sender_id):
+                logger.info(f'[没权限] {who} 是机器人, 不回复')
+                return
+            if state.deny_cooling(chat_id, sender_id, self.cfg.get('deny_reply_cooldown', 0)):
+                logger.info(f'[没权限] {who} 在「{where}」想唤起数字人, 冷却时间内已经回过, 这次不回')
+                return
+            # 引用回复他的那条: 话题群、普通群的话题里回进那个话题(rootId 是话题的根), 别的地方留在主会话
+            sent = await asyncio.to_thread(self.client.send_message, {'kind': 'text', 'text': text}, chat_id,
+                                           root_id=msg.get('anchor') or msg_id, parent_id=msg_id)
+            self.storage.log_action(actor='daemon', action='deny_reply', chat_id=chat_id, msg_id=str(sent or ''),
+                                    content=text, ok=1 if sent else 0, error='' if sent else '发送失败',
+                                    turn_kind='message', turn_ref=msg_id)
+            if sent:
+                logger.info(f'[没权限] {who} 在「{where}」想唤起数字人, 已回复: {text}')
+            else:
+                logger.error(f'[没权限] 给 {who} 在「{where}」的回复发送失败: {text}')
+        except Exception as e:
+            logger.exception(f'没权限回复出错: {e!r}')
 
     async def _enqueue_message(self, msg, body, chat_name, sender_name, is_owner, note=''):
         if not body:

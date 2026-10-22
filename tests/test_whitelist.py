@@ -233,7 +233,8 @@ def test_cli_list(cli_env, capsys):
     import json
     st, _ = cli_env
     assert cli.cmd_whitelist(_args('list')) == 0
-    assert capsys.readouterr().out.strip() == '只有你能唤起数字人'
+    assert capsys.readouterr().out.strip().splitlines() == [
+        '只有你能唤起数字人', '没权限的人发 /ai 会收到：你没有权限唤起本人的 lark-twin（10 分钟内同一人只回一次）']
     st.whitelist_add(LS, '李四', '飞书-IM', added_by='cli')
     assert cli.cmd_whitelist(_args('list', json=True)) == 0
     out = json.loads(capsys.readouterr().out)

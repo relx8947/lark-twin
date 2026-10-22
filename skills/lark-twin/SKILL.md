@@ -35,6 +35,7 @@ uv venv && uv pip install -e .
 | `LARKX_ALLOW_SELF` | 默认 `true`：用户自己发的 `/ai` 也会交给数字人，这是给它下指令、`/stop`、`/clear`、`/takeover` 的前提。没有触发前缀时，用户自己的消息一律不触发 |
 | `LARKX_REPLY_SIGNATURE` | 用户希望数字人发出的消息带上 AI 标识时填，比如 `（AI 代回）`。默认不加 |
 | `LARKX_TRIGGER_OWNER_ONLY` | 只有本人能唤起，默认关。只在唤起白名单为空时起作用；用户想让少数几个人也能叫起数字人，不改它，用 `larkx whitelist add` 加人 |
+| `LARKX_DENY_REPLY` | 没权限的人想唤起（私聊发 `/ai`、群里 @ 本人发 `/ai`）时 daemon 自动引用回复的一句话，不经过 agent。默认"你没有权限唤起{owner}的 lark-twin"（`{owner}` 是用户的名字）；用户不想回就设成空 `LARKX_DENY_REPLY=`。`LARKX_DENY_REPLY_COOLDOWN` 是同一会话同一人多少秒内只回一次，默认 600 |
 
 `.env` 里写了 key 时，执行 `chmod 600 .env`。不要把 key 的内容输出到对话里。
 
@@ -108,7 +109,7 @@ uv venv && uv pip install -e .
 | 卸载服务 | `.venv/bin/larkx service uninstall` |
 | 全面检查 | `.venv/bin/larkx doctor` |
 | 网页控制台登录链接 | `.venv/bin/larkx web url`；令牌泄露了用 `larkx web reset-token` |
-| 管理谁能唤起数字人 | `.venv/bin/larkx whitelist list` / `add <名字或 user_id>` / `remove <名字或 user_id>`，或者网页控制台的"白名单"页。白名单非空时只有本人和名单里的人能唤起，为空时看 `LARKX_TRIGGER_OWNER_ONLY`。改动立即生效，不用重启。加人前和用户确认是哪一个（同名的看部门和 user_id） |
+| 管理谁能唤起数字人 | `.venv/bin/larkx whitelist list` / `add <名字或 user_id>` / `remove <名字或 user_id>`，或者网页控制台的"白名单"页。白名单非空时只有本人和名单里的人能唤起，为空时看 `LARKX_TRIGGER_OWNER_ONLY`。改动立即生效，不用重启。加人前和用户确认是哪一个（同名的看部门和 user_id）。没权限的人想唤起时会自动收到 `LARKX_DENY_REPLY`（`whitelist list` 第二行有说明） |
 
 数字人的人设和行为准则在 `~/.larkx/agent/CLAUDE.md`，长期记忆在 `~/.larkx/agent/memory/`，两处都可以直接修改。这个目录是一个 git 仓库，每轮的变化都会自动提交，改坏了可以用 git 回退。修改人设后，新会话一定会读到新内容：用户在飞书发 `/ai /clear` 即可开新会话，长期记忆会保留。`/ai /stop` 用来打断当前任务。这两个命令只有用户本人发才生效。
 
@@ -121,7 +122,7 @@ uv venv && uv pip install -e .
 | doctor 显示"模型调用"失败 | Claude：检查 `LARKX_CLAUDE_CLI` 指定的命令在终端里能否正常启动 Claude Code。Codex：检查 `codex` 在终端里能否正常对话；如果报 "workspace routing discovery" 或连接超时，多半是代理问题，在 `.env` 设置大写的 `HTTPS_PROXY`；如果报模型不支持，设置 `LARKX_AGENT_MODEL`。改完先 `service install` 刷新 PATH，再 `restart` |
 | doctor 或 status 显示"重复进程" | 有不归 systemd 管的 `larkx daemon` 在运行，同一账号会出现两个数字人。确认后结束那些进程 |
 | 日志里有"主模型被安全策略拦截" | 整个会话已经切到备用模型。确认 `LARKX_AGENT_FALLBACK_MODEL` 可用；必要时请用户发 `/ai /clear` 开新会话 |
-| 别人发 `/ai` 没反应 | 先 `.venv/bin/larkx whitelist list` 看第一行的规则：白名单非空时只认本人和名单里的人；为空且 `LARKX_TRIGGER_OWNER_ONLY=true` 时只认本人。群里别人还要 @ 本人。要放行某人就让用户把他加进白名单 |
+| 别人发 `/ai` 没反应 | 先 `.venv/bin/larkx whitelist list` 看第一行的规则：白名单非空时只认本人和名单里的人；为空且 `LARKX_TRIGGER_OWNER_ONLY=true` 时只认本人。群里别人还要 @ 本人。要放行某人就让用户把他加进白名单。没权限的人本该收到一句"没有权限"：没收到时看 `LARKX_DENY_REPLY` 是不是空的、是不是 10 分钟内已经回过他（日志里搜 `[没权限]`，`larkx audit` 里是 `deny_reply`） |
 | 审计里有"只能发到触发这一轮的会话" | 别人想让数字人给第三方发消息，被拦下了，这是预期行为。如果是本人想让它跨会话发消息，本人自己发 `/ai` 即可 |
 
 ## 注意

@@ -107,6 +107,8 @@ async function loadChats() {
 const chatLabel = (id, name) => name || chatNames[id] || (id ? `会话 ${id}` : '');
 
 const KIND = { message: '消息', task: '任务', say: '终端指令', system: '维护', web: '网页' };
+// daemon: 不经过数字人、由 daemon 直接发的(没权限的人想唤起时的自动回复)
+const ACTOR = { agent: '数字人', daemon: '自动回复' };
 const STATUS = { pending: '排队中', running: '处理中', done: '已完成', failed: '失败', cancelled: '已取消', expired: '已过期' };
 
 // ---- 登录 ----
@@ -295,12 +297,12 @@ async function viewActivity() {
       h('thead', {}, h('tr', {}, ['时间', '谁', '动作', '会话', '内容', '结果', ''].map(t => h('th', {}, t)))),
       h('tbody', {}, rows.map(r => h('tr', { class: 'act' },
         h('td', { class: 'muted nowrap' }, fmt(r.time)),
-        h('td', { class: 'nowrap' }, r.actor === 'agent' ? '数字人' : '本人', r.turn_kind ? h('div', { class: 'muted', style: 'font-size:11.5px' }, KIND[r.turn_kind] || r.turn_kind) : null),
-        h('td', { class: 'nowrap' }, { send: '发消息', recall: '撤回', whitelist: '白名单' }[r.action] || r.action),
+        h('td', { class: 'nowrap' }, ACTOR[r.actor] || '本人', r.turn_kind ? h('div', { class: 'muted', style: 'font-size:11.5px' }, KIND[r.turn_kind] || r.turn_kind) : null),
+        h('td', { class: 'nowrap' }, { send: '发消息', recall: '撤回', whitelist: '白名单', deny_reply: '没权限回复' }[r.action] || r.action),
         h('td', { style: 'min-width:120px;max-width:220px' }, h('div', { class: 'lines2', title: chatLabel(r.chat_id, r.chat_name) }, chatLabel(r.chat_id, r.chat_name))),
         h('td', { style: 'width:50%', class: r.recalled ? 'muted' : null }, clamp(r.content)),
         h('td', { class: 'nowrap' }, r.ok ? '✓' : h('span', { class: 'tag bad', title: r.error }, '✗ ' + (r.error || '').slice(0, 40))),
-        h('td', { class: 'nowrap' }, r.action === 'send' ? recallCtl(r) : null))))) : h('div', { class: 'empty' }, '还没有记录'));
+        h('td', { class: 'nowrap' }, r.action === 'send' || r.action === 'deny_reply' ? recallCtl(r) : null))))) : h('div', { class: 'empty' }, '还没有记录'));
   });
 }
 
@@ -408,7 +410,8 @@ async function viewWhitelist() {
       h('p', { class: 'muted', style: 'margin:8px 0 0' },
         st.entries.length ? '白名单里的人和其他人一样按访客对待，不会拿到你的权限。'
           : `白名单是空的，按 LARKX_TRIGGER_OWNER_ONLY（现在${st.owner_only ? '打开' : '没打开'}）决定。加了人之后，就只有你和白名单里的人能唤起。`,
-        '改动立即生效，不用重启；数字人自己改不了白名单。'));
+        '改动立即生效，不用重启；数字人自己改不了白名单。'),
+      st.deny ? h('p', { class: 'muted', style: 'margin:6px 0 0' }, st.deny) : null);
     put(list, h('h2', {}, `白名单（${st.entries.length}）`),
       st.entries.length ? h('div', { class: 'people' }, st.entries.map(p => personRow(p, {},
         h('span', { class: 'muted', style: 'font-size:12px' }, fmt(p.added_at) + (p.added_by === 'cli' ? ' 命令行添加' : ' 网页添加')),

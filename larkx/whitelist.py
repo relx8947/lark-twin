@@ -5,6 +5,8 @@
 - 白名单非空: 只有本人和白名单里的人能唤起, 别人的 /ai 一律不理;
 - 白名单为空: 看 LARKX_TRIGGER_OWNER_ONLY, 打开时只有本人, 关着时所有人;
 - 群里照旧要 @ 本人(LARKX_TRIGGER_GROUP_AT_ONLY); 接管中的会话、定时任务、larkx say 不受影响。
+没权限的人想唤起时(私聊发 /ai, 群里 @ 本人发 /ai), daemon 马上回一句 LARKX_DENY_REPLY, 不经过 agent;
+同一会话同一个人 LARKX_DENY_REPLY_COOLDOWN 秒内只回一次。见 triggers.denied_attempt 和 Daemon._deny。
 白名单里的人和其他人一样按访客对待(见 guest.py), 不会因此拿到本人的权限。
 
 只按 user_id 匹配, 从不按名字。白名单只有本人能改, 数字人自己不能改(见 Storage.whitelist_add 和 cli.py)。
@@ -35,6 +37,30 @@ def rule_sentence(count: int, triggers: dict, below: bool = True) -> str:
     if triggers.get('owner_only'):
         return '只有你能唤起数字人'
     return f'所有人都能唤起数字人{group}'
+
+
+def deny_text(cfg: dict, owner: str = '') -> str:
+    """没权限的人想唤起时自动回的那句话; 关掉(LARKX_DENY_REPLY 为空)时是空字符串。{owner} 换成本人的名字。"""
+    text = (cfg.get('deny_reply') or '').strip()
+    return text.replace('{owner}', owner or '本人') if text else ''
+
+
+def deny_sentence(cfg: dict, count: int, owner: str = '') -> str:
+    """规则下面的一句补充: 没权限的人发 /ai 会怎样。所有人都能唤起时没人会被拒, 返回空字符串。"""
+    triggers = cfg.get('triggers') or {}
+    if not count and not triggers.get('owner_only'):
+        return ''
+    text = deny_text(cfg, owner)
+    if not text:
+        return '没权限的人发 /ai 不会收到任何回复（LARKX_DENY_REPLY 为空）'
+    cooldown = int(cfg.get('deny_reply_cooldown') or 0)
+    if cooldown <= 0:
+        limit = '每次都回'
+    elif cooldown % 60:
+        limit = f'{cooldown} 秒内同一人只回一次'
+    else:
+        limit = f'{cooldown // 60} 分钟内同一人只回一次'
+    return f'没权限的人发 /ai 会收到：{text}（{limit}）'
 
 
 def _clean(text) -> str:

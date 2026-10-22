@@ -182,11 +182,12 @@ def activity(request: Request):
     names = _chat_names(st)
     rows = st.list_actions(limit=int(request.query_params.get('limit', 100)))
     rows.reverse()
-    recalled = st.recalled_ids(r.msg_id for r in rows if r.action == 'send')
+    sends = ('send', 'deny_reply')
+    recalled = st.recalled_ids(r.msg_id for r in rows if r.action in sends)
     return _json([{'id': r.id, 'time': r.created_at, 'actor': r.actor, 'action': r.action, 'chat_id': r.chat_id,
                    'chat_name': names.get(r.chat_id, ''), 'msg_id': r.msg_id, 'content': r.content, 'ok': bool(r.ok),
                    'error': r.error, 'turn_kind': r.turn_kind, 'turn_ref': r.turn_ref,
-                   'recalled': r.action == 'send' and r.msg_id in recalled} for r in rows])
+                   'recalled': r.action in sends and r.msg_id in recalled} for r in rows])
 
 
 @api
@@ -313,11 +314,14 @@ def _lark():
 
 
 def _whitelist_state(st: Storage) -> dict:
-    triggers = load_config()['triggers']
+    cfg = load_config()
+    triggers = cfg['triggers']
     rows = st.whitelist_list()
-    region = _auth().region
-    return {'rule': wl.rule_sentence(len(rows), triggers), 'owner_only': bool(triggers.get('owner_only')),
-            'group_at_only': bool(triggers.get('group_at_only')), 'entries': [wl.entry_dict(r, region) for r in rows]}
+    auth = _auth()
+    owner = st.owner_name(auth.user_id) if '{owner}' in (cfg.get('deny_reply') or '') else ''
+    return {'rule': wl.rule_sentence(len(rows), triggers), 'deny': wl.deny_sentence(cfg, len(rows), owner),
+            'owner_only': bool(triggers.get('owner_only')), 'group_at_only': bool(triggers.get('group_at_only')),
+            'entries': [wl.entry_dict(r, auth.region) for r in rows]}
 
 
 @api
@@ -487,7 +491,8 @@ def recall(request: Request):
     if not msg_id.isdigit():
         raise ValueError('msg_id 不合法')
     st = Storage()
-    sent = st.find_action('agent', 'send', msg_id) or st.find_action('human', 'send', msg_id)
+    sent = (st.find_action('agent', 'send', msg_id) or st.find_action('human', 'send', msg_id)
+            or st.find_action('daemon', 'deny_reply', msg_id))
     try:
         LarkClient(LarkAuth()).api('messages.DeleteMessageRequest', {'id': msg_id})
     except Exception as e:

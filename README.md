@@ -48,6 +48,8 @@ cp .env.example .env          # 选择 claude / codex，并填写启动命令
 
 **谁能唤起它（唤起白名单）**：你自己一直能。白名单里有人时，只有你和白名单里的人能唤起，别人的 `/ai` 一律不理；白名单为空时按上面的 `LARKX_TRIGGER_OWNER_ONLY`。群里照旧要 @你。白名单里的人和其他人一样按访客对待，不会拿到你的权限。在控制台的"白名单"页搜名字添加（同名的看头像和部门区分），或者用 `larkx whitelist add <名字或 user_id>`，两边是同一份名单，改了立即生效，不用重启。数字人自己改不了白名单：它调用 `larkx whitelist add/remove` 会被拒绝并通知你。
 
+**没权限的人想唤起时**：私聊里发 `/ai …`、或者在群里 @你 发 `/ai …` 的人没有权限时，daemon 马上引用回复他一句 `LARKX_DENY_REPLY`（默认"你没有权限唤起{owner}的 lark-twin"，`{owner}` 换成你的名字），不经过数字人、不加签名。同一会话里同一个人 10 分钟内只回一次（`LARKX_DENY_REPLY_COOLDOWN`，秒）。群里没 @你 的 `/ai`、普通聊天、机器人发的都不回；接管中的会话照常交给数字人。`LARKX_DENY_REPLY` 设成空就关掉。每次回复都记进审计（`larkx audit`、控制台"动态"页）。
+
 **在终端，或者你自己的 agent 里**
 
 ```bash
@@ -85,6 +87,7 @@ larkx service status | logs -f   # 运行状态
 | `LARKX_AGENT_FALLBACK_MODEL` | 用 Claude 时，主模型被安全策略拦截后改用的备用模型 |
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认是 `/ai` |
 | `LARKX_REPLY_SIGNATURE` | 每条回复末尾的署名，比如 `🤖 lark-twin · 数字分身`，会和正文空一行、前面加"——" |
+| `LARKX_DENY_REPLY` / `LARKX_DENY_REPLY_COOLDOWN` | 没权限的人发 `/ai` 时自动回的一句话（`{owner}` 换成你的名字，设成空关掉）· 同一会话同一人多少秒内只回一次，默认 600 |
 | `LARKX_ALERT_CMD` | 飞书登录失效时的备用告警命令，比如用 lark-cli 机器人身份发给你 |
 | `LARKX_WEB_URL` | 网页控制台的对外地址（Nginx 入口），用来生成登录链接 |
 
