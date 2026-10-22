@@ -1,5 +1,6 @@
 // 网页版飞书。只用只读接口看消息, 看过的仍是未读; 聊天内容一律用 textContent 渲染, 不拼 HTML。
 // 能发文字、表情(Unicode emoji)、@、图片和文件, 都由后端匿名发送(有未读时经本人私聊转发)并在发出后核对已读。
+// 话题群显示话题列表(每个话题的根消息和回复数), 点开一个话题在右侧看它的回复; 位置(position)都是话题位置。
 'use strict';
 
 const $ = id => document.getElementById(id);
@@ -122,7 +123,8 @@ const S = { feed: [], cursor: '', filter: 'all', q: '', results: null, latest: n
   chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, seq: 0, poll: 0, me: null,
   readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false, loaded: false, fetchedAt: 0, rows: new Map(),
   cache: new Map(), inflight: new Map(), cards: new Map(), hoverTimer: 0, prefetching: false,
-  pending: [], pendingSeq: 0, mentions: [], members: null, sending: false };
+  pending: [], pendingSeq: 0, mentions: [], members: null, sending: false, thread: null, threadSeq: 0 };
+const isTopic = () => !!S.chat && S.chat.kind === 'topic';
 // 新消息: 每秒先问本地库(daemon 收到推送就入库), 本地没有时最多每 3 秒去服务端拉一次; 页面在后台时放慢
 const POLL_MS = 1000, SERVER_MS = 3000, SERVER_HIDDEN_MS = 10000;
 // 会话列表: 本地库有新消息时尽快刷新(最多每 3 秒一次), 否则每 8 秒一次, 页面在后台时 30 秒一次
@@ -317,11 +319,11 @@ async function prefetchTop() {
   } finally { S.prefetching = false; }
 }
 
-async function openChat(chatId) {
+async function openChat(chatId, threadId) {
   saveCurrent();
   clearInterval(S.poll);
   const seq = ++S.seq;
-  clearComposer();
+  clearComposer(); closeThread();
   const cached = S.cache.get(chatId), item = S.feed.find(i => i.chat_id === chatId);
   Object.assign(S, { chatId, chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, loaded: false, rows: new Map(),
     head: null, body: null, input: null });
@@ -332,6 +334,7 @@ async function openChat(chatId) {
     useEntry(cached);
     renderChat(); renderMsgs(cached.view ? 'restore' : 'unread', cached.view);
     startPoll(seq);
+    if (threadId) openThreadId(threadId);
     if (Date.now() - cached.fetchedAt > FRESH_MS) refreshOpen(seq);
     return;
   }
@@ -348,6 +351,7 @@ async function openChat(chatId) {
   if (S.body) renderHead(); else renderChat();
   renderMsgs('unread');
   startPoll(seq);
+  if (threadId) openThreadId(threadId);
 }
 
 async function refreshOpen(seq) {
@@ -370,7 +374,7 @@ function startPoll(seq) {
 function closeChat() {
   saveCurrent();
   clearInterval(S.poll); S.seq++;
-  clearComposer();
+  clearComposer(); closeThread();
   Object.assign(S, { chatId: '', chat: null, msgs: [], loaded: false, head: null, body: null, input: null });
   $('tab-im').classList.remove('has-chat');
   emptyChat('看消息不会标为已读，对方也看不到');
@@ -381,11 +385,14 @@ async function pollTick(seq) {
   if (S.polling || seq !== S.seq) return;
   S.polling = true;
   try {
-    const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}&local=1`).catch(() => null);
-    if (seq !== S.seq) return;
-    if (d && d.messages.length) {
-      addMsgs(d.messages); S.end = Math.max(S.end, d.end); renderMsgs('keep-bottom');
-      return;
+    // 话题群不问本地库: 本地库按会话位置存消息, 和话题位置对不上, 只定时从服务端刷新
+    if (!isTopic()) {
+      const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}&local=1`).catch(() => null);
+      if (seq !== S.seq) return;
+      if (d && d.messages.length) {
+        addMsgs(d.messages); S.end = Math.max(S.end, d.end); renderMsgs('keep-bottom');
+        return;
+      }
     }
     if (Date.now() - S.lastServer >= (document.hidden ? SERVER_HIDDEN_MS : SERVER_MS)) await pollChat(seq);
   } finally { if (seq === S.seq) S.polling = false; }
@@ -396,6 +403,12 @@ async function pollChat(seq) {
   S.lastServer = Date.now();
   const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}`).catch(() => null);
   if (!d || seq !== S.seq) return;
+  if (d.chat.kind === 'topic') {
+    // 话题群返回的是最近几个话题(回复数会变), 替换这一段; 打开着的话题顺带取新回复
+    mergeFresh(S, d); renderHead(); renderMsgs('keep-bottom');
+    await pollThread();
+    return;
+  }
   S.chat = d.chat;
   if (d.messages.length) addMsgs(d.messages);
   S.end = Math.max(S.end, d.end);
@@ -411,9 +424,10 @@ async function olderMsgs() {
   renderMsgs('keep-offset');
 }
 
-function addMsgs(list) {
-  const have = new Set(S.msgs.map(m => m.msg_id));
-  S.msgs = S.msgs.concat(list.filter(m => !have.has(m.msg_id))).sort((a, b) => a.position - b.position);
+function addMsgs(list) { addTo(S, list); }
+function addTo(t, list) {
+  const have = new Set(t.msgs.map(m => m.msg_id));
+  t.msgs = t.msgs.concat(list.filter(m => !have.has(m.msg_id))).sort((a, b) => a.position - b.position);
 }
 
 // 搭好聊天窗口(标题、消息区、输入框), 每次打开会话搭一次; 之后只更新标题(renderHead)和消息(renderMsgs), 输入框里打的字不会丢
@@ -475,7 +489,7 @@ function isGrouped(m, prev) {
   return !!prev && prev.kind !== 'system' && prev.kind !== 'recalled' && prev.from_id === m.from_id && m.time - prev.time < 300;
 }
 
-function msgRow(m, grouped) {
+function msgRow(m, grouped, inThread) {
   if (m.kind === 'system' || m.kind === 'recalled') return h('div', { class: 'sys-msg' + (m.kind === 'recalled' ? ' recalled' : '') }, m.content);
   return h('div', { class: 'msg' + (m.me ? ' me' : '') },
     grouped ? h('span', { class: 'msg-avatar-gap' }) : avatar(m.avatar, m.sender, 32),
@@ -483,17 +497,17 @@ function msgRow(m, grouped) {
       grouped ? null : h('div', { class: 'msg-meta' }, m.me ? null : h('span', {}, m.sender || '未知'), h('time', {}, msgTime(m.time))),
       m.quote ? h('div', { class: 'msg-quote', title: (m.quote.sender ? m.quote.sender + '：' : '') + m.quote.text },
         m.quote.sender ? h('span', { class: 'msg-quote-who' }, m.quote.sender + '：') : null, m.quote.text) : null,
-      msgBody(m)),
+      msgBody(m, inThread)),
     h('div', { class: 'msg-ops' }, h('button', { title: '回复', onclick: () => setReply(m) }, icon('reply'), '回复')));
 }
 
-function msgBody(m) {
+function msgBody(m, inThread) {
   if (m.kind === 'image') return h('div', { class: 'bubble img' }, chatImage(m, m.image, 260, true));
   if (m.kind === 'sticker') return h('div', { class: 'bubble img sticker' }, chatImage(m, m.image, 140, false));
   if (m.kind === 'file') return fileCard(m);
   if (m.kind === 'card') return cardBubble(m);
   return h('div', { class: 'bubble' },
-    m.root_id && !m.quote ? h('div', { class: 'bubble-reply' }, '回复话题') : null,
+    m.root_id && !m.quote && !inThread ? h('div', { class: 'bubble-reply' }, '回复话题') : null,
     m.title ? h('div', { class: 'bubble-title' }, m.title) : null,
     segments(m.segments, m));
 }
@@ -561,7 +575,8 @@ function cardBubble(m) {
 }
 
 function setReply(m) {
-  S.replyTo = { root_id: m.root_id || m.msg_id, sender: m.me ? '我' : m.sender, content: (m.content || '').slice(0, 80) };
+  // 引用回复: parent 是点的那条(上方显示的引用), root 是它所在那串回复最早的一条; 话题群里 root 就是话题的根消息
+  S.replyTo = { root_id: m.root_id || m.msg_id, parent_id: m.msg_id, sender: m.me ? '我' : m.sender, content: (m.content || '').slice(0, 80) };
   renderReply(); S.input && S.input.focus();
   // 被回复的那条(话题的根消息)会被服务端标为已读; 回复自己发的不涉及别人
   if (!m.me || m.root_id) toast('回复某条消息会让那一条对对方显示已读，其他消息不受影响');
@@ -596,28 +611,164 @@ function renderMsgs(mode, view) {
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const fromBottom = box.scrollHeight - box.scrollTop;
   // 消息上的时间按"今天/昨天"显示, 过了零点就重建
+  // 话题群: 每个话题一行(发起人、时间、根消息、回复数), 不合并同一个人的连续话题, 也不插时间分隔
+  const topic = isTopic();
   const rows = [], built = new Map(), day = new Date().toDateString();
   let prev = null, divider = null;
   for (const m of S.msgs) {
     if (m.kind === 'system' && !m.content) continue;  // 没有提示文字的系统消息
     if (!divider && isFirstUnread(m)) {
-      divider = h('div', { class: 'unread-divider' }, h('span', {}, '以下为新消息'));
+      divider = h('div', { class: 'unread-divider' }, h('span', {}, topic ? '以下为新话题' : '以下为新消息'));
       rows.push(divider); prev = null;
     }
-    if (!prev || m.time - prev.time > 300) { rows.push(h('div', { class: 'time-divider' }, msgTime(m.time))); prev = null; }
-    const key = m.msg_id || 'p' + m.position, sig = sigOf(m), grouped = isGrouped(m, prev), old = S.rows.get(key);
-    const row = old && old.sig === sig && old.grouped === grouped && old.day === day ? old : { sig, grouped, day, node: msgRow(m, grouped) };
+    if (!topic && (!prev || m.time - prev.time > 300)) { rows.push(h('div', { class: 'time-divider' }, msgTime(m.time))); prev = null; }
+    const key = m.msg_id || 'p' + m.position, sig = sigOf(m), grouped = !topic && isGrouped(m, prev), old = S.rows.get(key);
+    const row = old && old.sig === sig && old.grouped === grouped && old.day === day ? old
+      : { sig, grouped, day, node: topic ? topicRow(m) : msgRow(m, grouped) };
     built.set(key, row);
     rows.push(row.node);
     prev = m;
   }
   S.rows = built;
-  put(box, S.hasMore ? h('div', { class: 'chat-older' }, h('button', { onclick: olderMsgs }, '查看更早的消息')) : null,
-    rows.length ? rows : h('div', { class: 'sys-msg' }, '还没有消息'));
+  const empty = topic ? (S.hasMore ? '最近没有话题' : '还没有话题') : '还没有消息';
+  put(box, S.hasMore ? h('div', { class: 'chat-older' }, h('button', { onclick: olderMsgs }, topic ? '查看更早的话题' : '查看更早的消息')) : null,
+    rows.length ? rows : h('div', { class: 'sys-msg' }, empty));
+  if (topic) markTopic();
   if (mode === 'restore' && view) box.scrollTop = view.bottom ? box.scrollHeight : view.top;
   else if (mode === 'unread' && divider) box.scrollTop = Math.max(0, divider.offsetTop - 12);
   else if (mode === 'bottom' || mode === 'unread' || (mode === 'keep-bottom' && nearBottom)) box.scrollTop = box.scrollHeight;
   else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
+}
+
+// ---- 话题群: 话题列表和右侧的话题面板 ----
+
+// 话题的根消息: 和消息列表一样的头像、名字、时间和气泡, 一律靠左(本人发的也显示名字); foot 是下面的"N 条回复"
+function postRow(m, cls, foot, onclick) {
+  if (m.kind === 'system' || m.kind === 'recalled') {
+    return h('div', { class: 'topic-sys' }, h('div', { class: 'sys-msg' + (m.kind === 'recalled' ? ' recalled' : '') }, m.content), foot);
+  }
+  return h('div', { class: 'msg ' + cls, onclick },
+    avatar(m.avatar, m.sender, 32),
+    h('div', { class: 'msg-main' },
+      h('div', { class: 'msg-meta' }, h('span', {}, m.me ? (S.me && S.me.name) || '我' : m.sender || '未知'), h('time', {}, msgTime(m.time))),
+      msgBody(m, true), foot),
+    h('div', { class: 'msg-ops' }, h('button', { title: '回复这个话题', onclick: e => { e.stopPropagation(); setReply(m); } }, icon('reply'), '回复')));
+}
+
+function topicRow(m) {
+  const t = m.thread || {}, n = t.reply_count || 0;
+  const foot = h('button', { class: 'topic-foot', onclick: e => { e.stopPropagation(); openThread(m); } }, icon('chat'),
+    n ? `${n} 条回复` : '查看话题', n && t.update_time ? h('span', { class: 'topic-last' }, '最后回复 ' + msgTime(t.update_time)) : null);
+  // 点话题的空白处也能打开; 点链接、图片、文件、按钮或者选中文字时不打开
+  const row = postRow(m, 'topic', m.kind === 'system' || m.kind === 'recalled' ? (n ? foot : null) : foot, e => {
+    if (e.target.closest('a, img, button') || String(window.getSelection() || '')) return;
+    openThread(m);
+  });
+  row.dataset.thread = t.id || '';
+  return row;
+}
+
+// 话题列表里标出正在右侧看的那个
+function markTopic() {
+  if (!S.body) return;
+  const id = S.thread ? S.thread.id : '';
+  S.body.querySelectorAll('[data-thread]').forEach(el => el.classList.toggle('active', !!id && el.dataset.thread === id));
+}
+
+function openThreadId(id) {
+  if (!isTopic() || !/^\d+$/.test(id)) return;
+  openThread(S.msgs.find(m => m.thread && m.thread.id === id) || { thread: { id, reply_count: 0, last_position: -1 } });
+}
+
+async function openThread(m) {
+  const info = m.thread;
+  if (!info || !info.id || (S.thread && S.thread.id === info.id)) return;
+  const seq = ++S.threadSeq, chatId = S.chatId;
+  S.thread = { id: info.id, chatId, seq, root: m.msg_id ? m : null, info, msgs: [], start: 0, end: -1, hasMore: false, loaded: false,
+    error: false, rows: new Map(), rootRow: null };
+  $('tab-im').classList.add('has-thread');
+  history.replaceState(null, '', `#/im/${chatId}/${info.id}`);
+  renderThread(); markTopic();
+  // 带上话题列表里的最后一条回复的位置, 后端据此先猜着拉回复, 和查话题信息同时进行
+  const q = info.last_position >= 0 ? `?last=${info.last_position}` : '';
+  const d = await act(() => api(`/api/im/chat/${chatId}/thread/${info.id}${q}`));
+  const t = S.thread;
+  if (!t || t.seq !== seq) return;
+  if (!d) { t.error = true; renderThreadBody(); return; }
+  Object.assign(t, { root: d.root, info: d.thread, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more, loaded: true });
+  renderThreadBody('top');
+}
+
+// byUser: 点了关闭(地址退回到会话); 切换、关闭会话时地址已经由导航改好了, 不动它
+function closeThread(byUser) {
+  if (!S.thread) return;
+  if (byUser === true && S.chatId) history.replaceState(null, '', `#/im/${S.chatId}`);
+  S.thread = null; S.threadSeq++;
+  $('tab-im').classList.remove('has-thread');
+  put($('thread')); $('thread').hidden = true;
+  markTopic();
+}
+
+function renderThread() {
+  const t = S.thread;
+  if (!t) return;
+  t.sub = h('span', { class: 'chat-sub' });
+  t.body = h('div', { class: 'thread-body' });
+  put($('thread'), h('div', { class: 'thread-head' }, h('div', { class: 'thread-title' }, '话题'), t.sub, h('div', { class: 'chat-grow' }),
+    h('button', { class: 'thread-close', title: '关闭', onclick: () => closeThread(true) }, icon('close'))), t.body);
+  $('thread').hidden = false;
+  renderThreadBody('top');
+}
+
+// 话题面板: 根消息、"N 条回复"、(更早的回复)、回复; 回复和消息列表一样按时间分隔、合并同一个人的连续消息, 没变的沿用原来的节点
+function renderThreadBody(mode) {
+  const t = S.thread;
+  if (!t || !t.body) return;
+  const box = t.body, n = t.info.reply_count || 0;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80, fromBottom = box.scrollHeight - box.scrollTop;
+  t.sub.textContent = n ? `${n} 条回复` : '';
+  // 从地址直接打开时, 根消息要等接口返回
+  const rootSig = t.root ? sigOf(t.root) : '';
+  if (t.root && (!t.rootRow || t.rootRow.sig !== rootSig)) t.rootRow = { sig: rootSig, node: postRow(t.root, 'thread-root', null) };
+  const rows = [], built = new Map(), day = new Date().toDateString();
+  let prev = null;
+  for (const m of t.msgs) {
+    if (m.kind === 'system' && !m.content) continue;
+    if (!prev || m.time - prev.time > 300) { rows.push(h('div', { class: 'time-divider' }, msgTime(m.time))); prev = null; }
+    const key = m.msg_id || 'p' + m.position, sig = sigOf(m), grouped = isGrouped(m, prev), old = t.rows.get(key);
+    const row = old && old.sig === sig && old.grouped === grouped && old.day === day ? old : { sig, grouped, day, node: msgRow(m, grouped, true) };
+    built.set(key, row);
+    rows.push(row.node);
+    prev = m;
+  }
+  t.rows = built;
+  const status = t.error ? '加载失败' : !t.loaded ? '加载中…' : !n && !rows.length ? '还没有回复' : null;
+  put(box, t.rootRow ? t.rootRow.node : null, h('div', { class: 'thread-divider' }, h('span', {}, n ? `${n} 条回复` : '回复')),
+    t.hasMore ? h('div', { class: 'chat-older' }, h('button', { onclick: olderReplies }, '查看更早的回复')) : null,
+    status ? h('div', { class: 'sys-msg' }, status) : null, rows);
+  if (mode === 'top') box.scrollTop = 0;
+  else if (mode === 'keep-bottom' && nearBottom) box.scrollTop = box.scrollHeight;
+  else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
+}
+
+async function olderReplies() {
+  const t = S.thread;
+  if (!t) return;
+  const d = await act(() => api(`/api/im/chat/${t.chatId}/thread/${t.id}?before=${t.start}&count=30`));
+  if (!d || S.thread !== t) return;
+  addTo(t, d.messages); Object.assign(t, { start: d.start, hasMore: d.has_more, info: d.thread });
+  renderThreadBody('keep-offset');
+}
+
+// 打开着的话题: 随话题列表的定时刷新取新回复, 回复数和根消息(比如被撤回)也一起更新
+async function pollThread() {
+  const t = S.thread;
+  if (!t || !t.loaded) return;
+  const d = await api(`/api/im/chat/${t.chatId}/thread/${t.id}?after=${t.end}`).catch(() => null);
+  if (!d || S.thread !== t) return;
+  Object.assign(t, { root: d.root, info: d.thread, end: Math.max(t.end, d.end) });
+  if (d.messages.length) addTo(t, d.messages);
+  renderThreadBody('keep-bottom');
 }
 
 // ---- 发送: 图片、文件、@、表情 ----
@@ -839,10 +990,10 @@ function confirmBox(text, okLabel) {
 }
 
 // 上传一个图片或文件并发出: 浏览器到这里的进度用 XHR 的上传进度显示, 之后是这里上传到飞书和发送
-function sendAttachment(p, chatId, root, show) {
+function sendAttachment(p, chatId, reply, show) {
   return new Promise((resolve, reject) => {
     const q = new URLSearchParams({ kind: p.kind, name: p.file.name || (p.kind === 'image' ? 'image.png' : 'file'), type: p.file.type || '' });
-    if (root) q.set('root_id', root);
+    if (reply) { q.set('root_id', reply.root_id); q.set('parent_id', reply.parent_id); }
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/im/chat/${chatId}/upload?${q}`);
     xhr.setRequestHeader('X-Larkx', '1');
@@ -884,7 +1035,7 @@ async function sendMsg() {
   if (!input || !S.chat || S.sending) return;
   const text = input.value.trim();
   if (!text && !S.pending.length) return;
-  const seq = S.seq, chatId = S.chatId, queue = S.pending, root = S.replyTo ? S.replyTo.root_id : null;
+  const seq = S.seq, chatId = S.chatId, queue = S.pending, reply = S.replyTo ? { root_id: S.replyTo.root_id, parent_id: S.replyTo.parent_id } : null;
   const current = () => seq === S.seq;
   const results = [];
   S.sending = true; input.disabled = true; S.refreshSend(); renderPending(); closeMention(); closeEmoji();
@@ -892,13 +1043,13 @@ async function sendMsg() {
     // 先按添加的顺序发图片和文件, 再发文字
     while (queue.length) {
       const p = queue[0];
-      results.push(await sendAttachment(p, chatId, root, s => { p.status = s; if (current()) renderPending(); }).finally(() => { p.status = ''; }));
+      results.push(await sendAttachment(p, chatId, reply, s => { p.status = s; if (current()) renderPending(); }).finally(() => { p.status = ''; }));
       if (p.url) URL.revokeObjectURL(p.url);
       queue.shift();
       if (current()) renderPending();
     }
     if (text) {
-      const r = await sendText(chatId, { text, root_id: root, mentions: current() ? S.mentions : [] });
+      const r = await sendText(chatId, { text, ...(reply || {}), mentions: current() ? S.mentions : [] });
       if (r) {
         results.push(r);
         if (current()) { input.value = ''; S.mentions = []; }
@@ -956,11 +1107,13 @@ async function start() {
   setInterval(feedTick, 2000);
 }
 
+// 地址: #/im/<会话> 打开会话, 话题群再加 /<话题 id> 同时打开右侧的话题面板
 function route() {
-  const [, tab, arg] = (location.hash || '#/im').split('/');
+  const [, tab, arg, sub] = (location.hash || '#/im').split('/');
   if (tab === 'twin') { showTab('twin'); return; }
   showTab('im');
-  if (arg && arg !== S.chatId) openChat(arg);
+  if (arg && arg !== S.chatId) openChat(arg, sub);
+  else if (arg && S.loaded && (sub || '') !== (S.thread ? S.thread.id : '')) { if (sub) openThreadId(sub); else closeThread(); }
   else if (!arg && S.chatId !== '') closeChat();
   else if (!arg) emptyChat('看消息不会标为已读，对方也看不到');
 }

@@ -12,12 +12,12 @@ def wrap_packet(cmd: int, payload_msg, request_id: str) -> P.Packet:
 
 
 def build_send_message_packet(text: str, chat_id: str, request_id: str, root_id: str=None, thread_chat: bool=False,
-                              cid: str=None) -> P.Packet:
+                              cid: str=None, parent_id: str=None, in_thread: bool=False) -> P.Packet:
     """普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执;
-    带 root_id 是话题回复, 被回复的那条会对对方显示已读。
+    带 root_id 是回复(默认是主会话里的引用回复, 见 message_request), 被回复的那条会对对方显示已读。
     cid: 这条消息的客户端 id, 推送和拉取到的消息里都带着它; 不传就随机生成。"""
     return build_message_packet({'kind': 'text', 'text': text}, chat_id, request_id, root_id=root_id,
-                                thread_chat=thread_chat, cid=cid)
+                                thread_chat=thread_chat, cid=cid, parent_id=parent_id, in_thread=in_thread)
 
 
 # 要发出的消息统一用一个 dict 描述(LarkClient.send_message 收的就是它), 和发到哪个会话、是不是回复无关,
@@ -76,8 +76,14 @@ def plain_text(msg: dict) -> str:
     return ''.join('@' + s['name'] if s['type'] == 'at' else s['text'] for s in text_segments(msg))
 
 
-def message_request(msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
-    """按消息描述生成 messages.PutMessageRequest(完整版 proto, 带 atUserIdList)。"""
+def message_request(msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None,
+                    parent_id: str=None, in_thread: bool=False):
+    """按消息描述生成 messages.PutMessageRequest(完整版 proto, 带 atUserIdList)。
+
+    带 root_id 是回复, 和飞书客户端一样: parentId 是直接回的那条(上方显示的引用, 默认就是 root_id), rootId 是这串回复
+    最早的那条(回的那条本身是回复时是它的 rootId)。默认是主会话里的引用回复; in_thread 为真才回进普通群里已有的话题。
+    话题群里的回复本来就在话题里(rootId 是话题的根消息), 不带 isReplyInThread。
+    """
     from .gateway import _lark_all
     L = _lark_all()
     kind = msg.get('kind')
@@ -90,9 +96,10 @@ def message_request(msg: dict, chat_id: str, root_id: str=None, thread_chat: boo
     req.version = 1
     if root_id:
         req.rootId = str(root_id)
-        req.parentId = str(root_id)
-        # 普通群缺 isReplyInThread 会落进主会话;话题群反而拒收它(replyInThread not support chat)
-        if not thread_chat:
+        req.parentId = str(parent_id or root_id)
+        # 带 isReplyInThread 是回进话题(根消息没有话题时会新开一个); 不带就留在主会话, 是引用回复。
+        # 话题群反而拒收它(replyInThread not support chat)
+        if in_thread and not thread_chat:
             req.isReplyInThread = True
     if kind == 'image':
         # 实测只填 imageKey 会被拒("found invalid image key"), 上传图片拿到的 key 要同时填进 cryptoToken
@@ -133,9 +140,10 @@ def message_request(msg: dict, chat_id: str, root_id: str=None, thread_chat: boo
 
 
 def build_message_packet(msg: dict, chat_id: str, request_id: str, root_id: str=None, thread_chat: bool=False,
-                         cid: str=None) -> P.Packet:
-    """发消息(PutMessageRequest)的请求包, msg 见上面的消息描述。"""
-    return wrap_packet(5, message_request(msg, chat_id, root_id=root_id, thread_chat=thread_chat, cid=cid), request_id)
+                         cid: str=None, parent_id: str=None, in_thread: bool=False) -> P.Packet:
+    """发消息(PutMessageRequest)的请求包, msg 见上面的消息描述, 回复的参数见 message_request。"""
+    return wrap_packet(5, message_request(msg, chat_id, root_id=root_id, thread_chat=thread_chat, cid=cid,
+                                          parent_id=parent_id, in_thread=in_thread), request_id)
 
 
 def build_create_chat_packet(user_id: str, request_id: str) -> P.Packet:

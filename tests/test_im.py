@@ -38,6 +38,15 @@ class FakeIMClient:
         self.feed_calls = 0
         self.feed_delay = 0
         self.names_asked = []  # 单个查名字(get_user_name)的调用
+        self.reply_args = []   # 每次发送的 (root_id, parent_id, in_thread)
+        # 话题群: 会话 id -> 会话信息; 话题位置 -> 话题(格式同 LarkClient._thread_dict); 看不见的话题位置;
+        # 话题 id -> {话题内位置: 回复}; 服务端一次最多往前查多少个位置
+        self.topics = {}
+        self.threads = {}
+        self.hidden = set()
+        self.replies = {}
+        self.scan_cap = 1000
+        self.thread_pulls = []
         self.feed = {'cards': [{'id': 1, 'type': 1, 'rankTime': 50}, {'id': 2, 'type': 1, 'rankTime': 40},
                                {'id': 9, 'type': 13, 'rankTime': 30}, {'id': 3, 'type': 1, 'isHide': True}],
                      'chats': {'1': {'name': '项目群', 'type': 2, 'lastMessagePositionBadgeCount': 7, 'readPositionBadgeCount': 4,
@@ -71,6 +80,8 @@ class FakeIMClient:
     def get_chat_info(self, chat_id):
         assert not self.offline, '不该访问服务端'
         self._meet()
+        if str(chat_id) in self.topics:
+            return dict(self.topics[str(chat_id)])
         return {'name': '项目群', 'type': 2, 'lastMessagePosition': self.last, 'firstChatMessagePosition': 60,
                 'lastMessagePositionBadgeCount': 3, 'readPositionBadgeCount': 3, 'memberCount': 5, 'readPosition': self.chat_read}
 
@@ -86,20 +97,48 @@ class FakeIMClient:
             'content_data': {'image': {'origin': {'key': 'img_k1', 'width': 4, 'height': 3}}} if p == 100 else None}
             for p in positions]
 
+    def pull_threads(self, chat_id, positions, command_version=None):
+        """和服务端一样: 从最大的位置往前找, 跳过看不见的话题, 凑够 len(positions) 个看得见的(最多查 scan_cap 个位置)。"""
+        assert not self.offline, '不该访问服务端'
+        self._meet()
+        positions = sorted(positions)
+        self.thread_pulls.append((positions[0], positions[-1], command_version))
+        found, pos = [], positions[-1]
+        while pos >= 0 and len(found) < len(positions) and positions[-1] - pos < self.scan_cap:
+            if pos in self.threads and pos not in self.hidden:
+                found.append(self.threads[pos])
+            pos -= 1
+        return {'threads': sorted(found, key=lambda t: t['position']), 'start': max(pos + 1, 0)}
+
+    def pull_threads_by_ids(self, ids, command_version=None):
+        assert not self.offline, '不该访问服务端'
+        self._meet()
+        self.thread_pulls.append(('ids', list(ids), command_version))
+        return {t['thread_id']: t for t in self.threads.values() if t['thread_id'] in ids}
+
+    def pull_thread_messages(self, chat_id, thread_id, positions, command_version=None):
+        assert not self.offline, '不该访问服务端'
+        self._meet()
+        positions = list(positions)
+        self.thread_pulls.append(('replies', thread_id, positions[0], positions[-1], command_version))
+        got = self.replies.get(thread_id) or {}
+        return [got[p] for p in positions if p in got]
+
     def pull_messages(self, ids, command_version=None):
         assert not self.offline, '不该访问服务端'
         self.pulled.append(('ids', sorted(ids), command_version))
         return [self.by_id[i] for i in ids if i in self.by_id]
 
-    def send_message(self, msg, chat_id, root_id=None, keep_unread=False, fallback=True):
+    def send_message(self, msg, chat_id, root_id=None, keep_unread=False, fallback=True, parent_id=None, in_thread=None):
         from larkx.protocol.proto import builders
         assert fallback is False, '网页版转发不成不能退回普通发送'
+        self.reply_args.append((root_id, parent_id, in_thread))
         if self.relay_fails and self.relays(chat_id, *self.read_state(chat_id), root_id):
             return None
         self.sent.append((chat_id, builders.plain_text(msg), root_id, keep_unread))
         self.messages.append(msg)
         # 和服务端一样: 话题回复时被回复的那条变成已读; 经本人私聊转发不动已读位置
-        self.done.update(self.leak + ([root_id] if root_id else []))
+        self.done.update(self.leak + [i for i in (root_id, parent_id) if i])
         if self.advance:
             self.read_pos = 100
         return '777'
@@ -169,6 +208,13 @@ def test_send_is_audited_as_owner(ctx):
     assert c.post('/api/im/chat/5/send', json={'text': 'hi', 'root_id': 'x'}).status_code == 400
     r = c.post('/api/im/chat/5/send', json={'text': '收到\n', 'root_id': '42'})
     assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0} and fake.sent == [('5', '收到', '42', True)]
+    # 网页上点"回复"是主会话里的引用回复: 引用点的那条(parent_id), 不回进话题; 没给 parent_id 时引用 root_id 那条
+    assert fake.reply_args == [('42', '42', False)]
+    c.post('/api/im/chat/5/send', json={'text': '好', 'root_id': '40', 'parent_id': '42'})
+    assert fake.reply_args[-1] == ('40', '42', False)
+    assert c.post('/api/im/chat/5/send', json={'text': '好', 'root_id': '40', 'parent_id': 'x'}).status_code == 400
+    c.post('/api/im/chat/5/send', json={'text': '好', 'parent_id': '42'})  # 不是回复时 parent_id 不起作用
+    assert fake.reply_args[-1] == (None, None, None)
     a = Storage().list_actions()[-1]
     assert (a.actor, a.action, a.chat_id, a.msg_id, a.turn_kind) == ('human', 'send', '5', '777', 'web')
     # 改动类请求一样要带 X-Larkx
@@ -190,6 +236,9 @@ def test_send_reports_others_messages_turned_read(ctx):
     fake.done = set()
     fake.leak = ['96', '100']
     assert send(root_id='98')['newly_read'] == 2
+    # 引用回复时被引用的那条(parent)变成已读也是"回复"本身的意思
+    fake.leak, fake.done = [], set()
+    assert send(root_id='90', parent_id='98')['newly_read'] == 0
 
 
 def test_send_reports_fallback_and_unknown(ctx):
@@ -452,3 +501,233 @@ def test_p2p_peer_found_in_local_storage_first(ctx):
     # 找到过就记住了
     c.get('/api/im/feed')
     assert len(fake.pulled) == 1
+
+
+# ---- 话题群 ----
+
+def _topic(pos, chat='7', replies=0, sender='300'):
+    """一个话题(格式同 LarkClient._thread_dict), 话题 id 和根消息 id 都是 9000 + 位置。"""
+    tid = str(9000 + pos)
+    return {'thread_id': tid, 'position': pos, 'reply_count': replies, 'last_position': replies - 1, 'update_time': 1000 + pos,
+            'owner_id': sender, 'root': {'msg_id': tid, 'position': 5000 + pos, 'from_id': sender, 'chat_id': chat,
+                                         'create_time': pos, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': f'话题{pos}',
+                                         'content_data': None, 'root_id': '', 'parent_id': ''}}
+
+
+def _reply(tid, pos, parent=None, sender='200'):
+    return {'msg_id': f'{tid}{pos:02d}', 'position': pos, 'chat_position': 6000 + pos, 'from_id': sender, 'chat_id': '7',
+            'create_time': 2000 + pos, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': f'回复{pos}', 'content_data': None,
+            'root_id': tid, 'parent_id': parent or tid}
+
+
+def _topic_group(fake, last=50, read=45):
+    fake.topics['7'] = {'name': '话题群', 'type': 2, 'chatMode': 3, 'lastThreadPosition': last, 'readThreadPosition': read,
+                        'memberCount': 9, 'firstChatMessagePosition': -1}
+    fake.threads.update({p: _topic(p, replies=p % 3) for p in range(0, last + 1)})
+
+
+def test_topic_chat_lists_topics_instead_of_messages(ctx):
+    """话题群的会话信息里没有 lastMessagePosition: 按话题位置取话题, 不再按消息位置拉(以前因此显示"还没有消息")。"""
+    from larkx.protocol.client import MODERN_COMMAND_VERSION
+    c, fake = ctx
+    _topic_group(fake)
+    fake.hidden = {47, 48, 49}  # 入群提示之类看不见的话题, 由服务端跳过
+    d = c.get('/api/im/chat/7?count=5').json()
+    assert [m['position'] for m in d['messages']] == [43, 44, 45, 46, 50]
+    assert (d['start'], d['end'], d['has_more']) == (43, 50, True)
+    assert d['chat']['kind'] == 'topic' and d['chat']['read_position'] == 45 and d['chat']['last_position'] == 50
+    top = d['messages'][-1]
+    assert (top['msg_id'], top['sender'], top['content'], top['segments']) == ('9050', '李四', '话题50', [{'type': 'text', 'text': '话题50'}])
+    assert top['thread'] == {'id': '9050', 'reply_count': 2, 'last_position': 1, 'update_time': 1050}
+    assert fake.thread_pulls == [(46, 50, MODERN_COMMAND_VERSION)]
+    assert not [p for p in fake.pulled if p[0] == 'history']  # 没有按消息位置拉
+    # 再打开: 按记下的会话信息猜位置, 和查会话信息同时进行; 这期间来了新话题, 只补查多出来的那段
+    fake.threads.update({51: _topic(51), 52: _topic(52)})
+    fake.topics['7']['lastThreadPosition'] = 52
+    fake.thread_pulls, fake.barrier = [], threading.Barrier(2)
+    d = c.get('/api/im/chat/7?count=5').json()
+    assert fake.thread_pulls == [(46, 50, MODERN_COMMAND_VERSION), (51, 52, MODERN_COMMAND_VERSION)]
+    assert [m['position'] for m in d['messages']] == [43, 44, 45, 46, 50, 51, 52] and (d['start'], d['end']) == (43, 52)
+    # 往前翻: 位置不依赖会话信息, 也是同时查
+    fake.thread_pulls, fake.barrier = [], threading.Barrier(2)
+    older = c.get('/api/im/chat/7?before=43&count=5').json()
+    assert [m['position'] for m in older['messages']] == [38, 39, 40, 41, 42] and (older['start'], older['has_more']) == (38, True)
+    assert fake.thread_pulls == [(38, 42, MODERN_COMMAND_VERSION)]
+    # 定时刷新: 不管给的位置, 都重取最近 TOPIC_REFRESH 个(回复数会变), 页面替换这一段
+    fake.threads[52] = _topic(52, replies=4)
+    fake.thread_pulls = []
+    d = c.get('/api/im/chat/7?after=52').json()
+    assert len(d['messages']) == im.TOPIC_REFRESH and d['messages'][-1]['thread']['reply_count'] == 4
+    assert fake.thread_pulls == [(43, 52, MODERN_COMMAND_VERSION)]
+    assert (d['start'], d['end']) == (40, 52)
+    # 翻到头了
+    assert c.get('/api/im/chat/7?before=3&count=5').json()['has_more'] is False
+
+
+def test_sparse_topic_chat_keeps_looking_further_back(ctx):
+    """几乎全是入群提示的大群: 服务端一次找不够看得见的话题, 接着往前找, 最多再查 TOPIC_ROUNDS 次。"""
+    c, fake = ctx
+    _topic_group(fake, last=100, read=0)
+    fake.hidden = set(range(0, 101)) - {3, 10, 100}
+    fake.scan_cap = 30
+    d = c.get('/api/im/chat/7?count=5').json()
+    assert [m['position'] for m in d['messages']] == [3, 10, 100]
+    assert (d['start'], d['has_more']) == (0, False)
+    assert len(fake.thread_pulls) == 1 + im.TOPIC_ROUNDS
+    # 还没有话题的话题群
+    fake.topics['7'].pop('lastThreadPosition')
+    fake.thread_pulls = []
+    im._chat_infos.clear()  # 不按记下的会话信息猜
+    d = c.get('/api/im/chat/7').json()
+    assert (d['messages'], d['start'], d['end'], d['has_more']) == ([], 0, -1, False) and fake.thread_pulls == []
+
+
+def test_topic_chat_never_mixes_in_local_messages(ctx):
+    """本地库按会话位置存消息, 和话题位置对不上: 话题群的 local 轮询不返回本地库里的消息。"""
+    c, fake = ctx
+    _topic_group(fake)
+    c.get('/api/im/chat/7?count=5')
+    Storage().save_message({'msg_id': 'x', 'chat_id': '7', 'from_id': '300', 'msg_type': 4, 'position': 60, 'content': 'hi'})
+    fake.offline = True
+    d = c.get('/api/im/chat/7?after=50&local=1').json()
+    assert d['messages'] == [] and d['local'] is True
+
+
+def test_thread_shows_root_and_replies_in_order(ctx):
+    from larkx.protocol.client import MODERN_COMMAND_VERSION
+    c, fake = ctx
+    _topic_group(fake)
+    fake.threads[50] = _topic(50, replies=4)
+    fake.replies['9050'] = {0: _reply('9050', 0), 1: _reply('9050', 1, sender='300'), 2: _reply('9050', 2, parent='905001'),
+                            3: _reply('9050', 3, sender='100')}
+    fake.by_id['905001'] = fake.replies['9050'][1]  # 被引用的那条不在这一批里, 按 id 查
+    # 带上话题列表给的最后位置: 先猜着拉回复, 和查话题信息同时进行
+    fake.barrier = threading.Barrier(2)
+    d = c.get('/api/im/chat/7/thread/9050?count=2&last=3').json()
+    assert (d['root']['msg_id'], d['root']['position'], d['root']['content']) == ('9050', -1, '话题50')
+    assert [m['position'] for m in d['messages']] == [2, 3] and (d['start'], d['end'], d['has_more']) == (2, 3, True)
+    assert d['thread'] == {'id': '9050', 'reply_count': 4, 'last_position': 3, 'update_time': 1050}
+    # 回的是话题里另一条的照常显示引用; 直接回根消息的不显示(都在这个话题里)
+    assert d['messages'][0]['quote'] == {'sender': '李四', 'text': '回复1'}
+    assert d['messages'][1]['quote'] is None and d['messages'][1]['me'] is True
+    assert ('replies', '9050', 2, 23, MODERN_COMMAND_VERSION) in fake.thread_pulls
+    older = c.get('/api/im/chat/7/thread/9050?before=2&count=2').json()
+    assert [m['position'] for m in older['messages']] == [0, 1] and older['has_more'] is False
+    assert older['messages'][0]['quote'] is None and older['messages'][0]['sender'] == '张三(备注)'
+    # 没给最后位置: 先查话题信息再拉
+    fake.thread_pulls = []
+    assert [m['position'] for m in c.get('/api/im/chat/7/thread/9050').json()['messages']] == [0, 1, 2, 3]
+    assert fake.thread_pulls == [('ids', ['9050'], MODERN_COMMAND_VERSION), ('replies', '9050', 0, 3, MODERN_COMMAND_VERSION)]
+    # 取新回复
+    assert c.get('/api/im/chat/7/thread/9050?after=3').json()['messages'] == []
+    fake.replies['9050'][4] = _reply('9050', 4)
+    fake.threads[50] = _topic(50, replies=5)
+    d = c.get('/api/im/chat/7/thread/9050?after=3').json()
+    assert [m['position'] for m in d['messages']] == [4] and d['thread']['reply_count'] == 5
+    # 没有回复的话题
+    d = c.get('/api/im/chat/7/thread/9049?last=-1').json()
+    assert (d['messages'], d['root']['msg_id'], d['has_more']) == ([], '9049', False)
+    # 别的会话的话题、不存在的话题、不合法的位置
+    assert c.get('/api/im/chat/5/thread/9050').status_code == 400
+    assert c.get('/api/im/chat/7/thread/1').status_code == 400
+    assert c.get('/api/im/chat/7/thread/9050?last=-5').status_code == 400
+    assert c.get('/api/im/chat/7/thread/9050?before=x').status_code == 400
+    assert not [p for p in fake.pulled if p[0] == 'history']
+
+
+def test_feed_previews_topic_chat_with_last_visible_topic(ctx):
+    from larkx.protocol.proto import proto_pb2 as P
+    c, fake = ctx
+    fake.feed['cards'].append({'id': 7, 'type': 1, 'rankTime': 45})
+    fake.feed['chats']['7'] = {'name': '话题群', 'type': 2, 'chatMode': 3, 'lastThreadId': 'join', 'lastVisibleThreadId': 'r7'}
+    fake.feed['messages']['r7'] = {'fromId': '300', 'type': 4, 'content': P.TextContent(text='最新话题').SerializeToString()}
+    items = {i['chat_id']: i for i in c.get('/api/im/feed').json()['items']}
+    assert (items['7']['kind'], items['7']['preview']) == ('topic', '李四: 最新话题')
+    assert items['1']['preview'] == '' and items['2']['kind'] == 'p2p'  # 普通群、私聊照旧
+
+
+def test_read_client_allows_thread_queries_only(monkeypatch):
+    from larkx.protocol import get_region
+    from larkx.protocol.proto import proto_pb2 as P
+    auth = type('A', (), {'user_id': '100', 'region': get_region('feishu'), 'gateway_app_id': '1', 'cookies': {}})()
+    rc = im.ReadClient(auth)
+    posts = []
+
+    class Session:
+        def post(self, url, headers, cookies, data, timeout):
+            posts.append(headers['x-command'])
+            return type('R', (), {'content': P.Packet().SerializeToString(), 'raise_for_status': lambda self: None})()
+    rc.http = Session()
+    assert rc.pull_threads('7', [1, 2]) == {'threads': [], 'start': 1}
+    assert rc.pull_threads_by_ids(['9']) == {} and rc.pull_thread_messages('7', '9', [0]) == []
+    assert posts == ['8108', '8111', '8109']
+    # 标话题已读、标消息已读的命令发不出去
+    for cmd in ('thread.PutReadThreadsRequest', 'topic_group.PutTopicsReadStateRequest', 'messages.PutReadMessagesRequest'):
+        with pytest.raises(RuntimeError, match='只读客户端'):
+            rc.api(cmd, {})
+    assert len(posts) == 3
+
+
+def test_client_pulls_visible_threads_and_thread_messages(monkeypatch):
+    """协议层: 请求带上只取看得见的话题、往前找; 响应里看不见的话题不要, 位置换成话题位置。"""
+    from larkx.protocol import get_region
+    from larkx.protocol.client import LarkClient
+    from larkx.protocol.proto import gateway, proto_pb2 as P
+    c = object.__new__(LarkClient)
+    c.auth = type('A', (), {'user_id': '100', 'region': get_region('feishu'), 'gateway_app_id': '1', 'cookies': {}})()
+    c._thread_chats = {}
+    sent, replies = [], []
+
+    def post(packet, command_version=None):
+        sent.append((packet.cmd, packet.payload, command_version))
+        return replies.pop(0).SerializeToString()
+    monkeypatch.setattr(c, '_gateway_post', post)
+
+    def packet(msg):
+        pkt = P.Packet()
+        pkt.payload = msg.SerializeToString()
+        return pkt
+
+    def root(m, mid, pos):
+        m.id, m.type, m.fromId, m.chatId, m.createTime, m.position = mid, 4, '300', '7', 50, pos
+        m.content = P.TextContent(text=f'话题{mid}').SerializeToString()
+
+    R = gateway.resolve_type('thread.PullThreadsByPositionsResponse')
+    r = R()
+    for pos, tid, visible in ((10, '91', True), (9, '90', False)):
+        t = r.threads[pos]
+        t.id, t.position, t.isVisible, t.rootMessageId, t.ownerId, t.updateTime = tid, pos, visible, tid, '300', 99
+        root(r.rootMessages[tid], tid, 500 + pos)
+    r.threads[10].replyCount, r.threads[10].lastMessagePosition = 2, 1
+    r.invisibleThreads[7].position = 7
+    replies.append(packet(r))
+    out = c.pull_threads('7', [10, 9], command_version='7.72.0')
+    assert out['start'] == 7 and [t['thread_id'] for t in out['threads']] == ['91']
+    t = out['threads'][0]
+    assert (t['position'], t['reply_count'], t['last_position'], t['update_time'], t['owner_id']) == (10, 2, 1, 99, '300')
+    assert (t['root']['msg_id'], t['root']['content'], t['root']['scope'], t['root']['position']) == ('91', '话题91', 'topic', 510)
+    cmd, payload, version = sent[-1]
+    req = gateway.resolve_type('thread.PullThreadsByPositionsRequest').FromString(payload)
+    assert (cmd, version, req.channelId, list(req.positions), req.onlyVisibleThreads, req.direction) == (8108, '7.72.0', '7', [9, 10], True, 1)
+    # 话题里的消息: position 换成话题内的位置(根消息 -1), 会话里的位置另放
+    M = gateway.resolve_type('thread.PullThreadMessagesByPositionsResponse')
+    m = M()
+    root(m.messages[-1], '91', 510)
+    root(m.messages[0], '92', 511)
+    m.messages[0].rootId = m.messages[0].parentId = '91'
+    replies.append(packet(m))
+    msgs = c.pull_thread_messages('7', '91', [-1, 0])
+    assert [(x['msg_id'], x['position'], x['chat_position'], x['root_id']) for x in msgs] == [('91', -1, 510, ''), ('92', 0, 511, '91')]
+    req = gateway.resolve_type('thread.PullThreadMessagesByPositionsRequest').FromString(sent[-1][1])
+    assert (req.threadId, req.channelId, list(req.positions)) == ('91', '7', [-1, 0])
+    # 按 id 取话题; 没有 lastMessagePosition 时按回复数推算
+    B = gateway.resolve_type('thread.PullThreadsByIDsResponse')
+    b = B()
+    t = b.threads['91']
+    t.id, t.channelId, t.position, t.isVisible, t.rootMessageId, t.replyCount = '91', '7', 10, True, '91', 3
+    root(b.rootMessages['91'], '91', 510)
+    replies.append(packet(b))
+    got = c.pull_threads_by_ids(['91'])
+    assert list(got) == ['91'] and got['91']['last_position'] == 2 and got['91']['root']['chat_id'] == '7'
+    # 没有位置就不发请求
+    assert c.pull_threads('7', []) == {'threads': [], 'start': 0} and c.pull_thread_messages('7', '91', []) == [] and len(sent) == 3

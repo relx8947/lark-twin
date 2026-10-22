@@ -10,8 +10,9 @@ from larkx.protocol.proto import builders
 from larkx.protocol.proto import lark_all_pb2 as LA
 
 
-def _client(monkeypatch, read=5, last=8, thread_chat=False, forward=None, recall_error=False, ids=None):
-    """会话 read+1..last 是本人的未读。forward 是转发接口的返回(异常就抛出), ids 是依次发出的消息拿到的 id。"""
+def _client(monkeypatch, read=5, last=8, thread_chat=False, forward=None, recall_error=False, ids=None, targets=None):
+    """会话 read+1..last 是本人的未读。forward 是转发接口的返回(异常就抛出), ids 是依次发出的消息拿到的 id,
+    targets 是按 id 能查到的消息(查被回复的那条用; 是异常就抛出)。"""
     c = object.__new__(LarkClient)
     c.auth = type('A', (), {'user_id': '100'})()
     c._thread_chats, c._self_chat = {}, ''
@@ -27,6 +28,10 @@ def _client(monkeypatch, read=5, last=8, thread_chat=False, forward=None, recall
         calls.append((cmd, data))
         if cmd == 'messages.DeleteMessageRequest' and recall_error:
             raise RuntimeError('recall boom')
+        if cmd == 'messages.PullMessagesByIdsRequest':
+            if isinstance(targets, Exception):
+                raise targets
+            return {'messages': {i: (targets or {})[i] for i in data['messageIds'] if i in (targets or {})}}
         if cmd == 'messages.PutTransmitMessageRequest':
             if isinstance(forward, Exception):
                 raise forward
@@ -98,16 +103,34 @@ def test_no_unread_sends_normally(monkeypatch):
     assert calls == [] and chats == []
 
 
-def test_root_id_is_a_plain_topic_reply(monkeypatch):
-    c, sent, calls, _ = _client(monkeypatch, ids=['new'])
-    assert c.send_msg('hi', 'c1', root_id='m7', keep_unread=True) == 'new'
-    r = _req(sent[-1])
-    assert (len(sent), r.chatId, r.rootId, r.parentId, r.isReplyInThread, r.syncToChat) == (1, 'c1', 'm7', 'm7', True, False)
-    assert calls == []
-    # 话题群拒收 isReplyInThread
-    c, sent, _, _ = _client(monkeypatch, thread_chat=True, ids=['new'])
-    c.send_msg('hi', 'c1', root_id='t1', keep_unread=True)
-    assert (_req(sent[-1]).rootId, _req(sent[-1]).isReplyInThread) == ('t1', False)
+def test_reply_is_a_quote_reply_unless_already_in_a_thread(monkeypatch):
+    """普通群和私聊里回复是主会话里的引用回复(以前一律带 isReplyInThread, 回复都变成了新开的话题);
+    回的那条已经在话题里时回进那个话题; 话题群里回进话题。数字人和 larkx send --root 都走这里。"""
+    def reply(root_id, targets=None, thread_chat=False, **kw):
+        c, sent, calls, _ = _client(monkeypatch, ids=['new'], targets=targets, thread_chat=thread_chat)
+        if kw:
+            msg_id = c.send_message({'kind': 'text', 'text': 'hi'}, 'c1', root_id=root_id, keep_unread=True, **kw)
+        else:
+            msg_id = c.send_msg('hi', 'c1', root_id=root_id, keep_unread=True)
+        assert msg_id == 'new'
+        r = _req(sent[-1])
+        assert (len(sent), r.chatId, r.syncToChat) == (1, 'c1', False)
+        return (r.rootId, r.parentId, r.isReplyInThread), [cmd for cmd, _ in calls]
+    # 普通消息: 引用回复, 不经本人私聊转发
+    assert reply('m7', {'m7': {'id': 'm7'}}) == (('m7', 'm7', False), ['messages.PullMessagesByIdsRequest'])
+    # 回的那条本身是引用回复: rootId 用它的 rootId, 引用的还是它
+    assert reply('m7', {'m7': {'id': 'm7', 'rootId': 'a1', 'parentId': 'a1'}})[0] == ('a1', 'm7', False)
+    # 那条已经有话题(数字人在普通群的话题里答复时, --root 是话题的根消息): 回进这个话题
+    assert reply('m7', {'m7': {'id': 'm7', 'threadId': 'm7', 'threadMessageType': 1}})[0] == ('m7', 'm7', True)
+    # 那条是话题里的回复: 回进它所在的话题, 引用它
+    assert reply('m8', {'m8': {'id': 'm8', 'rootId': 'm7', 'threadId': 'm7', 'threadMessageType': 2}})[0] == ('m7', 'm8', True)
+    # 查不到或查询失败: 按引用回复发
+    assert reply('m7', {})[0] == ('m7', 'm7', False)
+    assert reply('m7', RuntimeError('boom'))[0] == ('m7', 'm7', False)
+    # 话题群拒收 isReplyInThread, 回复本来就在话题里; 不用查
+    assert reply('t1', thread_chat=True) == (('t1', 't1', False), [])
+    # 网页版给了引用的那条和 in_thread: 照给的发, 不用查
+    assert reply('m7', parent_id='m9', in_thread=False) == (('m7', 'm9', False), [])
 
 
 def test_self_chat_target_and_keep_unread_off_send_normally(monkeypatch):
@@ -147,5 +170,10 @@ def test_my_read_status_batches(monkeypatch):
 
 def test_builder_uses_given_cid():
     r = _req(builders.build_send_message_packet('x', 'c1', 'req', root_id='9', cid='abc'))
-    assert (r.cid, r.rootId, r.parentId, r.isReplyInThread, r.syncToChat, r.content.richText.innerText) == ('abc', '9', '9', True, False, 'x')
+    assert (r.cid, r.rootId, r.parentId, r.isReplyInThread, r.syncToChat, r.content.richText.innerText) == ('abc', '9', '9', False, False, 'x')
+    # 引用回复引用的是 parent_id; 回进已有话题才带 isReplyInThread, 话题群里不带
+    r = _req(builders.build_send_message_packet('x', 'c1', 'req', root_id='9', parent_id='10'))
+    assert (r.rootId, r.parentId, r.isReplyInThread) == ('9', '10', False)
+    assert _req(builders.build_send_message_packet('x', 'c1', 'req', root_id='9', in_thread=True)).isReplyInThread is True
+    assert _req(builders.build_send_message_packet('x', 'c1', 'req', root_id='9', in_thread=True, thread_chat=True)).isReplyInThread is False
     assert _req(builders.build_send_message_packet('x', 'c1', 'req')).cid

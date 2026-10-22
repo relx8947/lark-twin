@@ -688,7 +688,7 @@ def main():
     p = sub.add_parser('send', help='发送文本消息')
     p.add_argument('chat_id')
     p.add_argument('text', nargs='*', help='消息内容; 省略或写 - 时从 stdin 读取')
-    p.add_argument('--root', help='话题/线程根消息 id,回复进话题')
+    p.add_argument('--root', help='回复哪条消息: 普通群和私聊里是主会话里的引用回复(那条已在话题里时回进话题), 话题群里回进话题')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser('config', help='查看生效中的配置(配置项写在 .env 里)')

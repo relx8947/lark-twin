@@ -59,7 +59,7 @@ def test_image_and_file_messages():
     f = {'kind': 'file', 'key': 'file_v3_k', 'name': '报告.pdf', 'size': 1234, 'mime': 'application/pdf'}
     r = _req(builders.build_message_packet(f, 'c1', 'req', root_id='9'))
     assert (r.type, r.content.fileKey, r.content.fileName, r.content.fileSize, r.content.fileMime) == (3, 'file_v3_k', '报告.pdf', 1234, 'application/pdf')
-    assert (r.rootId, r.isReplyInThread) == ('9', True)
+    assert (r.rootId, r.parentId, r.isReplyInThread) == ('9', '9', False)  # 回复默认是主会话里的引用回复
     with pytest.raises(ValueError):
         builders.message_request({'kind': 'sticker'}, 'c1')
 
@@ -294,10 +294,10 @@ def test_upload_image_and_file_are_sent_anonymously(sctx, monkeypatch):
     assert r.json() == {'ok': True, 'msg_id': '777', 'kept_unread': True, 'newly_read': 0}
     assert got[-1] == ('image', png, 'shot.png', 'image/png') and fake.messages[-1] == {'kind': 'image', 'key': 'img_v3_k', 'name': 'shot.png'}
     assert fake.sent[-1] == ('5', '[图片]', None, True)
-    r = up('kind=file&name=' + '..%2F笔记.txt' + '&type=text/plain&root_id=42', b'hello')
+    r = up('kind=file&name=' + '..%2F笔记.txt' + '&type=text/plain&root_id=40&parent_id=42', b'hello')
     assert r.json()['ok'] is True and got[-1] == ('file', b'hello', 5, '笔记.txt', 'text/plain')
     assert fake.messages[-1] == {'kind': 'file', 'key': 'file_v3_k', 'name': '笔记.txt', 'size': 5, 'mime': 'text/plain'}
-    assert fake.sent[-1] == ('5', '[文件] 笔记.txt', '42', True)
+    assert fake.sent[-1] == ('5', '[文件] 笔记.txt', '40', True) and fake.reply_args[-1] == ('40', '42', False)
     a = Storage().list_actions()[-1]
     assert (a.actor, a.action, a.content, a.turn_kind) == ('human', 'send', '[文件] 笔记.txt', 'web')
 

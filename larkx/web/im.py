@@ -4,7 +4,7 @@
 这里从不调用 PutReadMessagesRequest / EnterChatRequest, 所以对方看不到已读, 你自己的未读提醒也还在。
 发消息也不改已读: 普通发送不会给别人的消息产生已读回执, 但会清掉本人在这个会话的未读, 所以有未读时经本人私聊
 转发过去(见 LarkClient.send_message 的 keep_unread), 对方看到的是一条普通消息, 本人的已读位置不动; 转发不成就报发送
-失败, 不退回普通发送。回复某条(话题回复)会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息,
+失败, 不退回普通发送。回复某条(主会话里的引用回复, 话题群里回进话题)会让被回复的那条对对方显示已读。发出后再核对已读位置和别人的未读消息,
 有变化的如实告诉页面。
 
 能发文字、带 @ 的文字、图片和文件, 各种类型都走同一套匿名发送和发后核对(_deliver)。图片和文件由浏览器把原始内容
@@ -18,6 +18,11 @@ POST 过来, 这里存进临时文件再上传到飞书(media.upload_image / upl
 看消息的路径(会话列表、打开会话、翻消息)要快: 用只读客户端 ReadClient(复用连接, 只放行查询类命令), 互不依赖的查询
 并发执行; 会话列表顺带记下每个会话的信息, 打开会话时据此先猜好该拉哪一段消息, 和查最新会话信息同时进行, 范围以查到的
 为准, 猜漏的再补拉。发消息、上传仍用原来的 client(), 流程不变。
+
+话题群(会话列表里 kind 为 topic)的消息按话题组织, 会话信息里没有 lastMessagePosition, 按普通会话拉会一条也拉不到。
+打开话题群时改为显示话题列表: 话题按话题位置(lastThreadPosition)用 thread.PullThreadsByPositionsRequest 取(只取看得见的,
+入群提示这类占位置的系统消息由服务端跳过), 每个话题带根消息和回复数; 点开一个话题时用 thread.PullThreadsByIDsRequest 取
+话题信息、thread.PullThreadMessagesByPositionsRequest 取回复(见 _topic_list、thread)。这几个也都是只读查询。
 """
 import asyncio
 import json
@@ -75,7 +80,15 @@ _pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix=POOL_PREFIX)
 # 只读客户端放行的网关命令: 都是查询, 不改变任何消息、已读或会话状态。5023 是 GetUserInfoRequest(查单个人的名字)
 READ_ONLY_COMMANDS = frozenset([gateway.resolve_cmd(n)[0] for n in (
     'feed.PullFeedCardsRequest', 'chatters.PullChattersByIdsRequest', 'chats.PullChatsByIdsRequest',
-    'messages.PullMessagesByPositionsRequest', 'messages.PullMessagesByIdsRequest')] + [5023])
+    'messages.PullMessagesByPositionsRequest', 'messages.PullMessagesByIdsRequest',
+    # 话题群: 按位置取话题、按 id 取话题、取话题里的回复。标话题已读的 thread.PutReadThreadsRequest 不在这里
+    'thread.PullThreadsByPositionsRequest', 'thread.PullThreadsByIDsRequest',
+    'thread.PullThreadMessagesByPositionsRequest')] + [5023])
+# 话题群: 定时刷新时重取最近这么多个话题(新话题和回复数的变化都在里面); 打开话题时按话题列表给的最后位置先猜着拉,
+# 往后多拉这么多条
+TOPIC_REFRESH = 10
+THREAD_SLACK = 20
+TOPIC_ROUNDS = 3
 # 打开会话时除了最近 count 条, 还往前多带到第一条未读(最多这么多条), 好在页面上定位到"以下为新消息"
 MAX_INITIAL = 100
 # 图片文件头: 有的图片(比如表情包)服务端按 application/octet-stream 返回, 认出来的才按图片显示
@@ -399,7 +412,10 @@ def _feed_page(c: ReadClient, cursor) -> dict:
         chat = chats.get(chat_id) or {}
         # 会话列表返回的会话信息和单独查的一样完整: 记下来, 打开会话时据此先猜该拉哪段消息, 也不用再查会话模式
         _remember_chat(c, chat_id, chat)
-        rows.append((card, chat_id, chat, msgs.get(str(chat.get('lastMessageId') or '')) or {}))
+        last_id = chat.get('lastMessageId')
+        if not last_id and _kind(chat) == 'topic':
+            last_id = chat.get('lastVisibleThreadId')  # 话题群没有 lastMessageId, 预览用最后一个看得见的话题(根消息)
+        rows.append((card, chat_id, chat, msgs.get(str(last_id or '')) or {}))
     # 名字: 最后一条消息的发送人和私聊的对方一起批量查; 私聊的对方本地找不到的, 和批量查名字同时去服务端找
     pending = _find_peers(c, st, {chat_id: (chat, str(m.get('fromId') or '')) for _, chat_id, chat, m in rows}, owner)
     senders = [(m.get('fromId'), chat_id) for _, chat_id, chat, m in rows if m.get('fromId') and _kind(chat) != 'p2p']
@@ -527,10 +543,17 @@ def chat(request: Request):
     st = Storage()
     after = int(_digits(q['after'], 'after')) if q.get('after') else None
     before = int(_digits(q['before'], 'before')) if q.get('before') and after is None else None
-    if after is not None and q.get('local'):
-        msgs, end = _local_messages(st, chat_id, after)
-        return _chat_out(c, chat_id, None, msgs, after + 1, end, None, st)
     guess, fetched, msgs = _cached_info(chat_id), range(0), []
+    topic_guess = bool(guess) and decoders.is_thread_chat(guess)
+    if after is not None and q.get('local'):
+        # 本地库里是按会话位置存的消息, 和话题位置对不上; 话题群的新话题只从服务端取
+        msgs, end = _local_messages(st, chat_id, after) if not topic_guess else ([], after)
+        return _chat_out(c, chat_id, None, msgs, after + 1, end, None, st)
+    if topic_guess:
+        out = _topic_list(c, chat_id, count, after, before, st, guess=guess)
+        if out is not None:
+            return out
+        guess = _cached_info(chat_id)  # 已经不是话题群了, 按刚查到的会话信息当普通会话继续
     if guess:
         g_start, g_end = _chat_range(guess, count, after, before)
         # 打开会话时往后多拉一些, 猜过之后来的新消息一般也就有了; 定时取新消息时不多拉, 没有新消息就只查会话信息
@@ -541,6 +564,8 @@ def chat(request: Request):
         info, msgs = _parallel((_fresh_info, c, chat_id), (_pull, c, chat_id, fetched))
     else:
         info = _fresh_info(c, chat_id)
+    if decoders.is_thread_chat(info):
+        return _topic_list(c, chat_id, count, after, before, st, info=info)
     start, end = _chat_range(info, count, after, before)
     msgs = msgs + _pull(c, chat_id, [p for p in range(start, end + 1) if p not in fetched])
     first = max(int(info.get('firstChatMessagePosition') or 1), 1)
@@ -573,6 +598,152 @@ def _chat_out(c: ReadClient, chat_id: str, info, msgs: list, start: int, end: in
             'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known, owner), 'kind': _kind(info),
                      'avatar': _chat_avatar(c, chat_id, info), 'unread': _badge(info), 'last_position': last,
                      'read_position': read, 'member_count': int(info.get('memberCount') or 0)}}
+
+
+# ---- 话题群 ----
+
+def _last_topic(info: dict) -> int:
+    """最新话题的位置; 还没有话题时是 -1。"""
+    v = info.get('lastThreadPosition')
+    return int(v) if v is not None else -1
+
+
+def _topic_positions(info: dict, count: int, after=None, before=None) -> range:
+    """要查的话题位置(服务端从其中最大的往前凑够约这么多个看得见的话题)。before: 往前翻 count 个, 不依赖会话信息;
+    after(定时刷新): 最近 TOPIC_REFRESH 个, 新话题和最近几个话题回复数的变化都在里面; 都没有是打开会话: 最近 count 个。"""
+    if before is not None:
+        return range(max(0, before - count), max(0, before))
+    last = _last_topic(info)
+    n = TOPIC_REFRESH if after is not None else count
+    return range(max(0, last - n + 1), last + 1)
+
+
+def _pull_topics(c: ReadClient, chat_id: str, positions) -> dict:
+    if not len(positions):
+        return {'threads': [], 'start': 0}
+    return _call(c.pull_threads, chat_id, positions, command_version=MODERN_COMMAND_VERSION)
+
+
+def _thread_out(t: dict) -> dict:
+    return {'id': t['thread_id'], 'reply_count': t['reply_count'], 'last_position': t['last_position'],
+            'update_time': t['update_time']}
+
+
+def _load_senders(c: ReadClient, chat_id: str, msgs: list, st: Storage):
+    """查好这批消息的发送人名字和被引用的消息(都记在内存缓存里), 做法同 _chat_out。"""
+    me = str(c.auth.user_id)
+    uids = [m.get('from_id') for m in msgs] + [m.get('remover_id') for m in msgs if m.get('recalled')] + [me]
+    _, quoted = _parallel((_people, c, uids, st), (_load_quotes, c, msgs))
+    later = [(_quotes.get(i) or {}).get('from_id') for i in quoted]
+    _people(c, later, st)
+    _lookup_names(c, [(u, chat_id) for u in uids + later])
+
+
+def _topic_list(c: ReadClient, chat_id: str, count: int, after, before, st: Storage, guess=None, info=None):
+    """话题群的话题列表, 格式同 chat(): messages 里每项是一个话题的根消息, position 是话题位置, 另带 thread
+    (话题 id、回复数、最后一条回复的位置、最后有动静的时间); start/end/has_more 也都按话题位置。
+    after 是定时刷新: 不管给的位置, 都重取最近 TOPIC_REFRESH 个话题, 页面用它替换这一段(回复数会变)。
+
+    有记下的会话信息(guess)时按它猜要查的位置, 和查最新会话信息同时进行; 最新话题位置比猜的靠后(来了新话题或入群提示)
+    就只补查多出来的那段, 多得太多才整段重查。会话信息里的已读位置换成 readThreadPosition, 页面据此画"以下为新话题"。"""
+    got, guessed = None, range(0)
+    if info is None:
+        guessed = _topic_positions(guess, count, after, before)
+        info, got = _parallel((_fresh_info, c, chat_id), (_pull_topics, c, chat_id, guessed))
+        if not decoders.is_thread_chat(info):
+            return None  # 会话模式变了(极少见): 由调用方按普通会话处理
+    want = _topic_positions(info, count, after, before)
+    if got is None:
+        got = _pull_topics(c, chat_id, want)
+    elif len(want) and (not len(guessed) or want[-1] > guessed[-1]):
+        g_end = guessed[-1] if len(guessed) else -1
+        if want[-1] - g_end > len(want):
+            got = _pull_topics(c, chat_id, want)
+        else:
+            more = _pull_topics(c, chat_id, range(g_end + 1, want[-1] + 1))
+            got = {'threads': got['threads'] + more['threads'], 'start': min(got['start'], more['start'])}
+    end = want[-1] if len(want) else (before - 1 if before is not None else -1)
+    start = min(got['start'], end + 1)
+    found = {t['position']: t for t in got['threads'] if start <= t['position'] <= end}
+    first = max(int(info.get('threadStartPosition') or 0), 0)
+    # 看得见的话题很稀(比如只有管理员能发言的大群, 几乎全是入群提示)时服务端一次找不够, 接着往前找, 最多再查 TOPIC_ROUNDS 次
+    rounds = 0
+    while after is None and len(found) < count and start > first and rounds < TOPIC_ROUNDS:
+        more = _pull_topics(c, chat_id, range(max(first, start - (count - len(found))), start))
+        found.update({t['position']: t for t in more['threads'] if t['position'] < start})
+        start, rounds = max(first, min(more['start'], start - 1)), rounds + 1
+    threads = sorted(found.values(), key=lambda t: t['position'])
+    _load_senders(c, chat_id, [t['root'] for t in threads], st)
+    items = [{**_message_out(c, t['root'], chat_id), 'position': t['position'], 'thread': _thread_out(t)} for t in threads]
+    known = {chat_id: st.get_chat_name(chat_id)}
+    return {'messages': items, 'start': start, 'end': end, 'has_more': start > first,
+            'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known, _owner_chat()), 'kind': 'topic',
+                     'avatar': _chat_avatar(c, chat_id, info), 'unread': _badge(info), 'last_position': _last_topic(info),
+                     'read_position': int(info.get('readThreadPosition') or 0), 'member_count': int(info.get('memberCount') or 0)}}
+
+
+def _position(value, what: str):
+    """话题内的位置: 根消息是 -1, 回复从 0 起。"""
+    if value in (None, ''):
+        return None
+    value = str(value)
+    if not re.fullmatch(r'-?\d{1,12}', value) or int(value) < -1:
+        raise ValueError(f'{what} 不合法')
+    return int(value)
+
+
+def _thread_info(c: ReadClient, thread_id: str):
+    return _call(c.pull_threads_by_ids, [thread_id], command_version=MODERN_COMMAND_VERSION).get(thread_id)
+
+
+def _pull_replies(c: ReadClient, chat_id: str, thread_id: str, positions) -> list:
+    positions = [p for p in positions if p >= 0]
+    return _call(c.pull_thread_messages, chat_id, thread_id, positions, command_version=MODERN_COMMAND_VERSION) if positions else []
+
+
+def thread(request: Request):
+    """话题群里的一个话题: 根消息(root)和回复(messages, 按话题内的位置从小到大, 也就是时间顺序)。
+    默认最近 count 条回复; before=<位置> 往前翻; after=<位置> 取新回复(一次最多 50 条)。
+    last=<位置> 是话题列表给的最后一条回复的位置: 有它就先按它猜着拉回复, 和查话题信息同时进行, 猜漏的再补拉。
+    回复直接回的是根消息时不再显示引用(都在这个话题里); 回的是话题里的另一条时照常显示引用。"""
+    c = reader()
+    chat_id = _digits(request.path_params['chat_id'], 'chat_id')
+    thread_id = _digits(request.path_params['thread_id'], 'thread_id')
+    q = request.query_params
+    count = min(int(q.get('count') or 30), 100)
+    after = _position(q.get('after'), 'after')
+    before = _position(q.get('before'), 'before') if after is None else None
+    hint = _position(q.get('last'), 'last')
+    if after is not None:
+        guessed = range(after + 1, after + 51)
+    elif before is not None:
+        guessed = range(max(0, before - count), max(0, before))
+    elif hint is not None:
+        guessed = range(max(0, hint - count + 1), hint + THREAD_SLACK + 1)
+    else:
+        guessed = range(0)
+    if len(guessed):
+        t, msgs = _parallel((_thread_info, c, thread_id), (_pull_replies, c, chat_id, thread_id, guessed))
+    else:
+        t, msgs = _thread_info(c, thread_id), []
+    if not t or str(t['root'].get('chat_id') or '') != chat_id:
+        raise ValueError('找不到这个话题')
+    last = t['last_position']
+    if after is not None:
+        start, end = after + 1, min(last, after + 50)
+    elif before is not None:
+        start, end = max(0, before - count), before - 1
+    else:
+        start, end = max(0, last - count + 1), last
+    msgs = msgs + _pull_replies(c, chat_id, thread_id, [p for p in range(start, end + 1) if p not in guessed])
+    msgs = sorted({int(m['position']): m for m in msgs if start <= int(m['position']) <= end}.values(),
+                  key=lambda m: int(m['position']))
+    msgs = [{**m, 'parent_id': ''} if str(m.get('parent_id') or '') == thread_id else m for m in msgs]
+    root = t['root']
+    _load_senders(c, chat_id, [root] + msgs, Storage())
+    return {'root': {**_message_out(c, root, chat_id), 'position': -1},
+            'messages': [_message_out(c, m, chat_id) for m in msgs], 'start': start, 'end': end, 'has_more': start > 0,
+            'thread': _thread_out(t)}
 
 
 def changes(request: Request):
@@ -614,7 +785,7 @@ def _text_message(text: str, mentions) -> dict:
 
 
 def send(request: Request):
-    """发文字。body: text, root_id(回复哪条, 可选), mentions(@ 了谁, 见 _text_message),
+    """发文字。body: text, root_id/parent_id(回复时: 被回复那条的根消息和它自己, 可选), mentions(@ 了谁, 见 _text_message),
     plain_at(有未读时同意把 @ 当普通文字发出, 见 _deliver)。"""
     c = client()
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
@@ -625,10 +796,12 @@ def send(request: Request):
     if len(text) > MAX_TEXT:
         raise ValueError(f'消息太长(超过 {MAX_TEXT} 字)')
     root_id = _digits(b['root_id'], 'root_id') if b.get('root_id') else None
-    return _deliver(c, chat_id, _text_message(text, b.get('mentions')), root_id, plain_at=bool(b.get('plain_at')))
+    parent_id = _digits(b['parent_id'], 'parent_id') if b.get('parent_id') and root_id else None
+    return _deliver(c, chat_id, _text_message(text, b.get('mentions')), root_id, plain_at=bool(b.get('plain_at')),
+                    parent_id=parent_id)
 
 
-def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, plain_at: bool = False):
+def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, plain_at: bool = False, parent_id=None):
     """发出一条消息(文字、图片、文件都走这里): 一律匿名发送, 发出后核对, 记审计。
 
     有未读时经本人私聊转发(见 LarkClient.send_message), 转发会把 @ 变成普通文字: 带 @ 的消息这时先返回 409 让页面
@@ -643,13 +816,15 @@ def _deliver(c: LarkClient, chat_id: str, msg: dict, root_id=None, plain_at: boo
     watch = []
     if read < last:
         try:
-            watch = [i for i in _others_unread(c, chat_id, read, last) if i != root_id]
+            watch = [i for i in _others_unread(c, chat_id, read, last) if i not in (root_id, parent_id)]
         except Exception as e:
             logger.warning(f'发送前查询未读消息失败: {e}')
             watch = None
     # 网页版一律匿名发送: 有未读时经本人私聊转发, 已读位置不动; 转发不成就算发送失败, 不退回普通发送(会清掉本人的未读)。
     # 发出后照样核对, 万一有变化如实报告
-    msg_id = _call(c.send_message, msg, chat_id, root_id=root_id, keep_unread=True, fallback=False)
+    # 回复: 网页上点"回复"是飞书常规的引用回复(留在主会话, 上方带被回复的那条), 不回进话题; 话题群里的回复照样进话题
+    reply = {'parent_id': parent_id or root_id, 'in_thread': False} if root_id else {}
+    msg_id = _call(c.send_message, msg, chat_id, root_id=root_id, keep_unread=True, fallback=False, **reply)
     Storage().log_action(actor='human', action='send', chat_id=chat_id, msg_id=str(msg_id or ''),
                          content=builders.plain_text(msg), ok=1 if msg_id else 0, error='' if msg_id else '发送失败',
                          turn_kind='web')
@@ -685,7 +860,7 @@ def _size_text(n: int) -> str:
 
 async def upload(request: Request):
     """发图片或文件。请求体是文件的原始内容(不是表单), query: kind=image|file, name=文件名, type=MIME,
-    root_id=回复哪条(可选)。边收边写进临时文件(超过上限立即停止), 上传到飞书后和文字一样匿名发出。"""
+    root_id/parent_id=回复哪条(可选, 同 send)。边收边写进临时文件(超过上限立即停止), 上传到飞书后和文字一样匿名发出。"""
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     q = request.query_params
     kind = q.get('kind')
@@ -698,6 +873,7 @@ async def upload(request: Request):
     if not re.fullmatch(r'[\w.+\-]{1,100}/[\w.+\-]{1,100}', mime):
         mime = ''
     root_id = _digits(q['root_id'], 'root_id') if q.get('root_id') else None
+    parent_id = _digits(q['parent_id'], 'parent_id') if q.get('parent_id') and root_id else None
     if int(request.headers.get('content-length') or 0) > limit:
         raise ValueError(too_big)
     with tempfile.TemporaryFile() as tmp:
@@ -710,10 +886,10 @@ async def upload(request: Request):
         if not size:
             raise ValueError('文件是空的')
         tmp.seek(0)
-        return await asyncio.to_thread(_send_upload, chat_id, kind, tmp, size, name, mime, root_id)
+        return await asyncio.to_thread(_send_upload, chat_id, kind, tmp, size, name, mime, root_id, parent_id)
 
 
-def _send_upload(chat_id: str, kind: str, fileobj, size: int, name: str, mime: str, root_id):
+def _send_upload(chat_id: str, kind: str, fileobj, size: int, name: str, mime: str, root_id, parent_id=None):
     c = client()
     try:
         if kind == 'image':
@@ -728,7 +904,7 @@ def _send_upload(chat_id: str, kind: str, fileobj, size: int, name: str, mime: s
     except UploadError as e:
         logger.warning(f'上传到飞书失败: {e}')
         raise UpstreamError(f'上传到飞书失败: {e}') from e
-    return _deliver(c, chat_id, msg, root_id)
+    return _deliver(c, chat_id, msg, root_id, parent_id=parent_id)
 
 
 def _real_name(chatter: dict, locale: str) -> str:
@@ -847,6 +1023,7 @@ ROUTES = [
     ('/api/im/chat/{chat_id}/send', send, ['POST']),
     ('/api/im/chat/{chat_id}/upload', upload, ['POST']),
     ('/api/im/chat/{chat_id}/members', members, ['GET']),
+    ('/api/im/chat/{chat_id}/thread/{thread_id}', thread, ['GET']),
     ('/api/im/search', search, ['GET']),
     ('/api/im/open', open_p2p, ['POST']),
     ('/api/im/media', media, ['GET']),

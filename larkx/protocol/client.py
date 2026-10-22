@@ -161,12 +161,14 @@ class LarkClient:
         """发一条纯文字消息, 见 send_message。"""
         return self.send_message({'kind': 'text', 'text': text}, chat_id, root_id=root_id, keep_unread=keep_unread)
 
-    def send_message(self, msg: dict, chat_id: str, root_id: str=None, keep_unread: bool=False, fallback: bool=True):
+    def send_message(self, msg: dict, chat_id: str, root_id: str=None, keep_unread: bool=False, fallback: bool=True,
+                     parent_id: str=None, in_thread: bool=None):
         """发一条消息(文字、带 @ 的文字、图片、文件, 格式见 builders 里的消息描述)。
         返回服务端分配的消息 id;未能确认发送成功(请求失败,或响应里拿不到 id)时返回 None。
 
         普通发送只把本人在这个会话的已读位置推到最新(清掉本人的未读), 不会给别人的消息产生已读回执。
-        root_id 是话题回复, 被回复的那条会对对方显示已读, 这是"回复"本身的意思。
+        root_id 是回复, 被回复的那条会对对方显示已读, 这是"回复"本身的意思。普通群和私聊里默认是主会话里的引用回复,
+        回的那条已经在话题里时回进那个话题; 话题群里回进话题(见 _reply_target)。parent_id、in_thread 见 _reply_target。
         keep_unread: 会话里还有本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条
         普通消息, 本人的已读位置不动; 转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
         fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读(网页版用)。
@@ -180,16 +182,51 @@ class LarkClient:
                 if msg_id or not fallback:
                     return msg_id
                 logger.warning(f'经本人私聊转发到会话 {chat_id} 没成功, 已退回普通发送: 本人在这个会话的未读会被清掉, 对方看不到已读')
-        return self._put_message(msg, chat_id, root_id=root_id, thread_chat=bool(root_id) and self.is_thread_chat(chat_id))
+        if not root_id:
+            return self._put_message(msg, chat_id)
+        thread_chat = self.is_thread_chat(chat_id)
+        root_id, parent_id, in_thread = self._reply_target(root_id, parent_id, in_thread, thread_chat)
+        return self._put_message(msg, chat_id, root_id=root_id, thread_chat=thread_chat, parent_id=parent_id, in_thread=in_thread)
+
+    def _reply_target(self, root_id: str, parent_id: str=None, in_thread: bool=None, thread_chat: bool=False) -> tuple:
+        """回复的 (rootId, parentId, 是否回进话题)。parent_id 是直接回的那条(上方显示的引用), 不给就是 root_id。
+
+        话题群: 回进话题, rootId 就是 root_id(话题的根消息)。
+        普通群和私聊: 默认是主会话里的引用回复, 和飞书客户端点"回复"一样, 不会新开话题; 只有回的那条已经在一个话题里
+        (它是话题的根消息, 或者本身是话题里的回复)时才回进那个话题, 普通群话题里的对话(比如数字人在话题里答复)
+        不会被拽到主会话。要判断时只读地查一下回的那条(PullMessagesByIdsRequest), 查不到就按引用回复发。
+        in_thread 和 parent_id 都给了(网页版点"回复"时)就照给的发, 不再查。
+        """
+        target = str(parent_id or root_id)
+        if thread_chat:
+            return str(root_id), target, False
+        if in_thread is not None and parent_id:
+            return str(root_id), target, bool(in_thread)
+        v = {}
+        try:
+            got = (self.api('messages.PullMessagesByIdsRequest', {'messageIds': [target]}) or {}).get('messages') or {}
+            v = next((m for m in got.values() if str(m.get('id')) == target), {})
+        except Exception as e:
+            logger.warning(f'查询被回复的消息 {target} 失败, 按引用回复发出: {e}')
+        # Message.threadMessageType: 1 是话题的根消息, 2 是话题里的回复, 0 是普通消息(包括主会话里的引用回复)
+        kind = v.get('threadMessageType') if isinstance(v.get('threadMessageType'), int) else 0
+        if in_thread is None:
+            in_thread = kind in (1, 2)
+        if in_thread:
+            # 回进话题: rootId 是话题的根消息(threadId); 那条还没有话题时(明确要求回进话题)以 root_id 为根新开一个
+            return (str(v.get('threadId') or target) if kind else str(root_id)), target, True
+        root = str(v.get('rootId') or '')
+        return (root if root and root != '0' else target), target, False
 
     def relays(self, chat_id: str, read: int, last: int, root_id: str=None) -> bool:
         """keep_unread 时这条会不会经本人私聊转发: 会话里还有本人的未读(read < last)、不是回复、目标也不是本人私聊
         (本人私聊里只有本人, 普通发送不涉及别人)。"""
         return not root_id and read < last and str(chat_id) != self._relay_chat()
 
-    def _put_message(self, msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None):
+    def _put_message(self, msg: dict, chat_id: str, root_id: str=None, thread_chat: bool=False, cid: str=None,
+                     parent_id: str=None, in_thread: bool=False):
         pkt = builders.build_message_packet(msg, chat_id, generate_long_request_id(), root_id=root_id,
-                                            thread_chat=thread_chat, cid=cid)
+                                            thread_chat=thread_chat, cid=cid, parent_id=parent_id, in_thread=in_thread)
         try:
             content = self._gateway_post(pkt)
         except Exception as e:
@@ -359,6 +396,75 @@ class LarkClient:
                 chat_id = str(v.get('chatId') or v.get('channelId') or '')
                 out.append(self._message_dict(v, chat_id, self.is_thread_chat(chat_id) if chat_id else False, 0))
         return out
+
+    # ---- 话题群(只读) ----
+    # 话题群的消息按话题组织: 会话信息里 lastMessagePosition 是空的, 话题有自己的位置(lastThreadPosition、
+    # readThreadPosition, 从 0 开始); 每个话题里根消息的位置是 -1, 回复从 0 排到话题的 lastMessagePosition。
+
+    def pull_threads(self, chat_id: str, positions, command_version: str=None) -> dict:
+        """按话题位置取话题群里的话题(只读, thread.PullThreadsByPositionsRequest)。
+
+        只取看得见的话题: 入群提示这类系统消息也各占一个话题位置但不显示, 带上 onlyVisibleThreads 和向上的方向后,
+        服务端从 positions 里最大的位置往前找, 跳过看不见的(放在 invisibleThreads 里), 凑够约 len(positions) 个看得见的。
+        返回 {'threads': 话题列表(按位置从小到大, 格式见 _thread_dict), 'start': 这次往前查到的最小位置}。
+        """
+        positions = sorted({int(p) for p in positions if int(p) >= 0})
+        if not positions:
+            return {'threads': [], 'start': 0}
+        resp = self.api('thread.PullThreadsByPositionsRequest',
+                        {'channelId': str(chat_id), 'type': 'CHAT_CHANNEL', 'positions': positions,
+                         'onlyVisibleThreads': True, 'direction': 'CHANNEL_UP'}, command_version=command_version) or {}
+        threads = resp.get('threads') or {}
+        covered = [int(p) for p in threads] + [int(p) for p in (resp.get('invisibleThreads') or {})]
+        out = [self._thread_dict(t, resp.get('rootMessages') or {}, chat_id) for t in threads.values() if t.get('isVisible')]
+        out = sorted((t for t in out if t), key=lambda t: t['position'])
+        return {'threads': out, 'start': min(covered + [positions[0]])}
+
+    def pull_threads_by_ids(self, thread_ids, command_version: str=None) -> dict:
+        """按话题 id 取话题(只读, thread.PullThreadsByIDsRequest), {thread_id: 话题}; 取不到的不在结果里。"""
+        ids = [str(t) for t in thread_ids if t]
+        if not ids:
+            return {}
+        resp = self.api('thread.PullThreadsByIDsRequest', {'threadIds': ids}, command_version=command_version) or {}
+        out = {}
+        for t in (resp.get('threads') or {}).values():
+            d = self._thread_dict(t, resp.get('rootMessages') or {}, str(t.get('channelId') or ''))
+            if d:
+                out[d['thread_id']] = d
+        return out
+
+    def pull_thread_messages(self, chat_id: str, thread_id: str, positions, command_version: str=None) -> list:
+        """按话题内的位置取一个话题里的消息(只读, thread.PullThreadMessagesByPositionsRequest), 格式同 pull_history,
+        position 是话题内的位置(根消息 -1, 回复从 0 起), 会话里的位置放在 chat_position。超出范围的位置没有结果。"""
+        positions = sorted({int(p) for p in positions if int(p) >= -1})
+        if not positions:
+            return []
+        resp = self.api('thread.PullThreadMessagesByPositionsRequest',
+                        {'threadId': str(thread_id), 'channelId': str(chat_id), 'channelType': 'CHAT_CHANNEL', 'positions': positions},
+                        command_version=command_version) or {}
+        out = []
+        for pos, v in sorted((resp.get('messages') or {}).items(), key=lambda kv: int(kv[0])):
+            msg = self._message_dict(v, chat_id, True, int(pos))
+            msg['chat_position'], msg['position'] = msg['position'], int(pos)
+            out.append(msg)
+        return out
+
+    @classmethod
+    def _thread_dict(cls, t: dict, roots: dict, chat_id: str):
+        """一个话题: thread_id、position(话题位置)、reply_count、last_position(话题内最后一条回复的位置, 没有回复是 -1)、
+        update_time(最后有动静的时间, 有回复时就是最后一条回复的时间)、owner_id、root(根消息, 格式同 pull_history)。
+        找不到根消息的返回 None。"""
+        root = roots.get(str(t.get('rootMessageId') or t.get('id') or ''))
+        if not root:
+            return None
+        msg = cls._message_dict(root, str(chat_id or root.get('chatId') or ''), True, 0)
+        replies = int(t.get('replyCount') or 0)
+        last = t.get('lastMessagePosition')
+        # 没有这个字段时按回复数推算(回复从 0 起连续编号)
+        last = int(last) if last is not None else replies - 1
+        return {'thread_id': str(t.get('id') or ''), 'position': int(t.get('position') or 0), 'reply_count': replies,
+                'last_position': max(last, -1), 'update_time': int(t.get('updateTime') or 0),
+                'owner_id': str(t.get('ownerId') or ''), 'root': msg}
 
     @staticmethod
     def _message_dict(v: dict, chat_id: str, thread_chat: bool, position: int) -> dict:
