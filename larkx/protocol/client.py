@@ -18,6 +18,10 @@ MODERN_COMMAND_VERSION = '7.72.0'
 
 
 class LarkClient:
+    # 发网关请求用的 HTTP 客户端: 默认是 requests 模块本身(每次新建连接), daemon 和发消息都用它。
+    # 网页版的只读客户端换成复用连接的 requests.Session(见 web/im.py 的 ReadClient)
+    http = requests
+
     def __init__(self, auth: LarkAuth):
         self.auth = auth
         self.auth.require_valid()
@@ -149,7 +153,7 @@ class LarkClient:
             'x-web-version': '3.9.32',
             'x-request-id': generate_long_request_id(),
         }
-        resp = requests.post(self.auth.region.gateway_url, headers=headers, cookies=self.auth.cookies, data=packet.SerializeToString(), timeout=15)
+        resp = self.http.post(self.auth.region.gateway_url, headers=headers, cookies=self.auth.cookies, data=packet.SerializeToString(), timeout=15)
         resp.raise_for_status()
         return resp.content
 

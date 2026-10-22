@@ -116,40 +116,53 @@ function avatar(url, name, size = 32) {
 
 // ---- 状态 ----
 
+// msgs/start/end/hasMore/readPos/unreadUpTo/fetchedAt/rows 是当前会话的; 离开时连同滚动位置存进 cache,
+// 再切回来先立刻显示存下的, 再在后台刷新
 const S = { feed: [], cursor: '', filter: 'all', q: '', results: null, latest: null, feedAt: 0, feedDirty: false, feedBusy: false,
   chatId: '', chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, seq: 0, poll: 0, me: null,
-  readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false,
+  readPos: 0, unreadUpTo: 0, lastServer: 0, polling: false, loaded: false, fetchedAt: 0, rows: new Map(),
+  cache: new Map(), inflight: new Map(), cards: new Map(), hoverTimer: 0, prefetching: false,
   pending: [], pendingSeq: 0, mentions: [], members: null, sending: false };
 // 新消息: 每秒先问本地库(daemon 收到推送就入库), 本地没有时最多每 3 秒去服务端拉一次; 页面在后台时放慢
 const POLL_MS = 1000, SERVER_MS = 3000, SERVER_HIDDEN_MS = 10000;
+// 会话列表: 本地库有新消息时尽快刷新(最多每 3 秒一次), 否则每 8 秒一次, 页面在后台时 30 秒一次
+const FEED_MS = 8000, FEED_DIRTY_MS = 3000, FEED_HIDDEN_MS = 30000;
+// 记住最近打开过的这么多个会话; 刚取到不到 5 秒的切回来不再刷新; 会话列表前几个和鼠标停留的会话提前取好
+const CACHE_MAX = 30, FRESH_MS = 5000, PREFETCH_TOP = 5, PREFETCH_FRESH_MS = 30000, HOVER_MS = 120;
 const KIND = { p2p: '单聊', group: '群组', topic: '话题群' };
 const FILTERS = [['all', '全部'], ['unread', '未读'], ['p2p', '单聊'], ['group', '群组']];
 
 // ---- 会话列表 ----
 
+function applyFeed(d) {
+  const fresh = new Set(d.items.map(i => i.chat_id));
+  S.feed = d.items.concat(S.feed.filter(i => !fresh.has(i.chat_id)));
+  if (!S.cursor) S.cursor = d.next_cursor;
+  renderFeed();
+}
+
 async function refreshFeed() {
   if (S.feedBusy) return;
   S.feedBusy = true; S.feedAt = Date.now();
   try {
-    const d = await api('/api/im/feed');
-    const fresh = new Set(d.items.map(i => i.chat_id));
-    S.feed = d.items.concat(S.feed.filter(i => !fresh.has(i.chat_id)));
-    if (!S.cursor) S.cursor = d.next_cursor;
-    renderFeed();
+    applyFeed(await api('/api/im/feed'));
   } finally { S.feedBusy = false; }
+  prefetchTop();
 }
 
-// 本地库有新消息入库就尽快刷新会话列表(最多每 3 秒一次), 不用等 8 秒一次的定时刷新
-async function checkChanges() {
-  if (document.hidden) return;
-  const d = await api('/api/im/changes').catch(() => null);
-  if (!d) return;
-  if (S.latest != null && d.latest !== S.latest) S.feedDirty = true;
-  S.latest = d.latest;
-  if (S.feedDirty && !S.feedBusy && Date.now() - S.feedAt >= 3000) {
-    S.feedDirty = false;
-    refreshFeed().catch(() => {});
+// 每 2 秒问一次本地库有没有新消息入库, 有就尽快刷新会话列表, 不用等定时刷新; 两种刷新合在这一个定时器里, 不重复请求
+async function feedTick() {
+  if (!document.hidden) {
+    const d = await api('/api/im/changes').catch(() => null);
+    if (d) {
+      if (S.latest != null && d.latest !== S.latest) S.feedDirty = true;
+      S.latest = d.latest;
+    }
   }
+  const age = Date.now() - S.feedAt;
+  if (S.feedBusy || !(age >= (document.hidden ? FEED_HIDDEN_MS : FEED_MS) || (S.feedDirty && age >= FEED_DIRTY_MS))) return;
+  S.feedDirty = false;
+  refreshFeed().catch(() => {});
 }
 
 async function moreFeed() {
@@ -162,7 +175,8 @@ async function moreFeed() {
 }
 
 function feedCard(i) {
-  return h('div', { class: 'feedCard' + (i.chat_id === S.chatId ? ' active' : ''), onclick: () => { location.hash = '#/im/' + i.chat_id; } },
+  return h('div', { class: 'feedCard', onclick: () => { location.hash = '#/im/' + i.chat_id; },
+    onmouseenter: () => hoverPrefetch(i.chat_id), onmouseleave: () => clearTimeout(S.hoverTimer) },
     avatar(i.avatar, i.name, 32),
     h('div', { class: 'feedCard-main' },
       h('div', { class: 'feedCard-row' }, h('div', { class: 'feedCard-name', title: i.name }, i.name),
@@ -194,9 +208,21 @@ function renderFeed() {
   const q = S.q.toLowerCase();
   const rows = S.feed.filter(i => (S.filter === 'all' || (S.filter === 'unread' ? i.unread > 0 : S.filter === 'p2p' ? i.kind === 'p2p' : i.kind !== 'p2p'))
     && (!q || i.name.toLowerCase().includes(q)));
-  put(list, rows.map(feedCard),
+  // 内容没变的会话卡片沿用原来的节点(头像不用重新加载), 只重建变了的
+  const cards = new Map();
+  for (const i of rows) {
+    const sig = JSON.stringify(i), old = S.cards.get(i.chat_id);
+    cards.set(i.chat_id, old && old.sig === sig ? old : { sig, node: feedCard(i) });
+  }
+  S.cards = cards;
+  put(list, [...cards.values()].map(c => c.node),
     S.cursor && !q ? h('button', { class: 'feed-more', onclick: () => act(moreFeed) }, '加载更多') : null,
     !rows.length ? h('div', { class: 'feed-hint' }, S.feed.length ? (q ? '回车搜索联系人和群组' : '没有符合条件的会话') : '加载中…') : null);
+  markActive();
+}
+
+function markActive() {
+  for (const [id, c] of S.cards) c.node.classList.toggle('active', id === S.chatId);
 }
 
 async function searchAll(q) {
@@ -217,31 +243,138 @@ function emptyChat(text) {
   put($('chat'), box);
 }
 
+// 取一个会话最近的消息; 同一个会话已经在取的(预取、上一次打开)就共用那次请求
+function fetchChat(chatId) {
+  let p = S.inflight.get(chatId);
+  if (!p) {
+    p = api(`/api/im/chat/${chatId}`).finally(() => S.inflight.delete(chatId));
+    S.inflight.set(chatId, p);
+  }
+  return p;
+}
+
+// 已读位置在取到时记下: "以下为新消息"标在那时就未读的第一条前, 之后来的新消息不再挪动它
+function entryFrom(d) {
+  return { chat: d.chat, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more, readPos: d.chat.read_position || 0,
+    unreadUpTo: d.end, fetchedAt: Date.now(), rows: new Map(), view: null };
+}
+
+function remember(chatId, e) {
+  S.cache.delete(chatId); S.cache.set(chatId, e);
+  for (const id of S.cache.keys()) {
+    if (S.cache.size <= CACHE_MAX) break;
+    if (id !== S.chatId) S.cache.delete(id);
+  }
+}
+
+// 后台刷新到的最近一段并进已有的消息(t 是当前会话 S 或缓存里的一项): 和已有的连得上就替换这一段, 撤回等变化也跟着更新;
+// 连不上(离开期间新消息太多)就只留新取到的这段
+function mergeFresh(t, d) {
+  if (t.msgs.length && d.start >= t.start && d.start <= t.end + 1) {
+    t.msgs = t.msgs.filter(m => m.position < d.start).concat(d.messages, t.msgs.filter(m => m.position > d.end));
+    t.end = Math.max(t.end, d.end);
+  } else {
+    Object.assign(t, { msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more });
+  }
+  Object.assign(t, { chat: d.chat, readPos: d.chat.read_position || 0, unreadUpTo: Math.max(t.unreadUpTo, d.end), fetchedAt: Date.now() });
+}
+
+// 离开当前会话时记下它的消息、已经建好的消息节点和滚动位置
+function saveCurrent() {
+  if (!S.chatId || !S.loaded) return;
+  const box = S.body;
+  const view = box ? { bottom: box.scrollHeight - box.scrollTop - box.clientHeight < 80, top: box.scrollTop } : null;
+  remember(S.chatId, { chat: S.chat, msgs: S.msgs, start: S.start, end: S.end, hasMore: S.hasMore, readPos: S.readPos,
+    unreadUpTo: S.unreadUpTo, fetchedAt: S.fetchedAt, rows: S.rows, view });
+}
+
+function useEntry(e) {
+  Object.assign(S, { chat: e.chat, msgs: e.msgs, start: e.start, end: e.end, hasMore: e.hasMore, readPos: e.readPos,
+    unreadUpTo: e.unreadUpTo, fetchedAt: e.fetchedAt, rows: e.rows || new Map(), loaded: true, lastServer: Date.now(), polling: false });
+}
+
+// 预取: 只读接口, 不会标已读。结果放进缓存, 打开时直接显示
+async function prefetch(chatId) {
+  const e = S.cache.get(chatId);
+  if (chatId === S.chatId || S.inflight.has(chatId) || (e && Date.now() - e.fetchedAt < PREFETCH_FRESH_MS)) return;
+  const d = await fetchChat(chatId).catch(() => null);
+  if (!d || chatId === S.chatId) return;  // 这期间打开了它: 由 openChat 用这次的结果
+  const old = S.cache.get(chatId);
+  if (old) mergeFresh(old, d); else remember(chatId, entryFrom(d));
+}
+
+function hoverPrefetch(chatId) {
+  clearTimeout(S.hoverTimer);
+  S.hoverTimer = setTimeout(() => prefetch(chatId), HOVER_MS);
+}
+
+// 会话列表最前面几个还没取过的会话, 一个接一个地预取
+async function prefetchTop() {
+  if (S.prefetching || document.hidden) return;
+  S.prefetching = true;
+  try {
+    for (const i of S.feed.slice(0, PREFETCH_TOP)) if (!S.cache.has(i.chat_id)) await prefetch(i.chat_id);
+  } finally { S.prefetching = false; }
+}
+
 async function openChat(chatId) {
+  saveCurrent();
   clearInterval(S.poll);
   const seq = ++S.seq;
   clearComposer();
-  Object.assign(S, { chatId, chat: null, msgs: [], replyTo: null });
+  const cached = S.cache.get(chatId), item = S.feed.find(i => i.chat_id === chatId);
+  Object.assign(S, { chatId, chat: null, msgs: [], start: 0, end: 0, hasMore: false, replyTo: null, loaded: false, rows: new Map(),
+    head: null, body: null, input: null });
   $('tab-im').classList.add('has-chat');
-  renderFeed();
-  emptyChat('加载中…');
-  const d = await act(() => api(`/api/im/chat/${chatId}`));
-  if (seq !== S.seq) return;
+  markActive();
+  if (cached) {
+    // 打开过的会话: 立刻显示记下的消息和滚动位置, 再在后台刷新
+    useEntry(cached);
+    renderChat(); renderMsgs(cached.view ? 'restore' : 'unread', cached.view);
+    startPoll(seq);
+    if (Date.now() - cached.fetchedAt > FRESH_MS) refreshOpen(seq);
+    return;
+  }
+  // 没打开过: 先用会话列表里的名字和头像把窗口搭好(输入框可以先打字), 消息到了再填进去
+  if (item) { S.chat = { chat_id: chatId, name: item.name, avatar: item.avatar, kind: item.kind, unread: item.unread }; renderChat(); }
+  else emptyChat('加载中…');
+  const d = await act(() => fetchChat(chatId));
+  if (seq !== S.seq) {
+    if (d && chatId !== S.chatId && !S.cache.has(chatId)) remember(chatId, entryFrom(d));  // 已经切走了, 留着下次用
+    return;
+  }
   if (!d) { emptyChat('打不开这个会话'); return; }
-  // 已读位置只在打开时记一次: "以下为新消息"标在打开时就未读的第一条前, 之后来的新消息不再挪动它
-  Object.assign(S, { chat: d.chat, msgs: d.messages, start: d.start, end: d.end, hasMore: d.has_more,
-    readPos: d.chat.read_position || 0, unreadUpTo: d.end, lastServer: Date.now(), polling: false });
-  renderChat();
+  useEntry(entryFrom(d));
+  if (S.body) renderHead(); else renderChat();
+  renderMsgs('unread');
+  startPoll(seq);
+}
+
+async function refreshOpen(seq) {
+  const chatId = S.chatId;
+  const d = await fetchChat(chatId).catch(() => null);
+  if (!d) return;
+  if (seq !== S.seq) {
+    const e = chatId !== S.chatId && S.cache.get(chatId);
+    if (e) mergeFresh(e, d);
+    return;
+  }
+  mergeFresh(S, d);
+  renderHead(); renderMsgs('keep-bottom');
+}
+
+function startPoll(seq) {
   S.poll = setInterval(() => pollTick(seq), POLL_MS);
 }
 
 function closeChat() {
+  saveCurrent();
   clearInterval(S.poll); S.seq++;
   clearComposer();
-  Object.assign(S, { chatId: '', chat: null, msgs: [] });
+  Object.assign(S, { chatId: '', chat: null, msgs: [], loaded: false, head: null, body: null, input: null });
   $('tab-im').classList.remove('has-chat');
   emptyChat('看消息不会标为已读，对方也看不到');
-  renderFeed();
+  markActive();
 }
 
 async function pollTick(seq) {
@@ -259,6 +392,7 @@ async function pollTick(seq) {
 }
 
 async function pollChat(seq) {
+  if (!S.loaded || seq !== S.seq) return;  // 消息还没取到(比如加载时就发了消息): 取到后的轮询会带上
   S.lastServer = Date.now();
   const d = await api(`/api/im/chat/${S.chatId}?after=${S.end}`).catch(() => null);
   if (!d || seq !== S.seq) return;
@@ -282,9 +416,10 @@ function addMsgs(list) {
   S.msgs = S.msgs.concat(list.filter(m => !have.has(m.msg_id))).sort((a, b) => a.position - b.position);
 }
 
+// 搭好聊天窗口(标题、消息区、输入框), 每次打开会话搭一次; 之后只更新标题(renderHead)和消息(renderMsgs), 输入框里打的字不会丢
 function renderChat() {
   S.head = h('div', { class: 'chat-head' });
-  S.body = h('div', { class: 'chat-body' });
+  S.body = h('div', { class: 'chat-body' }, S.loaded ? null : h('div', { class: 'sys-msg' }, '加载中…'));
   S.replyBar = h('div', { class: 'composer-reply', hidden: true });
   S.pendingBar = h('div', { class: 'composer-pending', hidden: true });
   S.mentionPop = h('div', { class: 'pop mention-pop', hidden: true });
@@ -312,8 +447,8 @@ function renderChat() {
           tool('image', '发送图片（也可以粘贴截图或拖进来）', () => imgInput.click()),
           tool('attach', '发送文件（不超过 100MB）', () => fileInput.click()), imgInput, fileInput),
         h('span', { class: 'composer-hint' }, 'Enter 发送，Shift + Enter 换行；匿名发送：对方看不到已读，你在这个会话的未读也保留'), sendBtn)),
-    h('div', { class: 'drop-zone' }, icon('attach'), `松开发送给 ${S.chat.name}`));
-  renderHead(); renderMsgs('unread');
+    h('div', { class: 'drop-zone' }, icon('attach'), S.dropText = h('span', {}, `松开发送给 ${S.chat.name}`)));
+  renderHead();
   input.focus();
 }
 
@@ -331,12 +466,17 @@ function renderHead() {
     c.kind !== 'p2p' && c.member_count ? h('span', { class: 'chat-sub' }, `${c.member_count} 人`) : null,
     h('div', { class: 'chat-grow' }),
     h('span', { class: 'incognito', title: '在这里看消息不会标为已读' }, icon('eye'), c.unread ? `${c.unread} 条未读 · 不会标为已读` : '不会标为已读'));
+  if (S.input) S.input.placeholder = `发送给 ${c.name}`;
+  if (S.dropText) S.dropText.textContent = `松开发送给 ${c.name}`;
 }
 
-function msgRow(m, prev) {
+// 同一个人 5 分钟内的连续消息不重复显示头像和名字, 和客户端一样
+function isGrouped(m, prev) {
+  return !!prev && prev.kind !== 'system' && prev.kind !== 'recalled' && prev.from_id === m.from_id && m.time - prev.time < 300;
+}
+
+function msgRow(m, grouped) {
   if (m.kind === 'system' || m.kind === 'recalled') return h('div', { class: 'sys-msg' + (m.kind === 'recalled' ? ' recalled' : '') }, m.content);
-  // 同一个人 5 分钟内的连续消息不重复显示头像和名字, 和客户端一样
-  const grouped = prev && prev.kind !== 'system' && prev.kind !== 'recalled' && prev.from_id === m.from_id && m.time - prev.time < 300;
   return h('div', { class: 'msg' + (m.me ? ' me' : '') },
     grouped ? h('span', { class: 'msg-avatar-gap' }) : avatar(m.avatar, m.sender, 32),
     h('div', { class: 'msg-main' },
@@ -439,12 +579,24 @@ function isFirstUnread(m) {
   return S.readPos > 0 && m.position > S.readPos && m.position <= S.unreadUpTo && !m.me && m.kind !== 'system';
 }
 
-function renderMsgs(mode) {
+// 消息内容的签名: 同一条消息内容没变(签名相同)就沿用已经建好的节点
+const SIGS = new WeakMap();
+function sigOf(m) {
+  let s = SIGS.get(m);
+  if (s === undefined) { s = JSON.stringify(m); SIGS.set(m, s); }
+  return s;
+}
+
+// 增量更新: 内容和分组都没变的消息沿用原来的节点(图片不重新加载、不闪), 只新建新来的和变了的(比如被撤回)。
+// mode: unread 定位到"以下为新消息"(没有就到底部), bottom 到底部, keep-bottom 原来在底部就留在底部,
+// keep-offset 往前加载后保持看到的位置不动, restore 恢复切走时的位置(view)
+function renderMsgs(mode, view) {
   const box = S.body;
-  if (!box) return;
+  if (!box || !S.loaded) return;
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const fromBottom = box.scrollHeight - box.scrollTop;
-  const rows = [];
+  // 消息上的时间按"今天/昨天"显示, 过了零点就重建
+  const rows = [], built = new Map(), day = new Date().toDateString();
   let prev = null, divider = null;
   for (const m of S.msgs) {
     if (m.kind === 'system' && !m.content) continue;  // 没有提示文字的系统消息
@@ -453,12 +605,17 @@ function renderMsgs(mode) {
       rows.push(divider); prev = null;
     }
     if (!prev || m.time - prev.time > 300) { rows.push(h('div', { class: 'time-divider' }, msgTime(m.time))); prev = null; }
-    rows.push(msgRow(m, prev));
+    const key = m.msg_id || 'p' + m.position, sig = sigOf(m), grouped = isGrouped(m, prev), old = S.rows.get(key);
+    const row = old && old.sig === sig && old.grouped === grouped && old.day === day ? old : { sig, grouped, day, node: msgRow(m, grouped) };
+    built.set(key, row);
+    rows.push(row.node);
     prev = m;
   }
+  S.rows = built;
   put(box, S.hasMore ? h('div', { class: 'chat-older' }, h('button', { onclick: olderMsgs }, '查看更早的消息')) : null,
     rows.length ? rows : h('div', { class: 'sys-msg' }, '还没有消息'));
-  if (mode === 'unread' && divider) box.scrollTop = Math.max(0, divider.offsetTop - 12);
+  if (mode === 'restore' && view) box.scrollTop = view.bottom ? box.scrollHeight : view.top;
+  else if (mode === 'unread' && divider) box.scrollTop = Math.max(0, divider.offsetTop - 12);
   else if (mode === 'bottom' || mode === 'unread' || (mode === 'keep-bottom' && nearBottom)) box.scrollTop = box.scrollHeight;
   else if (mode === 'keep-offset') box.scrollTop = box.scrollHeight - fromBottom;
 }
@@ -781,6 +938,8 @@ async function login(token) {
 
 async function start() {
   $('login').hidden = true;
+  // 会话列表和本人信息同时取; 会话列表先要服务端记下的上一次结果, 立刻显示, 再正常刷新一次
+  const first = S.me ? null : api('/api/im/feed?cached=1').catch(() => null);
   const me = await act(() => api('/api/im/me'));
   if (!me) return;
   if (S.me) { route(); return; }  // 登录过期后重新登录: 定时器已经在跑
@@ -789,10 +948,12 @@ async function start() {
   $('me').title = me.name;
   renderFilters();
   renderFeed();
-  act(refreshFeed);
-  setInterval(() => refreshFeed().catch(() => {}), 8000);
-  setInterval(checkChanges, 2000);
   route();
+  const d = await first;
+  if (d) applyFeed(d);
+  if (!d || d.cached) await act(refreshFeed);
+  else { S.feedAt = Date.now(); prefetchTop(); }
+  setInterval(feedTick, 2000);
 }
 
 function route() {
@@ -820,6 +981,7 @@ $('theme').addEventListener('click', () => {
 });
 if (localStorage.getItem('larkx-theme')) document.documentElement.dataset.theme = localStorage.getItem('larkx-theme');
 window.addEventListener('hashchange', route);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.me) feedTick(); });
 
 (async () => {
   // 登录链接形如 /#login=<令牌>: 片段不会发给服务器, 换成 cookie 后立即从地址栏抹掉

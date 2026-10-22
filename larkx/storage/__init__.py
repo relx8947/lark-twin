@@ -237,6 +237,16 @@ class Storage:
         finally:
             s.close()
 
+    def chat_peer(self, chat_id: str, user_id: str) -> str:
+        """私聊里对方的 user_id: 本地库里这个会话最近一条不是 user_id 发的消息的发送人; 没有这样的消息时是空串。"""
+        s = self.Session()
+        try:
+            row = (s.query(Message.sender_id).filter(Message.chat_id == str(chat_id), Message.sender_id.notin_(('', '0', str(user_id))))
+                   .order_by(desc(Message.id)).first())
+            return row[0] if row else ''
+        finally:
+            s.close()
+
     def messages_after(self, chat_id: str, position: int, limit: int = 50):
         """会话里 position 在这之后的消息, 按 position 排好。"""
         s = self.Session()

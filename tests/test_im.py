@@ -1,4 +1,8 @@
+import threading
+import time
+
 import pytest
+import requests
 from starlette.testclient import TestClient
 
 from larkx.storage import Storage
@@ -29,6 +33,18 @@ class FakeIMClient:
         self.by_id = {}       # pull_messages 能查到的消息
         self.pulled = []      # 记下 pull_history / pull_messages 的调用
         self.offline = False  # 置上后任何服务端请求都失败, 用来验证只读本地库的路径
+        self.last = 100       # 会话最新的 position
+        self.barrier = None   # 设上后查会话信息和拉消息要同时在进行才能继续(只验证一次), 用来验证两者是并发的
+        self.feed_calls = 0
+        self.feed_delay = 0
+        self.names_asked = []  # 单个查名字(get_user_name)的调用
+        self.feed = {'cards': [{'id': 1, 'type': 1, 'rankTime': 50}, {'id': 2, 'type': 1, 'rankTime': 40},
+                               {'id': 9, 'type': 13, 'rankTime': 30}, {'id': 3, 'type': 1, 'isHide': True}],
+                     'chats': {'1': {'name': '项目群', 'type': 2, 'lastMessagePositionBadgeCount': 7, 'readPositionBadgeCount': 4,
+                                     'isRemind': False},
+                               '2': {'name': '', 'type': 1, 'lastMessageId': 'm2', 'avatar': {'key': 'c2'}}},
+                     'messages': {'m2': {'fromId': '200', 'type': 4, 'content': b''}},
+                     'nextCursor': 123}
 
     def api(self, cmd, data=None):
         assert cmd in READ_ONLY_APIS, f'网页版飞书调用了不该调用的接口 {cmd}'
@@ -38,24 +54,29 @@ class FakeIMClient:
                       '300': {'name': 'Li', 'displayName': {'defaultVal': 'Li', 'i18nVals': {'zh_cn': '李四'}}}}
             return {'chatters': {u: people[u] for u in data['chatterIds'] if u in people}}
         assert cmd == 'feed.PullFeedCardsRequest'
-        return {'cards': [{'id': 1, 'type': 1, 'rankTime': 50}, {'id': 2, 'type': 1, 'rankTime': 40},
-                          {'id': 9, 'type': 13, 'rankTime': 30}, {'id': 3, 'type': 1, 'isHide': True}],
-                'chats': {'1': {'name': '项目群', 'type': 2, 'lastMessagePositionBadgeCount': 7, 'readPositionBadgeCount': 4,
-                                'isRemind': False},
-                          '2': {'name': '', 'type': 1, 'lastMessageId': 'm2', 'avatar': {'key': 'c2'}}},
-                'messages': {'m2': {'fromId': '200', 'type': 4, 'content': b''}},
-                'nextCursor': 123}
+        self.feed_calls += 1
+        time.sleep(self.feed_delay)
+        return self.feed
+
+    def _meet(self):
+        b = self.barrier
+        if b:
+            b.wait(timeout=2)
+            self.barrier = None
 
     def get_user_name(self, uid, chat_id):
+        self.names_asked.append(uid)
         return None
 
     def get_chat_info(self, chat_id):
         assert not self.offline, '不该访问服务端'
-        return {'name': '项目群', 'type': 2, 'lastMessagePosition': 100, 'firstChatMessagePosition': 60,
+        self._meet()
+        return {'name': '项目群', 'type': 2, 'lastMessagePosition': self.last, 'firstChatMessagePosition': 60,
                 'lastMessagePositionBadgeCount': 3, 'readPositionBadgeCount': 3, 'memberCount': 5, 'readPosition': self.chat_read}
 
     def pull_history(self, chat_id, positions, command_version=None):
         assert not self.offline, '不该访问服务端'
+        self._meet()
         positions = list(positions)
         self.pulled.append(('history', positions[0] if positions else None, positions[-1] if positions else None, command_version))
         return [self.history.get(p) or {
@@ -97,16 +118,20 @@ class FakeIMClient:
     def mark_read(self, *a, **k):
         raise AssertionError('网页版飞书不能标已读')
 
+    def note_chat(self, chat_id, info):
+        pass
+
 
 @pytest.fixture
 def ctx(tmp_path, monkeypatch):
     fake = FakeIMClient()
     monkeypatch.setattr(web, 'TOKEN_PATH', tmp_path / 'web_token')
     monkeypatch.setattr(im, 'client', lambda: fake)
+    monkeypatch.setattr(im, 'reader', lambda: fake)
     monkeypatch.setattr(im, '_owner_chat', lambda: 'self')
-    monkeypatch.setattr(im, '_profiles', {})
-    monkeypatch.setattr(im, '_p2p_names', {})
-    monkeypatch.setattr(im, '_quotes', {})
+    for cache in ('_profiles', '_name_tried', '_p2p_names', '_p2p_peers', '_quotes', '_chat_infos'):
+        monkeypatch.setattr(im, cache, {})
+    monkeypatch.setattr(im, '_feed', {'data': None, 'at': 0.0, 'flight': None})
     monkeypatch.setattr(im, 'READ_CHECK_DELAY', 0)
     c = TestClient(web.create_app())
     c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
@@ -309,3 +334,121 @@ def test_clean_keeps_only_readable_parts():
     assert im._clean('[系统消息] type=1 张三 加入了群聊') == '张三 加入了群聊'
     assert im._clean('[语音] 时长3.2s, key=abc') == '[语音] 3.2 秒'
     assert im._clean('[文件] a.pdf (application/pdf, 10字节, key=k)') == '[文件] a.pdf'
+
+
+def test_read_client_only_sends_queries_over_a_reused_connection(monkeypatch):
+    """只读客户端: 查询走复用的连接(连接刚好断了重试一次); 发消息、标已读这类命令一个请求都发不出去。"""
+    from larkx.protocol import client as client_mod, get_region
+    from larkx.protocol.proto import proto_pb2 as P
+    auth = type('A', (), {'user_id': '100', 'region': get_region('feishu'), 'gateway_app_id': '1', 'cookies': {}})()
+    rc = im.ReadClient(auth)
+    posts, fail = [], []
+
+    class Session:
+        def post(self, url, headers, cookies, data, timeout):
+            posts.append(headers['x-command'])
+            if fail:
+                raise fail.pop(0)
+            return type('R', (), {'content': P.Packet().SerializeToString(), 'raise_for_status': lambda self: None})()
+    rc.http = Session()
+    monkeypatch.setattr(client_mod.requests, 'post', lambda *a, **k: pytest.fail('只读客户端不该每次新建连接'))
+    rc.api('feed.PullFeedCardsRequest', {'type': 1})
+    assert posts == ['1000']
+    fail.append(requests.ConnectionError('连接被关闭'))
+    rc.get_chat_info('5')
+    assert posts[1:] == ['64', '64']
+    fail.append(requests.ConnectTimeout('超时'))  # 超时不重试
+    with pytest.raises(requests.ConnectTimeout):
+        rc.get_chat_info('5')
+    posts.clear()
+    assert rc.mark_read('5', 100) is False
+    assert rc.send_msg('hi', '5') is None
+    with pytest.raises(RuntimeError, match='只读客户端'):
+        rc.api('messages.PutReadMessagesRequest', {'chatId': '5', 'maxPosition': 1})
+    assert posts == []
+    # 记下会话模式后, 拉消息不再为此查会话信息
+    rc.note_chat('7', {'chatMode': 2})
+    assert rc.is_thread_chat('7') is True and posts == []
+
+
+def test_chat_open_queries_info_and_messages_together(ctx):
+    c, fake = ctx
+    # 第一次打开: 没有记下的会话信息, 先查信息再拉消息
+    d = c.get('/api/im/chat/5').json()
+    assert (d['start'], d['end']) == (71, 100) and fake.pulled == [('history', 71, 100, '7.72.0')]
+    # 再打开: 按记下的会话信息猜范围, 和查会话信息同时进行(两边要同时在进行才能通过 barrier); 多拉的新消息位置去掉
+    fake.barrier, fake.pulled = threading.Barrier(2), []
+    d = c.get('/api/im/chat/5').json()
+    assert (d['start'], d['end'], len(d['messages'])) == (71, 100, 30)
+    assert fake.pulled == [('history', 71, 120, '7.72.0')]
+    # 这期间来了新消息, 还在多拉的范围里: 不用补拉
+    fake.last, fake.pulled, fake.barrier = 110, [], threading.Barrier(2)
+    d = c.get('/api/im/chat/5').json()
+    assert (d['start'], d['end'], d['messages'][-1]['position']) == (81, 110, 110) and len(fake.pulled) == 1
+    # 新消息超出了多拉的范围: 补拉缺的那段
+    fake.last, fake.pulled, fake.barrier = 140, [], threading.Barrier(2)
+    d = c.get('/api/im/chat/5').json()
+    assert (d['start'], d['end']) == (111, 140) and [m['position'] for m in d['messages']] == list(range(111, 141))
+    assert fake.pulled[-1][1:3] == (131, 140)
+    # 往前翻也是同时查
+    fake.pulled, fake.barrier = [], threading.Barrier(2)
+    older = c.get('/api/im/chat/5?before=111&count=30').json()
+    assert (older['start'], older['end'], older['has_more']) == (81, 110, True) and fake.pulled == [('history', 81, 110, '7.72.0')]
+    # 定时取新消息: 记下的会话信息里没有新消息时只查会话信息, 有了再拉
+    fake.pulled = []
+    assert c.get('/api/im/chat/5?after=140').json()['messages'] == [] and fake.pulled == []
+    fake.last = 142
+    assert [m['position'] for m in c.get('/api/im/chat/5?after=140').json()['messages']] == [141, 142]
+
+
+def test_feed_requests_share_one_query_and_cached_returns_last(ctx):
+    c, fake = ctx
+    assert c.get('/api/im/feed?cached=1').json()['items']  # 还没有上一次的结果: 正常查
+    assert fake.feed_calls == 1
+    d = c.get('/api/im/feed?cached=1').json()
+    assert d['cached'] is True and [i['chat_id'] for i in d['items']] == ['1', '2'] and fake.feed_calls == 1
+    # 同时来的几个请求共用一次查询
+    fake.feed_delay = 0.3
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(im._first_feed_page())) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert fake.feed_calls == 2 and len(out) == 3 and all(o is out[0] for o in out)
+    # 之后的请求照常查新的
+    fake.feed_delay = 0
+    c.get('/api/im/feed')
+    assert fake.feed_calls == 3
+
+
+def test_unnamed_senders_are_not_looked_up_every_time(ctx):
+    c, fake = ctx
+    fake.history[100] = {'msg_id': '100', 'position': 100, 'from_id': '999', 'create_time': 100, 'msg_type': 4,
+                         'content': '机器人发的', 'content_data': None}
+    for _ in range(3):
+        assert c.get('/api/im/chat/5?count=5').json()['messages'][-1]['sender'] == ''
+    assert fake.names_asked == ['999']
+    im._name_tried['999'] -= im.NAME_RETRY + 1  # 过了一阵再试
+    c.get('/api/im/chat/5?count=5')
+    assert fake.names_asked == ['999', '999']
+
+
+def test_p2p_peer_found_in_local_storage_first(ctx):
+    c, fake = ctx
+    # 私聊最后一条是本人发的: 先查本地库里对方发过的消息, 不去服务端拉
+    fake.feed['messages']['m2']['fromId'] = '100'
+    fake.feed['chats']['2']['lastMessagePosition'] = 5
+    Storage().save_message({'msg_id': 'x1', 'chat_id': '2', 'from_id': '200', 'msg_type': 4, 'position': 3, 'content': 'hi'})
+    items = {i['chat_id']: i for i in c.get('/api/im/feed').json()['items']}
+    assert items['2']['name'] == '张三(备注)'
+    assert fake.pulled == []
+    # 本地库也没有: 去服务端拉最近 10 条找对方
+    fake.feed['chats']['4'] = {'name': '', 'type': 1, 'lastMessageId': 'm4', 'lastMessagePosition': 8}
+    fake.feed['messages']['m4'] = {'fromId': '100', 'type': 4, 'content': b''}
+    fake.feed['cards'].append({'id': 4, 'type': 1, 'rankTime': 20})
+    items = {i['chat_id']: i for i in c.get('/api/im/feed').json()['items']}
+    assert items['4']['name'] == '李四' and fake.pulled == [('history', 1, 8, None)]
+    # 找到过就记住了
+    c.get('/api/im/feed')
+    assert len(fake.pulled) == 1

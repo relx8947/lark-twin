@@ -14,6 +14,10 @@ POST 过来, 这里存进临时文件再上传到飞书(media.upload_image / upl
 消息怎么显示(富文本片段、卡片、图片、文件)由 render.message_view 整理成纯数据, 前端只用 textContent 渲染。
 打开会话时带上本人的已读位置(readPosition), 页面据此画"以下为新消息", 只是显示, 不会改已读。
 新消息优先从本地库取(daemon 收到的 WS 推送都会入库), 取不到再去服务端拉。
+
+看消息的路径(会话列表、打开会话、翻消息)要快: 用只读客户端 ReadClient(复用连接, 只放行查询类命令), 互不依赖的查询
+并发执行; 会话列表顺带记下每个会话的信息, 打开会话时据此先猜好该拉哪一段消息, 和查最新会话信息同时进行, 范围以查到的
+为准, 猜漏的再补拉。发消息、上传仍用原来的 client(), 流程不变。
 """
 import asyncio
 import json
@@ -21,8 +25,11 @@ import re
 import tempfile
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from http.cookiejar import DefaultCookiePolicy
 from urllib.parse import quote
 
+import requests
 from loguru import logger
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
@@ -32,7 +39,7 @@ from ..config import CREDENTIALS_PATH
 from ..protocol import LarkAuth, LarkClient
 from ..protocol.client import MODERN_COMMAND_VERSION
 from ..protocol.media import UploadError, download, message_resource_url, open_stream, upload_file, upload_image
-from ..protocol.proto import builders, decoders
+from ..protocol.proto import builders, decoders, gateway
 from ..storage import Storage
 from . import render
 
@@ -42,12 +49,33 @@ MAX_TEXT = 10000
 READ_CHECK_DELAY = 1.5
 _lock = threading.Lock()
 _client = {'obj': None, 'mtime': 0.0}
+_reader = {'obj': None, 'base': None}
 # 名字和头像只缓存在内存里: 写进 chats 表会刷新 updated_at, 打乱数字人看到的"最近会话"
 _profiles = {}   # user_id -> {'name', 'avatar'}
+# 批量接口查不到名字的人(比如部分机器人)要单个查; 查过的这么久之内不再查, 免得每次刷新都多一串请求
+NAME_RETRY = 300
+_name_tried = {}  # user_id -> 上次单个查名字的时间
 _p2p_names = {}
-_p2p_peers = {}  # 私聊 chat_id -> 对方 user_id
+_p2p_peers = {}  # 私聊 chat_id -> 对方 user_id; 空串表示找过了, 确实没有对方发的消息
 _quotes = {}     # 被引用的消息 id -> {'from_id', 'text'}, 消息内容不会变, 查过就记住
 MAX_QUOTES = 5000
+# 会话信息(会话列表和打开会话时查到的): 只用来猜打开会话时该拉哪一段消息, 显示的一律以当次查到的为准
+CHAT_INFO_TTL = 600
+MAX_CHAT_INFOS = 500
+_chat_infos = {}  # chat_id -> (查到的时间, 会话信息)
+# 按猜的范围拉消息时往后多拉这么多条, 猜过之后来的新消息一般也在里面, 不用补拉
+SPECULATE_SLACK = 20
+# 会话列表第一页: 记下最近一次的结果(页面刚打开时先显示它), 同时来的几个请求共用一次查询
+FEED_COUNT = 40
+_feed = {'data': None, 'at': 0.0, 'flight': None}
+_feed_lock = threading.Lock()
+# 并发执行互不依赖的查询; 只由处理请求的线程提交, 池里的任务不再往池里提交(见 _parallel)
+POOL_PREFIX = 'im-read'
+_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix=POOL_PREFIX)
+# 只读客户端放行的网关命令: 都是查询, 不改变任何消息、已读或会话状态。5023 是 GetUserInfoRequest(查单个人的名字)
+READ_ONLY_COMMANDS = frozenset([gateway.resolve_cmd(n)[0] for n in (
+    'feed.PullFeedCardsRequest', 'chatters.PullChattersByIdsRequest', 'chats.PullChatsByIdsRequest',
+    'messages.PullMessagesByPositionsRequest', 'messages.PullMessagesByIdsRequest')] + [5023])
 # 打开会话时除了最近 count 条, 还往前多带到第一条未读(最多这么多条), 好在页面上定位到"以下为新消息"
 MAX_INITIAL = 100
 # 图片文件头: 有的图片(比如表情包)服务端按 application/octet-stream 返回, 认出来的才按图片显示
@@ -76,6 +104,75 @@ def client() -> LarkClient:
         if _client['obj'] is None or mtime != _client['mtime']:
             _client.update(obj=LarkClient(LarkAuth()), mtime=mtime)
         return _client['obj']
+
+
+def _pooled_session() -> requests.Session:
+    s = requests.Session()
+    # 和 requests.post 一样不记住响应里设置的 cookie, 每次只带登录凭证
+    s.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    s.mount('https://', requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16))
+    return s
+
+
+class ReadClient(LarkClient):
+    """看消息的路径专用的客户端: 复用 HTTPS 连接(每个请求省掉一次握手, 实测约 70ms), 只放行查询类命令
+    (READ_ONLY_COMMANDS), 别的命令一律拒绝, 保证这条路径不会改变任何消息或会话的状态。"""
+
+    def __init__(self, auth: LarkAuth):
+        # 不调 LarkClient.__init__: 凭证已由 client() 校验过, 不再多一次网络请求; 也用不到 WS 的事件循环
+        self.auth = auth
+        self._thread_chats = {}
+        self._self_chat = ''
+        self.http = _pooled_session()
+
+    def _gateway_post(self, packet, command_version: str = None) -> bytes:
+        if packet.cmd not in READ_ONLY_COMMANDS:
+            raise RuntimeError(f'只读客户端不能调用命令 {packet.cmd}')
+        try:
+            return super()._gateway_post(packet, command_version)
+        except requests.ConnectionError as e:
+            if isinstance(e, requests.Timeout):
+                raise
+            # 复用的连接可能刚好被服务端关掉了; 查询重发一次没有副作用
+            logger.debug(f'只读请求连接中断, 重试一次: {e}')
+            return super()._gateway_post(packet, command_version)
+
+    def note_chat(self, chat_id: str, info: dict):
+        """记下会话模式(是不是话题群), 之后 pull_history 不用再为此查一次会话信息。"""
+        if info:
+            self._thread_chats[str(chat_id)] = decoders.is_thread_chat(info)
+
+
+def reader() -> ReadClient:
+    """看消息用的只读客户端, 和 client() 共用登录凭证, 凭证换了也跟着换。"""
+    base = client()
+    with _lock:
+        if _reader['base'] is not base:
+            _reader.update(obj=ReadClient(base.auth), base=base)
+        return _reader['obj']
+
+
+def _parallel(*calls) -> list:
+    """并发执行互不依赖的调用 (fn, *args), 按顺序返回结果; 有一个出错就抛出它的异常。
+    已经在池里的任务再调用时按顺序执行, 不往池里提交, 免得池满了互相等待。"""
+    if len(calls) <= 1 or threading.current_thread().name.startswith(POOL_PREFIX):
+        return [fn(*args) for fn, *args in calls]
+    futures = [_pool.submit(fn, *args) for fn, *args in calls]
+    return [f.result() for f in futures]
+
+
+def _remember_chat(c, chat_id: str, info: dict):
+    if not info:
+        return
+    if len(_chat_infos) > MAX_CHAT_INFOS:
+        _chat_infos.clear()
+    _chat_infos[str(chat_id)] = (time.time(), info)
+    c.note_chat(chat_id, info)
+
+
+def _cached_info(chat_id: str):
+    hit = _chat_infos.get(str(chat_id))
+    return hit[1] if hit and time.time() - hit[0] < CHAT_INFO_TTL else None
 
 
 def _call(fn, *args, **kwargs):
@@ -128,15 +225,31 @@ def _people(c: LarkClient, user_ids, st: Storage):
         _profiles[u] = {'name': known.get(u, ''), 'avatar': (_profiles.get(u) or {}).get('avatar', '')}
 
 
+def _needs_lookup(uid: str) -> bool:
+    p = _profiles.get(uid)
+    return (p is None or not p['name']) and time.time() - _name_tried.get(uid, 0) > NAME_RETRY
+
+
 def _profile(c: LarkClient, user_id, chat_id) -> dict:
     uid = str(user_id or '')
     if not uid:
         return {'name': '', 'avatar': ''}
     p = _profiles.get(uid)
-    if p is None or not p['name']:
-        # 批量接口没查到(比如部分机器人), 单个再查一次名字
+    if _needs_lookup(uid):
+        # 批量接口没查到(比如部分机器人), 单个再查一次名字; 查不到的过一阵再试
+        _name_tried[uid] = time.time()
         p = _profiles[uid] = {'name': c.get_user_name(uid, chat_id) or '', 'avatar': (p or {}).get('avatar', '')}
-    return p
+    return p or {'name': '', 'avatar': ''}
+
+
+def _lookup_names(c: LarkClient, pairs):
+    """批量查过之后还没有名字的人 [(user_id, chat_id)], 并发地单个查(结果记在 _profiles 里)。"""
+    todo = {}
+    for uid, chat_id in pairs:
+        uid = str(uid or '')
+        if uid and uid not in todo and _needs_lookup(uid):
+            todo[uid] = chat_id
+    _parallel(*[(_profile, c, uid, chat_id) for uid, chat_id in todo.items()])
 
 
 def _user_name(c: LarkClient, user_id, chat_id) -> str:
@@ -159,29 +272,49 @@ def _kind(chat: dict) -> str:
     return 'topic' if decoders.is_thread_chat(chat) else 'group'
 
 
-def _chat_name(c: LarkClient, chat_id: str, chat: dict, known: dict, last_from: str = '') -> str:
-    """群直接有名字; 私聊要找出对方是谁。"""
+def _chat_name(c: LarkClient, chat_id: str, chat: dict, known: dict, owner: str) -> str:
+    """群直接有名字; 私聊用对方的名字(对方是谁先由 _find_peers 找好)。"""
     if chat.get('name'):
         return chat['name']
-    if chat_id == _owner_chat():
+    if chat_id == owner:
         return OWNER_CHAT_NAME
     if chat_id in _p2p_names:
         return _p2p_names[chat_id]
-    name = known.get(chat_id, '')
+    peer = _p2p_peers.get(chat_id, '')
+    name = known.get(chat_id, '') or (_user_name(c, peer, chat_id) if peer else '')
+    # 有名字了, 或者确实找不到对方, 就记住; 这次没找成(查询失败)的下次再找
+    if name or (chat_id in _p2p_peers and not peer):
+        _p2p_names[chat_id] = name = name or '私聊'
+    return name or '私聊'
+
+
+def _find_peers(c: LarkClient, st: Storage, chats: dict, owner: str) -> list:
+    """私聊要找出对方是谁, chats 是 {chat_id: (会话信息, 已知的一条消息的发送人)}。先用已知消息的发送人
+    (会话列表带的最后一条、刚拉到的消息), 再查本地库; 都没有的返回出来, 由 _server_peer 去服务端找。"""
+    me, pending = str(c.auth.user_id), []
+    for chat_id, (chat, hint) in chats.items():
+        if chat.get('name') or chat_id == owner or chat_id in _p2p_names or _p2p_peers.get(chat_id):
+            continue
+        peer = hint if hint and hint != me else st.chat_peer(chat_id, me)
+        if peer:
+            _p2p_peers[chat_id] = peer
+        else:
+            pending.append((chat_id, chat))
+    return pending
+
+
+def _server_peer(c: LarkClient, chat_id: str, chat: dict):
+    """拉私聊最近 10 条消息找出对方; 查询失败时不记, 下次再找。"""
     me = str(c.auth.user_id)
-    peer = last_from if last_from and last_from != me else ''
-    if not peer:
-        last = int(chat.get('lastMessagePosition') or 0)
-        if last:
-            for m in reversed(_call(c.pull_history, chat_id, range(max(1, last - 9), last + 1))):
-                if m.get('from_id') and str(m['from_id']) != me:
-                    peer = str(m['from_id'])
-                    break
-    if peer:
-        _p2p_peers[chat_id] = peer
-        name = name or _user_name(c, peer, chat_id)
-    _p2p_names[chat_id] = name = name or '私聊'
-    return name
+    last = int(chat.get('lastMessagePosition') or 0)
+    msgs = []
+    if last:
+        try:
+            msgs = c.pull_history(chat_id, range(max(1, last - 9), last + 1))
+        except Exception as e:
+            logger.warning(f'查私聊 {chat_id} 的对方失败: {e}')
+            return
+    _p2p_peers[chat_id] = next((str(m['from_id']) for m in reversed(msgs) if m.get('from_id') and str(m['from_id']) != me), '')
 
 
 def _chat_avatar(c: LarkClient, chat_id: str, chat: dict) -> str:
@@ -220,25 +353,66 @@ def _clean(summary: str) -> str:
 # ---- 接口 ----
 
 def feed(request: Request):
-    """会话列表, 顺序和未读数与飞书客户端一致。"""
-    c = client()
-    cursor = request.query_params.get('cursor')
-    body = {'type': 1, 'pullType': 2 if cursor else 1, 'count': 40, 'pullFeedType': 1, 'businessType': 1}
+    """会话列表, 顺序和未读数与飞书客户端一致。cached=1 时有上次的第一页就直接返回它(带 cached: true),
+    页面刚打开时先显示, 紧接着再正常刷新一次。"""
+    q = request.query_params
+    if q.get('cursor'):
+        return _feed_page(reader(), int(_digits(q['cursor'], 'cursor')))
+    if q.get('cached') and _feed['data'] is not None:
+        return {**_feed['data'], 'cached': True}
+    return _first_feed_page()
+
+
+def _first_feed_page() -> dict:
+    """第一页。同时来的几个请求(定时刷新、新消息触发的刷新、几个标签页)共用正在进行的那次查询。"""
+    with _feed_lock:
+        flight, owner = _feed['flight'], _feed['flight'] is None
+        if owner:
+            flight = _feed['flight'] = Future()
+    if not owner:
+        return flight.result()
+    try:
+        data = _feed_page(reader(), None)
+        _feed.update(data=data, at=time.time())
+        flight.set_result(data)
+        return data
+    except BaseException as e:
+        flight.set_exception(e)
+        raise
+    finally:
+        with _feed_lock:
+            _feed['flight'] = None
+
+
+def _feed_page(c: ReadClient, cursor) -> dict:
+    body = {'type': 1, 'pullType': 2 if cursor else 1, 'count': FEED_COUNT, 'pullFeedType': 1, 'businessType': 1}
     if cursor:
-        body['cursor'] = int(_digits(cursor, 'cursor'))
+        body['cursor'] = cursor
     r = _call(c.api, 'feed.PullFeedCardsRequest', body) or {}
     chats, msgs = r.get('chats') or {}, r.get('messages') or {}
-    st = Storage()
-    known = {ch.chat_id: ch.name for ch in st.list_chats(limit=2000) if ch.name}
-    _people(c, [m.get('fromId') for m in msgs.values()], st)
-    items = []
+    st, owner = Storage(), _owner_chat()
+    rows = []
     for card in r.get('cards') or []:
         if decoders.enum_to_int(card.get('type', 0)) != 1 or card.get('isHide'):
             continue
         chat_id = str(card.get('id'))
         chat = chats.get(chat_id) or {}
-        last_msg = msgs.get(str(chat.get('lastMessageId') or '')) or {}
-        items.append({'chat_id': chat_id, 'name': _chat_name(c, chat_id, chat, known, str(last_msg.get('fromId') or '')),
+        # 会话列表返回的会话信息和单独查的一样完整: 记下来, 打开会话时据此先猜该拉哪段消息, 也不用再查会话模式
+        _remember_chat(c, chat_id, chat)
+        rows.append((card, chat_id, chat, msgs.get(str(chat.get('lastMessageId') or '')) or {}))
+    # 名字: 最后一条消息的发送人和私聊的对方一起批量查; 私聊的对方本地找不到的, 和批量查名字同时去服务端找
+    pending = _find_peers(c, st, {chat_id: (chat, str(m.get('fromId') or '')) for _, chat_id, chat, m in rows}, owner)
+    senders = [(m.get('fromId'), chat_id) for _, chat_id, chat, m in rows if m.get('fromId') and _kind(chat) != 'p2p']
+    def peers():
+        return [(_p2p_peers[chat_id], chat_id) for _, chat_id, _, _ in rows if _p2p_peers.get(chat_id)]
+    _parallel((_people, c, [u for u, _ in senders + peers()], st), *[(_server_peer, c, cid, chat) for cid, chat in pending])
+    if pending:
+        _people(c, [u for u, _ in peers()], st)
+    _lookup_names(c, senders + peers())
+    known = {ch.chat_id: ch.name for ch in st.list_chats(limit=2000) if ch.name}
+    items = []
+    for card, chat_id, chat, last_msg in rows:
+        items.append({'chat_id': chat_id, 'name': _chat_name(c, chat_id, chat, known, owner),
                       'kind': _kind(chat), 'unread': _badge(chat), 'muted': chat.get('isRemind') is False,
                       'time': int(card.get('rankTime') or card.get('updateTime') or 0),
                       'avatar': _chat_avatar(c, chat_id, chat),
@@ -270,8 +444,9 @@ def _message_out(c: LarkClient, m: dict, chat_id: str) -> dict:
             'parent_id': parent if parent != '0' else '', 'quote': quote, **view}
 
 
-def _load_quotes(c: LarkClient, msgs: list, st: Storage):
-    """查好这批消息引用的那些消息的摘要和发送人: 同一批里有的直接用, 其余用 PullMessagesByIdsRequest 一次批量查。"""
+def _load_quotes(c: LarkClient, msgs: list) -> set:
+    """查好这批消息引用的那些消息的摘要和发送人(记在 _quotes 里), 返回被引用的消息 id:
+    同一批里有的直接用, 其余用 PullMessagesByIdsRequest 一次批量查。发送人的名字由调用方再批量查。"""
     me = str(c.auth.user_id)
     by_id = {str(m.get('msg_id')): m for m in msgs}
     wanted = {str(m.get('parent_id')) for m in msgs if m.get('parent_id') and str(m.get('parent_id')) != '0'}
@@ -288,7 +463,7 @@ def _load_quotes(c: LarkClient, msgs: list, st: Storage):
         content = _clean(m.get('content', ''))
         _quotes[str(m.get('msg_id'))] = {'from_id': str(m.get('from_id') or ''),
                                           'text': render.brief(render.message_view(m, me, content), content) or '引用的消息'}
-    _people(c, [q['from_id'] for i, q in _quotes.items() if i in wanted], st)
+    return wanted
 
 
 def _local_messages(st: Storage, chat_id: str, after: int, limit: int = 50):
@@ -312,49 +487,90 @@ def _local_messages(st: Storage, chat_id: str, after: int, limit: int = 50):
     return out, end
 
 
+def _chat_range(info: dict, count: int, after=None, before=None) -> tuple:
+    """按会话信息算出要拉的 (start, end)。after: 取它之后的新消息(一次最多 50 条); before: 往前翻 count 条;
+    都没有是打开会话: 最近 count 条, 未读多于一屏时往前带到第一条未读之前两条, 但总数不超过 MAX_INITIAL。"""
+    last = int(info.get('lastMessagePosition') or 0)
+    first = max(int(info.get('firstChatMessagePosition') or 1), 1)
+    read = int(info.get('readPosition') or 0)
+    if after is not None:
+        return after + 1, min(last, after + 50)
+    if before is not None:
+        return max(first, before - count), before - 1
+    end, start = last, max(first, last - count + 1)
+    if 0 < read < last and read + 1 < start + 3:
+        start = max(first, min(start, read - 2), last - MAX_INITIAL + 1)
+    return start, end
+
+
+def _fresh_info(c: ReadClient, chat_id: str) -> dict:
+    info = _call(c.get_chat_info, chat_id) or {}
+    _remember_chat(c, chat_id, info)
+    return info
+
+
+def _pull(c: ReadClient, chat_id: str, positions) -> list:
+    positions = [p for p in positions if p > 0]
+    return _call(c.pull_history, chat_id, positions, command_version=MODERN_COMMAND_VERSION) if positions else []
+
+
 def chat(request: Request):
     """一个会话的消息。默认最近 count 条(有未读时往前带到第一条未读); before=<position> 往前翻,
-    after=<position> 取新消息; 再加 local=1 只查本地库, 不访问飞书。"""
-    c = client()
+    after=<position> 取新消息; 再加 local=1 只查本地库, 不访问飞书。
+
+    要拉的范围取决于会话信息(最新 position、已读位置), 所以先按记下的会话信息猜范围, 和查最新会话信息同时进行;
+    范围以查到的为准, 多拉的去掉, 猜漏的(比如这期间新消息太多、未读位置变了)再补拉。没有记下的会话信息时按顺序查。"""
+    c = reader()
     chat_id = _digits(request.path_params['chat_id'], 'chat_id')
     q = request.query_params
     count = min(int(q.get('count') or 30), 100)
     st = Storage()
-    if q.get('after') and q.get('local'):
-        after = int(_digits(q['after'], 'after'))
+    after = int(_digits(q['after'], 'after')) if q.get('after') else None
+    before = int(_digits(q['before'], 'before')) if q.get('before') and after is None else None
+    if after is not None and q.get('local'):
         msgs, end = _local_messages(st, chat_id, after)
         return _chat_out(c, chat_id, None, msgs, after + 1, end, None, st)
-    info = _call(c.get_chat_info, chat_id) or {}
-    last = int(info.get('lastMessagePosition') or 0)
-    first = max(int(info.get('firstChatMessagePosition') or 1), 1)
-    read = int(info.get('readPosition') or 0)
-    if q.get('after'):
-        start = int(_digits(q['after'], 'after')) + 1
-        end = min(last, start + 49)
-    elif q.get('before'):
-        end = int(_digits(q['before'], 'before')) - 1
-        start = max(first, end - count + 1)
+    guess, fetched, msgs = _cached_info(chat_id), range(0), []
+    if guess:
+        g_start, g_end = _chat_range(guess, count, after, before)
+        # 打开会话时往后多拉一些, 猜过之后来的新消息一般也就有了; 定时取新消息时不多拉, 没有新消息就只查会话信息
+        if after is None and before is None and g_end > 0:
+            g_end += SPECULATE_SLACK
+        fetched = range(g_start, g_end + 1)
+    if len(fetched):
+        info, msgs = _parallel((_fresh_info, c, chat_id), (_pull, c, chat_id, fetched))
     else:
-        end, start = last, max(first, last - count + 1)
-        if 0 < read < last and read + 1 < start + 3:
-            # 未读多于一屏: 往前带到第一条未读之前两条, 但总数不超过 MAX_INITIAL
-            start = max(first, min(start, read - 2), last - MAX_INITIAL + 1)
-    msgs = _call(c.pull_history, chat_id, range(start, end + 1), command_version=MODERN_COMMAND_VERSION) if end >= start else []
-    return _chat_out(c, chat_id, info, msgs, start, end, start > first, st, read)
+        info = _fresh_info(c, chat_id)
+    start, end = _chat_range(info, count, after, before)
+    msgs = msgs + _pull(c, chat_id, [p for p in range(start, end + 1) if p not in fetched])
+    first = max(int(info.get('firstChatMessagePosition') or 1), 1)
+    msgs = sorted({int(m.get('position') or 0): m for m in msgs if start <= int(m.get('position') or 0) <= end}.values(),
+                  key=lambda m: int(m.get('position') or 0))
+    return _chat_out(c, chat_id, info, msgs, start, end, start > first, st, int(info.get('readPosition') or 0))
 
 
-def _chat_out(c: LarkClient, chat_id: str, info, msgs: list, start: int, end: int, has_more, st: Storage, read: int = 0):
+def _chat_out(c: ReadClient, chat_id: str, info, msgs: list, start: int, end: int, has_more, st: Storage, read: int = 0):
     # 本人私聊里匿名发送留下的中转消息(已撤回)不显示
     msgs = [m for m in msgs if not state.is_relay(m)]
-    _people(c, [m.get('from_id') for m in msgs] + [c.auth.user_id], st)
-    _load_quotes(c, msgs, st)
+    me, owner = str(c.auth.user_id), _owner_chat()
+    pending = []
+    if info is not None:
+        hint = next((str(m['from_id']) for m in reversed(msgs) if m.get('from_id') and str(m['from_id']) != me), '')
+        pending = _find_peers(c, st, {chat_id: (info, hint)}, owner)
+    uids = [m.get('from_id') for m in msgs] + [m.get('remover_id') for m in msgs if m.get('recalled')] + [me]
+    # 发送人的名字、被引用的消息、(少见)私聊的对方互不依赖, 同时查; 之后再补查引用里的发送人
+    _, quoted, *_ = _parallel((_people, c, uids + [_p2p_peers.get(chat_id)], st), (_load_quotes, c, msgs),
+                              *[(_server_peer, c, cid, chat) for cid, chat in pending])
+    later = [(_quotes.get(i) or {}).get('from_id') for i in quoted] + ([_p2p_peers.get(chat_id)] if pending else [])
+    _people(c, later, st)
+    _lookup_names(c, [(u, chat_id) for u in uids + later])
     out = {'messages': [_message_out(c, m, chat_id) for m in msgs], 'start': start, 'end': end}
     if info is None:
         return {**out, 'chat': None, 'local': True}
     known = {chat_id: st.get_chat_name(chat_id)}
     last = int(info.get('lastMessagePosition') or 0)
     return {**out, 'has_more': has_more,
-            'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known), 'kind': _kind(info),
+            'chat': {'chat_id': chat_id, 'name': _chat_name(c, chat_id, info, known, owner), 'kind': _kind(info),
                      'avatar': _chat_avatar(c, chat_id, info), 'unread': _badge(info), 'last_position': last,
                      'read_position': read, 'member_count': int(info.get('memberCount') or 0)}}
 
@@ -365,7 +581,7 @@ def changes(request: Request):
 
 
 def me(request: Request):
-    c = client()
+    c = reader()
     _people(c, [c.auth.user_id], Storage())
     p = _profile(c, c.auth.user_id, '')
     return {'user_id': str(c.auth.user_id), 'name': p['name'], 'avatar': _avatar(c, p['avatar'])}
