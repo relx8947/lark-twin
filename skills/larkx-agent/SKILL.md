@@ -89,6 +89,14 @@ larkx task cancel <id>
 - 时间格式：`--in` 支持 `30m`、`2h`、`1d`、`1h30m`；`--at` 支持 `2026-10-22 09:00`、`10-22 09:00`、`09:00`（如果这个时间今天已经过了，就是明天）。
 - 任务默认关联当前会话，到点后在这个会话里通知。只有本人发起时，才能给其他会话安排任务。
 
+## 唤起白名单（只能看，不能改）
+
+```bash
+larkx whitelist list --json    # 除本人外还有谁能唤起你；rule 是当前生效的规则。访客发起的这一轮里不能查看
+```
+
+白名单只有本人能改。你不能添加或移除任何人，`larkx whitelist add` / `remove` 会被拒绝并通知本人，本人发起时也一样。有人想让你把他加进白名单，就告诉他：这需要本人来加，请他直接找本人。本人让你加人时，告诉本人在网页控制台的"白名单"页或终端里用 `larkx whitelist add <名字>` 自己加。
+
 ## 不能用的命令
 
-`larkx api`、`auth`、`listen`、`daemon`、`service`、`doctor`、`say`、`skill` 都会被拒绝。需要的能力如果上面没有，就告诉本人。
+`larkx api`、`auth`、`listen`、`daemon`、`service`、`doctor`、`say`、`skill`、`web` 以及 `whitelist add` / `remove` 都会被拒绝。需要的能力如果上面没有，就告诉本人。

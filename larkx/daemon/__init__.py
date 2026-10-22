@@ -75,6 +75,7 @@ class Daemon:
         print(f'  数字人目录: {self.home}', flush=True)
         print(f'  触发前缀: {t.get("prefix") or "(全部消息)"}  允许自己触发: {self.cfg.get("allow_self")}', flush=True)
         print(f'  群里别人需 @我: {bool(t.get("group_at_only"))}  只有本人能唤起: {bool(t.get("owner_only"))}', flush=True)
+        print(f'  唤起白名单: {len(self.storage.whitelist_ids())} 人(非空时只有本人和白名单里的人能唤起, 改了立即生效)', flush=True)
         print('─' * 56, flush=True)
 
     async def run(self):
@@ -109,7 +110,9 @@ class Daemon:
         is_owner = str(msg.get('from_id')) == str(self.auth.user_id)
         chat_id = str(msg['chat_id'])
         tk = None if is_owner else self.storage.takeover_get(chat_id, time.time())
-        if not tk and not should_handle(msg, self.cfg, self.auth.user_id):
+        # 白名单每条都现查: 命令行、网页改了立即生效, 不用重启
+        if not tk and not should_handle(msg, self.cfg, self.auth.user_id,
+                                        whitelist=() if is_owner else self.storage.whitelist_ids()):
             return
         age = time.time() - float(msg.get('create_time') or time.time())
         if age > self.cfg['inbox_max_age']:

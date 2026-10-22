@@ -296,7 +296,7 @@ async function viewActivity() {
       h('tbody', {}, rows.map(r => h('tr', { class: 'act' },
         h('td', { class: 'muted nowrap' }, fmt(r.time)),
         h('td', { class: 'nowrap' }, r.actor === 'agent' ? '数字人' : '本人', r.turn_kind ? h('div', { class: 'muted', style: 'font-size:11.5px' }, KIND[r.turn_kind] || r.turn_kind) : null),
-        h('td', { class: 'nowrap' }, { send: '发消息', recall: '撤回' }[r.action] || r.action),
+        h('td', { class: 'nowrap' }, { send: '发消息', recall: '撤回', whitelist: '白名单' }[r.action] || r.action),
         h('td', { style: 'min-width:120px;max-width:220px' }, h('div', { class: 'lines2', title: chatLabel(r.chat_id, r.chat_name) }, chatLabel(r.chat_id, r.chat_name))),
         h('td', { style: 'width:50%', class: r.recalled ? 'muted' : null }, clamp(r.content)),
         h('td', { class: 'nowrap' }, r.ok ? '✓' : h('span', { class: 'tag bad', title: r.error }, '✗ ' + (r.error || '').slice(0, 40))),
@@ -372,6 +372,78 @@ async function viewTakeovers() {
       t.goal ? h('div', { class: 'body' }, t.goal) : null))) : h('div', { class: 'empty' }, '当前没有接管中的会话'));
   }
   every(10000, refresh);
+}
+
+// ---- 白名单 ----
+
+// 头像来自飞书的公开 CDN; 加载不了时退回名字的第一个字
+function avatar(p) {
+  const initial = h('span', { class: 'avatar ph', 'aria-hidden': 'true' }, (p.name || '?').slice(0, 1));
+  if (!p.avatar) return initial;
+  return h('img', { class: 'avatar', src: p.avatar, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer',
+    onerror: e => e.target.replaceWith(initial) });
+}
+
+function personRow(p, attrs, ...right) {
+  return h('div', Object.assign({ class: 'person' }, attrs), avatar(p),
+    h('div', { class: 'who' },
+      h('div', { class: 'name' }, h('b', {}, p.name || '(无名字)'), p.department ? h('span', { class: 'sec' }, p.department) : null),
+      h('div', { class: 'muted mono' }, 'user_id ' + p.user_id)),
+    h('div', { style: 'flex:1' }), ...right);
+}
+
+async function viewWhitelist() {
+  page('白名单', h('span', { class: 'muted' }, '除了你，还有谁能唤起数字人'));
+  const rule = card(null);
+  const q = h('input', { type: 'text', placeholder: '输入名字搜人，例如：张伟', autocomplete: 'off', style: 'flex:1;min-width:220px' });
+  const results = h('div', { class: 'people' });
+  card('添加', h('p', { class: 'sec', style: 'margin-top:0' }, '搜到同名的人时，看头像和部门分清是谁，点一下就加进白名单。'),
+    h('div', { class: 'row' }, q), results);
+  const list = card('白名单');
+  let st = { entries: [] }, found = null, seq = 0, debounce = null;
+  const listed = () => new Set(st.entries.map(e => e.user_id));
+
+  function draw() {
+    put(rule, h('div', { class: 'rule' }, st.rule),
+      h('p', { class: 'muted', style: 'margin:8px 0 0' },
+        st.entries.length ? '白名单里的人和其他人一样按访客对待，不会拿到你的权限。'
+          : `白名单是空的，按 LARKX_TRIGGER_OWNER_ONLY（现在${st.owner_only ? '打开' : '没打开'}）决定。加了人之后，就只有你和白名单里的人能唤起。`,
+        '改动立即生效，不用重启；数字人自己改不了白名单。'));
+    put(list, h('h2', {}, `白名单（${st.entries.length}）`),
+      st.entries.length ? h('div', { class: 'people' }, st.entries.map(p => personRow(p, {},
+        h('span', { class: 'muted', style: 'font-size:12px' }, fmt(p.added_at) + (p.added_by === 'cli' ? ' 命令行添加' : ' 网页添加')),
+        h('button', { class: 'btn small danger', onclick: () => confirm(`把 ${p.name || p.user_id} 移出白名单?`) && act(async () => {
+          st = await api(`/api/whitelist/${encodeURIComponent(p.user_id)}`, { method: 'DELETE' }); draw();
+        }, `已把 ${p.name || p.user_id} 移出白名单`) }, '移除'))))
+        : h('div', { class: 'empty' }, '还没有人。在上面搜名字添加。'));
+    if (found == null) { put(results); return; }
+    const ids = listed();
+    put(results, found.people.length ? found.people.map(p => {
+      if (p.is_owner) return personRow(p, {}, h('span', { class: 'tag owner' }, '你自己，一直能唤起'));
+      if (ids.has(p.user_id)) return personRow(p, {}, h('span', { class: 'tag' }, '已在白名单'));
+      return personRow(p, { class: 'person pick', title: `把 ${p.name} 加进白名单`, onclick: () => add(p) },
+        h('button', { class: 'btn small primary' }, '添加'));
+    }) : h('div', { class: 'empty' }, `没有搜到「${found.query}」`));
+  }
+
+  const add = p => act(async () => {
+    st = await api('/api/whitelist', { method: 'POST', body: { user_id: p.user_id, name: p.name, department: p.department, avatar_key: p.avatar_key } });
+    draw();
+  }, `已把 ${p.name} 加进白名单`);
+
+  async function search() {
+    const text = q.value.trim(), my = ++seq;
+    if (!text) { found = null; draw(); return; }
+    put(results, h('div', { class: 'empty' }, '搜索中…'));
+    try {
+      const r = await api('/api/people?q=' + encodeURIComponent(text));
+      if (my === seq) { found = r; draw(); }
+    } catch (e) { if (my === seq) put(results, h('div', { class: 'empty' }, '搜索失败: ' + e.message)); }
+  }
+  q.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(search, 400); });
+  q.addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(debounce); search(); } });
+  // 命令行那边改了, 这里过一会儿也会跟上
+  every(20000, async () => { st = await api('/api/whitelist'); draw(); });
 }
 
 // ---- 记忆 / 人设 ----
@@ -473,7 +545,7 @@ async function viewCommand() {
 // ---- 路由 ----
 
 const VIEWS = { overview: viewOverview, conversations: viewConversations, activity: viewActivity, tasks: viewTasks,
-  takeovers: viewTakeovers, memory: viewMemory, persona: viewPersona, logs: viewLogs, command: viewCommand };
+  takeovers: viewTakeovers, whitelist: viewWhitelist, memory: viewMemory, persona: viewPersona, logs: viewLogs, command: viewCommand };
 
 async function route() {
   timers.forEach(clearInterval); timers = [];

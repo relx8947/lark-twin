@@ -148,6 +148,41 @@ def is_agent_actor() -> bool:
     return os.environ.get(ACTOR_ENV) == "agent"
 
 
+def inside_twin(proc: str = "/proc") -> bool:
+    """当前进程是不是数字人的 agent 会话起的。比 is_agent_actor 多两道: 清掉 LARKX_ACTOR 再起的子进程也认得出。
+
+    - systemd 托管时, agent 起的所有进程都在 daemon 的服务单元(cgroup)里;
+    - 往上找祖先进程: /proc/<pid>/environ 是进程启动时的环境, 子进程 unset、env -u 改不了它。
+    数字人有完整的 shell, 刻意绕过(如 systemd-run、直接改库)还是挡不住, 这只是防误用和注入的一道防线。
+    """
+    if is_agent_actor():
+        return True
+    from .service import UNIT
+    root = Path(proc)
+    try:
+        if any(UNIT in line.strip().split("/") for line in (root / "self" / "cgroup").read_text().splitlines()):
+            return True
+    except OSError:
+        pass
+    marker = f"{ACTOR_ENV}=agent".encode()
+    pid = "self"
+    for _ in range(64):
+        try:
+            # stat 的第 4 列是父进程 id; 进程名可能带空格和括号, 从最后一个 ")" 之后数
+            ppid = int((root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if ppid <= 1:
+            return False
+        pid = ppid
+        try:
+            if marker in (root / str(pid) / "environ").read_bytes().split(b"\0"):
+                return True
+        except OSError:
+            continue  # 别的用户的进程读不到环境, 接着往上找
+    return False
+
+
 def with_signature(text: str, cfg: dict) -> str:
     """数字人发出的消息加上签名: 空一行再署名, 一眼能看出是后缀而不是正文的最后一句。"""
     sig = (cfg.get("reply_signature") or "").strip()

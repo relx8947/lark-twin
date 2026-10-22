@@ -2,8 +2,8 @@ import json
 from datetime import datetime
 from sqlalchemy import create_engine, desc, func, or_
 from sqlalchemy.orm import sessionmaker
-from ..config import load_config
-from .models import Action, AgentSession, Base, Chat, Control, InboxItem, Message, Takeover, Task
+from ..config import inside_twin, load_config
+from .models import Action, AgentSession, Base, Chat, Control, InboxItem, Message, Takeover, Task, WhitelistEntry
 
 
 def _json_default(o):
@@ -409,3 +409,64 @@ class Storage:
 
     def count_actions_since(self, since: datetime, actor: str = 'agent', action: str = 'send') -> int:
         return self.count_actions(actor, action, since)
+
+    # ---- 唤起白名单 ----
+    # daemon 每条消息都现查, 改了立即生效。只有本人能改: 数字人的会话里调用会被拒绝(CLI 也先拦一道)
+
+    @staticmethod
+    def _whitelist_guard():
+        if inside_twin():
+            raise PermissionError('数字人不能修改唤起白名单, 只有本人能改')
+
+    def whitelist_list(self):
+        s = self.Session()
+        try:
+            return s.query(WhitelistEntry).order_by(WhitelistEntry.added_at, WhitelistEntry.user_id).all()
+        finally:
+            s.close()
+
+    def whitelist_ids(self) -> set:
+        s = self.Session()
+        try:
+            return {r[0] for r in s.query(WhitelistEntry.user_id).all()}
+        finally:
+            s.close()
+
+    def whitelist_get(self, user_id: str):
+        s = self.Session()
+        try:
+            return s.get(WhitelistEntry, str(user_id))
+        finally:
+            s.close()
+
+    def whitelist_add(self, user_id: str, name: str = '', department: str = '', avatar_key: str = '',
+                      added_by: str = '') -> bool:
+        """加入白名单; 已经在里面时只刷新名字等快照, 返回 False。"""
+        self._whitelist_guard()
+        user_id = str(user_id or '').strip()
+        if not user_id.isdigit():
+            raise ValueError(f'user_id 不合法: {user_id!r}')
+        s = self.Session()
+        try:
+            row = s.get(WhitelistEntry, user_id)
+            created = row is None
+            if created:
+                row = WhitelistEntry(user_id=user_id, added_by=added_by, added_at=datetime.now())
+                s.add(row)
+            for key, value, size in (('name', name, 256), ('department', department, 512), ('avatar_key', avatar_key, 256)):
+                if value or created:
+                    setattr(row, key, (value or '')[:size])
+            s.commit()
+            return created
+        finally:
+            s.close()
+
+    def whitelist_remove(self, user_id: str) -> bool:
+        self._whitelist_guard()
+        s = self.Session()
+        try:
+            n = s.query(WhitelistEntry).filter_by(user_id=str(user_id)).delete()
+            s.commit()
+            return n > 0
+        finally:
+            s.close()

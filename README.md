@@ -46,6 +46,8 @@ cp .env.example .env          # 选择 claude / codex，并填写启动命令
 
 以 `/` 开头的命令只认你本人。想让数字人只听你一个人的，在 `.env` 设 `LARKX_TRIGGER_OWNER_ONLY=true`：别人发的 `/ai`（私聊、群聊，包括 @你 的）都不理会；你主动接管的会话、定时任务、`larkx say` 照常。
 
+**谁能唤起它（唤起白名单）**：你自己一直能。白名单里有人时，只有你和白名单里的人能唤起，别人的 `/ai` 一律不理；白名单为空时按上面的 `LARKX_TRIGGER_OWNER_ONLY`。群里照旧要 @你。白名单里的人和其他人一样按访客对待，不会拿到你的权限。在控制台的"白名单"页搜名字添加（同名的看头像和部门区分），或者用 `larkx whitelist add <名字或 user_id>`，两边是同一份名单，改了立即生效，不用重启。数字人自己改不了白名单：它调用 `larkx whitelist add/remove` 会被拒绝并通知你。
+
 **在终端，或者你自己的 agent 里**
 
 ```bash
@@ -54,6 +56,7 @@ larkx say --wait "…"             # 直接指挥数字人
 larkx task add --in 30m -        # 安排定时任务
 larkx takeover start <chat_id> --for 2h --goal "…"   # 让它替你聊一段
 larkx mentions --since 24h       # 最近谁找过你，有没有回
+larkx whitelist add 张三         # 让张三也能唤起数字人（list / remove 查看、移除）
 larkx audit                      # 它发过什么
 larkx recall <msg_id>            # 撤回一条
 larkx service status | logs -f   # 运行状态
@@ -63,7 +66,7 @@ larkx service status | logs -f   # 运行状态
 
 `larkx service install` 会同时装上网页控制台（`lark-twin-web.service`，只监听 `127.0.0.1:18341`），对外由你自己的 Nginx 反向代理。`larkx web url` 打印带令牌的登录链接，打开一次即可；`larkx web reset-token` 让所有已登录的浏览器失效。
 
-打开这个地址就是数字人控制台：总览、对话、动态、任务、接管、记忆、人设、日志和指挥。以前的 `/console` 地址会跳回首页。
+打开这个地址就是数字人控制台：总览、对话、动态、任务、接管、白名单、记忆、人设、日志和指挥。以前的 `/console` 地址会跳回首页。
 
 执行 `larkx skill install` 之后，直接对你的 Claude Code 或 Codex 说"给张三发个消息""看看某个群在聊什么"就可以。完整命令见 `larkx --help`。
 

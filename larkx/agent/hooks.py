@@ -13,6 +13,8 @@ from .. import guest, state
 
 # 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务、以本人身份下指令、改 skill: 都不该由数字人自己做
 FORBIDDEN_CMD = re.compile(r'\b(larkx|lark)\s+(api|auth|listen|daemon|service|doctor|say|skill|web)\b')
+# 唤起白名单只有本人能改(可以看): 免得有人让数字人把自己加进去。CLI 和存储层也会拒绝
+WHITELIST_WRITE = re.compile(r'\b(larkx|lark)\s+whitelist\s+(add|remove)\b')
 
 
 def _deny(reason: str) -> dict:
@@ -27,6 +29,8 @@ def check_tool_use(tool_name: str, tool_input: dict):
         return '数字人不能读取或修改飞书登录凭证和网页控制台令牌'
     if tool_name == 'Bash' and FORBIDDEN_CMD.search((tool_input or {}).get('command', '')):
         return '数字人不能调用 larkx api / auth / listen / daemon / service / doctor / say / skill / web; 需要的能力请用 larkx 的其他子命令'
+    if tool_name == 'Bash' and WHITELIST_WRITE.search((tool_input or {}).get('command', '')):
+        return '数字人不能修改唤起白名单, 只有本人能改; 想加进白名单的人请直接找本人'
     return None
 
 

@@ -20,6 +20,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import service, state
+from .. import whitelist as wl
 from ..agent.home import commit_agent_home
 from ..config import DATA_DIR, load_config
 from ..storage import Storage
@@ -67,6 +68,8 @@ def api(fn):
             return fn(request)
         except ValueError as e:
             return _json({'error': str(e)}, 400)
+        except PermissionError as e:
+            return _json({'error': str(e)}, 403)
     return endpoint
 
 
@@ -296,6 +299,82 @@ def takeover_item(request: Request):
     return _json({'ok': ok})
 
 
+# ---- 唤起白名单 ----
+# 和 larkx whitelist 共用一张表; daemon 每条消息现查, 改了立即生效。数字人没有网页令牌, 改不了这里
+
+def _auth():
+    from ..protocol import LarkAuth
+    return LarkAuth()
+
+
+def _lark():
+    from ..protocol import LarkClient
+    return LarkClient(_auth())
+
+
+def _whitelist_state(st: Storage) -> dict:
+    triggers = load_config()['triggers']
+    rows = st.whitelist_list()
+    region = _auth().region
+    return {'rule': wl.rule_sentence(len(rows), triggers), 'owner_only': bool(triggers.get('owner_only')),
+            'group_at_only': bool(triggers.get('group_at_only')), 'entries': [wl.entry_dict(r, region) for r in rows]}
+
+
+@api
+def whitelist(request: Request):
+    st = Storage()
+    if request.method == 'POST':
+        b = request.state.body
+        uid = str(b.get('user_id') or '').strip()
+        if not wl.is_user_id(uid):
+            raise ValueError('user_id 不合法')
+        if uid == str(_auth().user_id):
+            raise ValueError('你本人一直能唤起数字人, 不用加进白名单')
+        name, dept, avatar = (str(b.get(k) or '').strip() for k in ('name', 'department', 'avatar_key'))
+        if not name:
+            person = wl.lookup_user(_lark(), uid)
+            if not person:
+                raise ValueError(f'找不到 user_id 为 {uid} 的人')
+            name, dept, avatar = person['name'], person['department'], person['avatar_key']
+        created = st.whitelist_add(uid, name, dept, avatar, added_by='web')
+        if created:
+            st.log_action(actor='human', action='whitelist', content=f'网页加入白名单 {wl.label({"user_id": uid, "name": name, "department": dept})}')
+        return _json(dict(_whitelist_state(st), ok=True, created=created))
+    return _json(_whitelist_state(st))
+
+
+@api
+def whitelist_item(request: Request):
+    st = Storage()
+    uid = request.path_params['user_id']
+    if not wl.is_user_id(uid):
+        raise ValueError('user_id 不合法')
+    row = st.whitelist_get(uid)
+    if not row:
+        return _json({'error': '白名单里没有这个人'}, 404)
+    st.whitelist_remove(uid)
+    st.log_action(actor='human', action='whitelist', content=f'网页移出白名单 {wl.label(row)}')
+    return _json(dict(_whitelist_state(st), ok=True))
+
+
+@api
+def people(request: Request):
+    """按名字搜人, 给白名单页添加用: 带部门和头像区分同名的人, 标出已在白名单里的和本人。"""
+    q = (request.query_params.get('q') or '').strip()
+    if not q:
+        raise ValueError('输入名字再搜')
+    try:
+        client = _lark()
+        found = wl.search_people(client, q)
+    except Exception as e:
+        return _json({'error': f'搜索失败: {e}'[:300]}, 502)
+    listed = Storage().whitelist_ids()
+    me = str(client.auth.user_id)
+    region = client.auth.region
+    return _json({'query': q, 'people': [dict(p, avatar=region.avatar_url(p['avatar_key']), whitelisted=p['user_id'] in listed,
+                                              is_owner=p['user_id'] == me) for p in found]})
+
+
 def _agent_home() -> Path:
     return Path(load_config()['agent_home'])
 
@@ -467,6 +546,9 @@ def create_app() -> Starlette:
         Route('/api/say', say, methods=['POST']),
         Route('/api/takeovers', takeovers, methods=['GET', 'POST']),
         Route('/api/takeovers/{chat_id}', takeover_item, methods=['DELETE']),
+        Route('/api/whitelist', whitelist, methods=['GET', 'POST']),
+        Route('/api/whitelist/{user_id}', whitelist_item, methods=['DELETE']),
+        Route('/api/people', people),
         Route('/api/memory', memory), Route('/api/memory/{name}', memory_item, methods=['PUT', 'DELETE']),
         Route('/api/persona', persona, methods=['GET', 'PUT']),
         Route('/api/history', history), Route('/api/history/{sha}', history_item),

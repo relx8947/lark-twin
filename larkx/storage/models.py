@@ -116,3 +116,14 @@ class Control(Base):
     status = Column(String(16), default='pending', index=True)
     result = Column(Text, default='')
 
+
+
+class WhitelistEntry(Base):
+    """唤起白名单: 除本人外能叫起数字人的人。只按 user_id 匹配; 名字、部门、头像是添加时的快照, 只用来显示。"""
+    __tablename__ = 'whitelist'
+    user_id = Column(String(32), primary_key=True)
+    name = Column(String(256), default='')
+    department = Column(String(512), default='')
+    avatar_key = Column(String(256), default='')
+    added_by = Column(String(16), default='')
+    added_at = Column(DateTime, default=datetime.now)

@@ -133,6 +133,21 @@ td.nowrap, th.nowrap { white-space: nowrap; }
 .clamp.more:not(.open)::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1.6em; background: linear-gradient(transparent, var(--surface-1)); }
 td .body { margin: 0; }
 
+/* 白名单 */
+.rule { font-size: 16px; font-weight: 600; }
+.people { display: flex; flex-direction: column; }
+.people .empty { padding: 10px 0 0; }
+.person { display: flex; align-items: center; gap: 12px; padding: 10px 8px; border-top: 1px solid var(--grid); border-radius: 8px; }
+.people > .person:first-child { border-top-color: transparent; }
+.card > .people:not(:empty) { margin-top: 10px; }
+.person.pick { cursor: pointer; }
+.person.pick:hover { background: var(--surface-2); }
+.person .who { min-width: 0; }
+.person .name { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.person .mono { font-size: 11.5px; }
+.avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; object-fit: cover; background: var(--surface-2); }
+.avatar.ph { display: inline-flex; align-items: center; justify-content: center; color: var(--text-secondary); font-weight: 600; }
+
 .split { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
 .files a { display: block; padding: 6px 10px; border-radius: 8px; color: var(--text-secondary); }
 .files a.on, .files a:hover { background: var(--surface-2); color: var(--text-primary); }

@@ -590,6 +590,130 @@ def cmd_audit(args):
     return 0
 
 
+TWIN_WHITELIST_DENIED = '数字人不能修改唤起白名单, 只有本人能改; 想加进白名单的人请直接找本人'
+
+
+def _choose(prompt: str, labels: list):
+    """在终端里从候选中选一个, 返回下标; 取消时返回 None。"""
+    try:
+        import questionary
+        ans = questionary.select(prompt, choices=[questionary.Choice(l, value=i) for i, l in enumerate(labels)]
+                                 + [questionary.Choice('取消', value=-1)]).ask()
+        return None if ans is None or ans < 0 else ans
+    except Exception:
+        pass
+    print(prompt)
+    for i, l in enumerate(labels, 1):
+        print(f'  [{i}] {l}')
+    c = input('选择编号(回车取消): ').strip()
+    return int(c) - 1 if c.isdigit() and 1 <= int(c) <= len(labels) else None
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _pick_person(args, people: list, what: str, rerun: str):
+    """多个候选时让本人选: 终端里交互选择; 不是终端(或 --json)时列出候选, 请本人用 user_id 重新运行。"""
+    from .whitelist import label
+    if _interactive() and not args.json:
+        i = _choose(f'{what}, 选一个:', [label(p) for p in people])
+        if i is None:
+            print('已取消')
+        return people[i] if i is not None else None
+    msg = f'{what}, 用 user_id 重新运行: larkx whitelist {rerun} <user_id>'
+    if args.json:
+        _print_json({'ok': False, 'error': msg, 'candidates': people})
+    else:
+        print(msg, file=sys.stderr)
+        for p in people:
+            print(f'  {label(p)}', file=sys.stderr)
+    return None
+
+
+def cmd_whitelist(args):
+    from . import whitelist as wl
+    from .config import inside_twin
+    st = Storage()
+    triggers = load_config()['triggers']
+    query = ' '.join(args.target).strip()
+    if args.action == 'list':
+        rows = st.whitelist_list()
+        rule = wl.rule_sentence(len(rows), triggers, below=False)
+        if args.json:
+            _print_json({'rule': rule, 'owner_only': bool(triggers.get('owner_only')),
+                         'group_at_only': bool(triggers.get('group_at_only')), 'entries': [wl.entry_dict(r) for r in rows]})
+            return 0
+        print(rule)
+        for r in rows:
+            print(f'{r.user_id}\t{r.name or "-"}\t{r.department or "-"}\t添加于 {r.added_at:%Y-%m-%d %H:%M}')
+        return 0
+    if inside_twin():
+        # 数字人的会话里(包括清掉 LARKX_ACTOR 之后): 不能改, 免得有人让它把自己加进去
+        turn = state.read_turn()
+        st.log_action(actor='agent', action='whitelist', content=f'{args.action} {query}'[:300], ok=0,
+                      error=TWIN_WHITELIST_DENIED, turn_kind=(turn or {}).get('kind', ''), turn_ref=(turn or {}).get('ref', ''))
+        try:
+            from .notify import Notifier
+            verb = '加进' if args.action == 'add' else '移出'
+            Notifier(load_config(), LarkClient(LarkAuth())).alert(
+                f'数字人想把「{query}」{verb}唤起白名单, 已拦截。白名单只能由你在控制台或终端(larkx whitelist)里改',
+                key=f'whitelist:{args.action}:{query}', cooldown=600)
+        except Exception as e:
+            logger.debug(f'白名单拦截告警没发出去: {e!r}')
+        return _fail(args, TWIN_WHITELIST_DENIED, code=3)
+    if not query:
+        return _fail(args, f'用法: larkx whitelist {args.action} <名字或 user_id>')
+    if args.action == 'add':
+        client = LarkClient(LarkAuth())
+        if wl.is_user_id(query):
+            person = wl.lookup_user(client, query)
+            if not person:
+                return _fail(args, f'找不到 user_id 为 {query} 的人')
+        else:
+            people = wl.search_people(client, query)
+            if not people:
+                return _fail(args, f'没有搜到叫「{query}」的人')
+            # 只有一个候选并且名字完全一样时直接加; 否则(同名、或者只是名字相近)让本人确认是哪一个
+            if len(people) == 1 and people[0]['name'] == query:
+                person = people[0]
+            else:
+                person = _pick_person(args, people, f'搜到 {len(people)} 个人' if len(people) > 1 else f'只搜到名字相近的「{people[0]["name"]}」',
+                                      'add')
+                if not person:
+                    return 1
+        if person['user_id'] == str(client.auth.user_id):
+            return _fail(args, '你本人一直能唤起数字人, 不用加进白名单')
+        created = st.whitelist_add(person['user_id'], person['name'], person['department'], person['avatar_key'], added_by='cli')
+        if created:
+            _audit(st, 'whitelist', '', f'加入白名单 {wl.label(person)}')
+        msg = ('已加入白名单: ' if created else '已经在白名单里: ') + wl.label(person)
+        changed = person
+    else:
+        rows = st.whitelist_list()
+        if wl.is_user_id(query):
+            matches = [r for r in rows if r.user_id == query]
+        else:
+            matches = [r for r in rows if r.name == query] or [r for r in rows if query in (r.name or '')]
+        if not matches:
+            return _fail(args, f'白名单里没有「{query}」; 用 larkx whitelist list 查看')
+        if len(matches) > 1:
+            picked = _pick_person(args, [wl.entry_dict(r) for r in matches], f'白名单里有 {len(matches)} 个「{query}」', 'remove')
+            if not picked:
+                return 1
+            matches = [r for r in matches if r.user_id == picked['user_id']]
+        row = matches[0]
+        st.whitelist_remove(row.user_id)
+        _audit(st, 'whitelist', '', f'移出白名单 {wl.label(row)}')
+        msg, changed = '已移出白名单: ' + wl.label(row), wl.entry_dict(row)
+    rule = wl.rule_sentence(len(st.whitelist_ids()), triggers, below=False)
+    if args.json:
+        _print_json({'ok': True, 'person': changed, 'rule': rule})
+    else:
+        print(f'{msg}\n现在{rule}。立即生效, 不用重启。')
+    return 0
+
+
 def cmd_skill(args):
     from .skills import install_user_skill
     targets = ['claude', 'codex'] if args.target == 'all' else [args.target]
@@ -748,6 +872,11 @@ def main():
     p.add_argument('--goal', help='交代给数字人的目标, 如"帮我和他约下周二开会"')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_takeover)
+    p = sub.add_parser('whitelist', help='唤起白名单: 除了你还有谁能叫起数字人(非空时只有你和名单里的人能叫起); 数字人自己不能改')
+    p.add_argument('action', choices=['list', 'add', 'remove'])
+    p.add_argument('target', nargs='*', help='add: 名字(搜人, 同名时让你选)或 user_id; remove: 名单里的名字或 user_id')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_whitelist)
     p = sub.add_parser('mentions', help='最近谁找过你: 别人的私聊、@你的群消息, 以及你之后回没回')
     p.add_argument('--since', default='24h', help='多久以内, 如 12h、1d')
     p.add_argument('--json', action='store_true')

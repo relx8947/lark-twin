@@ -21,6 +21,9 @@ class FakeClient:
         self.keep_unread = []  # 每次发送带的 keep_unread
         self.auth = type('A', (), {'user_id': user_id})()
         self._owner_chat = owner_chat
+        self.people = []      # search 返回的结果(和 LarkClient.search 的格式一样)
+        self.user_names = {}  # get_user_name 能查到的人
+        self.searches = []
 
     def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text))
@@ -31,7 +34,11 @@ class FakeClient:
         return self._owner_chat
 
     def get_user_name(self, user_id, chat_id):
-        return None
+        return self.user_names.get(str(user_id))
+
+    def search(self, query):
+        self.searches.append(query)
+        return [r for r in self.people if query in r['title'].replace('<h>', '').replace('</h>', '')]
 
     def get_group_name(self, chat_id):
         return None

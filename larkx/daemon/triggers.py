@@ -4,6 +4,7 @@ from datetime import datetime
 from xml.sax.saxutils import escape, quoteattr
 
 from .. import state
+from ..whitelist import may_invoke
 from ..protocol.proto import proto_pb2 as P
 
 CHAT_TYPE_NAMES = {1: 'p2p', 2: 'group', 3: 'topic_group'}
@@ -84,15 +85,16 @@ def mentions_me(msg: dict, my_user_id: str) -> bool:
     return False
 
 
-def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
+def should_handle(msg: dict, cfg: dict, my_user_id: str, whitelist=()) -> bool:
+    """whitelist: 唤起白名单里的 user_id。"""
     t = cfg.get('triggers') or {}
     is_own = str(msg.get('from_id')) == str(my_user_id)
     # 本人的消息只在有触发前缀时才可能触发: 数字人的回复被 CLI 禁止以前缀开头, 这样不会自己触发自己
     if is_own and not (cfg.get('allow_self') and t.get('prefix')):
         return False
-    # 只有本人能唤起: 别人发的(私聊、群聊, 包括 @ 本人的)一律不触发;
-    # 接管中的会话、定时任务、larkx say 不经过这里, 不受影响
-    if t.get('owner_only') and not is_own:
+    # 谁能唤起: 本人一直能; 白名单非空时只有本人和白名单里的人, 为空时看 owner_only(打开则只有本人)。
+    # 不能唤起的人发的(私聊、群聊, 包括 @ 本人的)一律不触发; 接管中的会话、定时任务、larkx say 不经过这里, 不受影响
+    if not is_own and not may_invoke(msg.get('from_id'), t, whitelist):
         return False
     content = strip_mentions(msg.get('content'))
     chat_id = str(msg.get('chat_id'))

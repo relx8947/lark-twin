@@ -271,6 +271,42 @@ def test_owner_only_keeps_takeover_tasks_and_say(tmp_path, monkeypatch, fake_cli
     assert sorted(ev.kind for ev in asyncio.run(one_round())) == ['say', 'task']
 
 
+def test_whitelist_takes_effect_without_restart(tmp_path, monkeypatch, fake_client):
+    """唤起白名单改了立即生效(daemon 每条消息现查); 白名单里的人照旧按访客处理, 群里要 @ 本人。"""
+    from larkx.daemon.triggers import GUEST_NOTE
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    obj.cfg['triggers']['owner_only'] = True
+    now = int(time.time())
+    p2p = {'chat_id': 'p1', 'chat_type': 1, 'from_id': '200', 'create_time': now, 'content': '/ai 在吗'}
+    group = dict(p2p, chat_id='g1', chat_type=2)
+    other_db = Storage(obj.storage.url)  # 命令行、网页是另一个进程, 用自己的连接改
+
+    async def run():
+        seen = []
+        for step, m in (('empty', dict(p2p, msg_id='w1')),
+                        ('add', None),
+                        ('p2p', dict(p2p, msg_id='w2')),
+                        ('group-no-at', dict(group, msg_id='w3')),
+                        ('group-at', dict(group, msg_id='w4', at_me=True)),
+                        ('not-listed', dict(p2p, msg_id='w5', from_id='201')),
+                        ('remove', None),
+                        ('removed', dict(p2p, msg_id='w6'))):
+            if step == 'add':
+                other_db.whitelist_add('200', '张三', '飞书-IM', added_by='cli')
+            elif step == 'remove':
+                other_db.whitelist_remove('200')
+            else:
+                await obj.on_message(m, '张三', '张三')
+                seen.append((step, obj.inbox.qsize()))
+        return seen
+
+    assert asyncio.run(run()) == [('empty', 0), ('p2p', 1), ('group-no-at', 1), ('group-at', 2), ('not-listed', 2), ('removed', 2)]
+    evs = [obj.inbox.get_nowait() for _ in range(2)]
+    assert [e.ref for e in evs] == ['w2', 'w4'] and not any(e.is_owner for e in evs)
+    asyncio.run(obj._handle(evs[0]))
+    assert 'owner="false"' in obj.session.prompts[0] and GUEST_NOTE in obj.session.prompts[0]
+
+
 def test_takeover_in_owner_chat_gives_hint(tmp_path, monkeypatch, fake_client):
     obj = _daemon(tmp_path, fake_client, monkeypatch)
     msg = {'chat_id': 'self', 'chat_type': 1, 'create_time': int(time.time()), 'msg_id': 'h1',

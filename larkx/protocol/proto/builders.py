@@ -220,11 +220,12 @@ def decode_search_response(content: bytes):
     if pkt.payload:
         resp = P.UniversalSearchResponse()
         resp.ParseFromString(pkt.payload)
+        # summary: 用户是部门, 群是"包含: 某某"; 同名的人靠部门和头像区分
         for r in resp.results:
-            if r.type == 1:
-                results.append({'type': 'user', 'id': r.id, 'title': r.titleHighlighted})
-            elif r.type == 3:
-                results.append({'type': 'group', 'id': r.id, 'title': r.titleHighlighted})
+            kind = {1: 'user', 3: 'group'}.get(r.type)
+            if kind:
+                results.append({'type': kind, 'id': r.id, 'title': r.titleHighlighted, 'summary': r.summaryHighlighted,
+                                'avatar_key': r.avatarKey})
     return results
 
 
