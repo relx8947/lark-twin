@@ -1,19 +1,13 @@
-"""发图片、文件、@ 的单元测试: 消息结构、匿名发送(打开 keep_unread 时)流程、上传协议、网页接口。都不访问网络。"""
+"""发图片、文件、@ 的单元测试: 消息结构、匿名发送(打开 keep_unread 时)流程、上传协议。都不访问网络。"""
 import zlib
 
 import pytest
-from starlette.testclient import TestClient
 
 from larkx.protocol import client as client_mod
 from larkx.protocol import media
 from larkx.protocol.client import LarkClient
 from larkx.protocol.proto import builders
 from larkx.protocol.proto import lark_all_pb2 as LA
-from larkx.storage import Storage
-from larkx.web import app as web
-from larkx.web import im
-
-from test_im import FakeIMClient
 
 E = LA.entities.RichTextElement
 AT_MSG = {'kind': 'text', 'segments': [{'type': 'text', 'text': '请 '}, {'type': 'at', 'user_id': '200', 'name': '张三'},
@@ -215,145 +209,3 @@ def test_upload_file_failures(monkeypatch):
         media.upload_file(_auth(), io.BytesIO(b''), 0, 'a.txt')
     with pytest.raises(media.UploadError, match='比声明的短'):
         media.upload_file(_auth(), io.BytesIO(b'ab'), 5, 'a.txt')
-
-
-# ---- 网页接口 ----
-
-class FakeSendClient(FakeIMClient):
-    def api(self, cmd, data=None):
-        if cmd == 'chats.PullChatChattersRequest':
-            self.member_calls = getattr(self, 'member_calls', 0) + 1
-            return {'chatters': {'100': {'name': '我本人'}, '300': {'name': 'Li', 'alias': '小李', 'namePinyin': 'li', 'type': 1},
-                                 '200': {'name': '张三', 'alias': '张三(备注)', 'enUsName': 'Zhang San',
-                                         'avatar': {'key': 'a200'}},
-                                 '400': {'name': '机器人', 'type': 2}, 'x': {'name': '坏 id'}},
-                    'orderedWeight': {'200': 1, '300': 2, '400': 3, '100': 0}}
-        return super().api(cmd, data)
-
-
-@pytest.fixture
-def sctx(tmp_path, monkeypatch):
-    fake = FakeSendClient()
-    monkeypatch.setattr(web, 'TOKEN_PATH', tmp_path / 'web_token')
-    monkeypatch.setattr(im, 'client', lambda: fake)
-    monkeypatch.setattr(im, '_owner_chat', lambda: 'self')
-    for name in ('_profiles', '_p2p_names', '_quotes', '_members'):
-        monkeypatch.setattr(im, name, {})
-    # 发送方式按默认配置(普通发送), 不受本机 .env 影响
-    monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
-    c = TestClient(web.create_app())
-    c.headers.update({'Authorization': f'Bearer {web.get_token()}', 'X-Larkx': '1'})
-    return c, fake
-
-
-def test_text_message_splits_chosen_mentions():
-    picks = [{'user_id': '200', 'name': '张三'}, {'user_id': '300', 'name': '张三丰'}, {'user_id': 'bad', 'name': '王五'}]
-    msg = im._text_message('@张三丰 和 @张三 好, @王五 不算, 邮箱 a@张三', picks)
-    assert [(s['type'], s.get('user_id') or s.get('text')) for s in msg['segments'] if s.get('text') != ''] == [
-        ('at', '300'), ('text', ' 和 '), ('at', '200'), ('text', ' 好, @王五 不算, 邮箱 a'), ('at', '200')]
-    assert im._text_message('没有 @', []) == {'kind': 'text', 'text': '没有 @'}
-    assert im._text_message('选完删掉了', picks) == {'kind': 'text', 'segments': [{'type': 'text', 'text': '选完删掉了'}]}
-    # 同名的两个人按出现顺序对上
-    two = im._text_message('@李 @李', [{'user_id': '1', 'name': '李'}, {'user_id': '2', 'name': '李'}])
-    assert [s['user_id'] for s in two['segments'] if s['type'] == 'at'] == ['1', '2']
-
-
-def test_send_with_mentions_is_a_real_at(sctx):
-    c, fake = sctx
-    # 会话里有未读(已读位置 95 < 100)也一样: 普通发送, 不用确认, @ 是真的 @
-    r = c.post('/api/im/chat/5/send', json={'text': '@张三 你好', 'mentions': [{'user_id': '200', 'name': '张三'}]})
-    assert r.status_code == 200 and r.json() == {'ok': True, 'msg_id': '777'}
-    assert fake.messages[-1]['segments'][1] == {'type': 'at', 'user_id': '200', 'name': '张三'}
-    assert fake.sent == [('5', '@张三 你好', None, False)]
-    assert Storage().list_actions()[-1].content == '@张三 你好'
-
-
-def test_mentions_are_sent_normally_even_with_keep_unread(sctx, monkeypatch):
-    c, fake = sctx
-    # 打开 LARKX_KEEP_UNREAD 时转发会把 @ 变成文字, 所以带 @ 的消息照样普通发送; 不带 @ 的才按配置匿名发送
-    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
-    body = {'text': '@张三 你好', 'mentions': [{'user_id': '200', 'name': '张三'}]}
-    assert c.post('/api/im/chat/5/send', json=body).json() == {'ok': True, 'msg_id': '777'}
-    assert fake.sent[-1] == ('5', '@张三 你好', None, False) and fake.messages[-1]['segments'][1]['type'] == 'at'
-    c.post('/api/im/chat/5/send', json={'text': '你好'})
-    assert fake.sent[-1] == ('5', '你好', None, True)
-
-
-def test_upload_image_and_file_are_sent(sctx, monkeypatch):
-    c, fake = sctx
-    got = []
-    monkeypatch.setattr(im, 'upload_image', lambda auth, data, name, mime: got.append(('image', data, name, mime)) or 'img_v3_k')
-
-    def fake_upload_file(auth, fileobj, size, name, mime):
-        got.append(('file', fileobj.read(), size, name, mime))
-        return 'file_v3_k'
-    monkeypatch.setattr(im, 'upload_file', fake_upload_file)
-    png = b'\x89PNG\r\n\x1a\n' + b'0' * 20
-    up = lambda q, data, **kw: c.post('/api/im/chat/5/upload?' + q, content=data,
-                                      headers={'Content-Type': 'application/octet-stream', **kw.get('headers', {})})
-    r = up('kind=image&name=shot.png&type=image/png', png)
-    assert r.json() == {'ok': True, 'msg_id': '777'}
-    assert got[-1] == ('image', png, 'shot.png', 'image/png') and fake.messages[-1] == {'kind': 'image', 'key': 'img_v3_k', 'name': 'shot.png'}
-    assert fake.sent[-1] == ('5', '[图片]', None, False)
-    r = up('kind=file&name=' + '..%2F笔记.txt' + '&type=text/plain&root_id=40&parent_id=42', b'hello')
-    assert r.json()['ok'] is True and got[-1] == ('file', b'hello', 5, '笔记.txt', 'text/plain')
-    assert fake.messages[-1] == {'kind': 'file', 'key': 'file_v3_k', 'name': '笔记.txt', 'size': 5, 'mime': 'text/plain'}
-    assert fake.sent[-1] == ('5', '[文件] 笔记.txt', '40', False) and fake.reply_args[-1] == ('40', '42', False)
-    a = Storage().list_actions()[-1]
-    assert (a.actor, a.action, a.content, a.turn_kind) == ('human', 'send', '[文件] 笔记.txt', 'web')
-
-
-def test_upload_rejects_bad_input(sctx, monkeypatch):
-    c, fake = sctx
-    monkeypatch.setattr(im, 'upload_image', lambda *a: pytest.fail('不该上传'))
-    up = lambda q, data, headers=None: c.post('/api/im/chat/5/upload?' + q, content=data,
-                                              headers={'Content-Type': 'application/octet-stream', **(headers or {})})
-    r = up('kind=image&name=x.svg', b'<svg onload=alert(1)>')
-    assert r.status_code == 400 and '作为文件发送' in r.json()['error']
-    assert up('kind=sticker', b'x').status_code == 400
-    assert up('kind=file&name=a', b'').status_code == 400
-    monkeypatch.setattr(im, 'MAX_FILE', 4)
-    r = up('kind=file&name=a', b'12345')
-    assert r.status_code == 400 and '不能超过' in r.json()['error']
-    assert up('kind=file&name=a', b'1', headers={'X-Larkx': ''}).status_code == 403
-    assert fake.sent == []
-
-
-def test_relay_failure_is_reported_not_downgraded(sctx, monkeypatch):
-    # 只在打开 LARKX_KEEP_UNREAD 时才经私聊转发; 转发不成就报发送失败, 不退回普通发送
-    c, fake = sctx
-    monkeypatch.setenv('LARKX_KEEP_UNREAD', 'true')
-    fake.relay_fails = True
-    r = c.post('/api/im/chat/5/send', json={'text': 'hi'})
-    assert r.status_code == 502 and '不会改用普通发送' in r.json()['error'] and fake.sent == []
-    a = Storage().list_actions()[-1]
-    assert (a.ok, a.error) == (0, '发送失败')
-
-
-def test_upload_failure_is_reported(sctx, monkeypatch):
-    c, fake = sctx
-
-    def boom(*a, **k):
-        raise media.UploadError('创建上传失败: HTTP 500')
-    monkeypatch.setattr(im, 'upload_file', boom)
-    r = c.post('/api/im/chat/5/upload?kind=file&name=a.txt', content=b'abc', headers={'Content-Type': 'application/octet-stream'})
-    assert r.status_code == 502 and '上传到飞书失败' in r.json()['error'] and fake.sent == []
-
-
-def test_members_for_mentions(sctx):
-    c, fake = sctx
-    d = c.get('/api/im/chat/5/members').json()
-    # 不含本人和不合法的 id, 按群里的顺序; 名字用对方自己的名字, 备注名另给
-    assert [(m['user_id'], m['name'], m['alias'], m['bot']) for m in d['members']] == [
-        ('200', '张三', '张三(备注)', False), ('300', 'Li', '小李', False), ('400', '机器人', '', True)]
-    assert d['members'][0]['en'] == 'Zhang San' and d['members'][0]['avatar'].endswith('a200~?image_size=72x72&cut_type=&quality=&format=png&sticker_format=.webp')
-    assert d['complete'] is True
-    c.get('/api/im/chat/5/members')
-    assert fake.member_calls == 1  # 缓存住了
-
-
-def test_binary_body_does_not_break_json_endpoints(sctx):
-    c, _ = sctx
-    # 不是 JSON 的请求体不会让中间件出错; 发送接口照常校验
-    r = c.post('/api/im/chat/5/send', content=b'\xff\xfe\x00', headers={'Content-Type': 'application/json'})
-    assert r.status_code == 400 and r.json()['error'] == '消息内容为空'

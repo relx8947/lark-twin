@@ -491,8 +491,7 @@ document.getElementById('theme').addEventListener('click', e => {
   localStorage.setItem('larkx-theme', document.documentElement.dataset.theme);
 });
 if (localStorage.getItem('larkx-theme')) document.documentElement.dataset.theme = localStorage.getItem('larkx-theme');
-// 嵌在网页版飞书的「数字人」标签页里时: 不显示自己的品牌栏, 深浅色跟着外层切换
-if (new URLSearchParams(location.search).has('embed')) document.documentElement.classList.add('embed');
-window.addEventListener('storage', e => { if (e.key === 'larkx-theme' && e.newValue) document.documentElement.dataset.theme = e.newValue; });
-window.addEventListener('hashchange', route);
-loginFromHash().then(loadChats).then(route);
+const start = () => loginFromHash().then(loadChats).then(route);
+// 页面已经开着时再打开登录链接, 只有 # 后面变了, 页面不会重新加载: 这时也要换 cookie
+window.addEventListener('hashchange', () => (location.hash.startsWith('#login=') ? start() : route()));
+start();

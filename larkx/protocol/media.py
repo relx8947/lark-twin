@@ -52,25 +52,6 @@ def download(auth: LarkAuth, url: str, out_path: str=None, max_bytes: int=200 * 
         return (out_path, content_type, n)
 
 
-def open_stream(auth: LarkAuth, url: str, chunk: int=1 << 16):
-    """打开一个资源, 返回 (逐块读取的迭代器, 总字节数或 0)。读完或中途放弃都会关掉连接。"""
-    r = requests.get(url, cookies=auth.cookies, timeout=60, stream=True)
-    try:
-        r.raise_for_status()
-    except Exception:
-        r.close()
-        raise
-    # 压缩传输时 requests 会边读边解压, 原始长度对不上解压后的字节数, 就不报长度
-    length = 0 if r.headers.get('content-encoding') else int(r.headers.get('content-length') or 0)
-
-    def chunks():
-        try:
-            yield from r.iter_content(chunk)
-        finally:
-            r.close()
-    return chunks(), length
-
-
 # ---- 上传 ----
 # 接口都在文件主机上, 带登录 cookie, 请求和响应是 lark.pan 里的 protobuf(实测得出):
 #   图片: POST /api/image, multipart 表单字段 image → 响应字段 1 是图片 key(img_ 开头)

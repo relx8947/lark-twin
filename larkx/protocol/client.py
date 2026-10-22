@@ -11,17 +11,7 @@ from .proto import builders, decoders, proto_pb2 as P
 from .proto.ids import generate_access_key, generate_long_request_id, generate_request_cid, generate_request_id
 
 
-# 请求里声明的客户端版本。服务端按它裁剪返回的消息: 默认的旧版本拉到的卡片会被降级成"请升级客户端"的提示,
-# 带上和 WS 连接一致的新版本才拿得到完整卡片(jsonCard)。daemon 一直用默认版本, 网页版飞书看消息时用新版本。
-DEFAULT_COMMAND_VERSION = '5.7.0'
-MODERN_COMMAND_VERSION = '7.72.0'
-
-
 class LarkClient:
-    # 发网关请求用的 HTTP 客户端: 默认是 requests 模块本身(每次新建连接), daemon 和发消息都用它。
-    # 网页版的只读客户端换成复用连接的 requests.Session(见 web/im.py 的 ReadClient)
-    http = requests
-
     def __init__(self, auth: LarkAuth):
         self.auth = auth
         self.auth.require_valid()
@@ -137,7 +127,7 @@ class LarkClient:
         except Exception as e:
             logger.error(f'消息回调异常: {e}')
 
-    def _gateway_post(self, packet: P.Packet, command_version: str=None) -> bytes:
+    def _gateway_post(self, packet: P.Packet) -> bytes:
         headers = {
             'content-type': 'application/x-protobuf',
             'accept': '*/*',
@@ -146,14 +136,14 @@ class LarkClient:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
             'x-appid': self.auth.gateway_app_id,
             'x-command': str(packet.cmd),
-            'x-command-version': command_version or DEFAULT_COMMAND_VERSION,
+            'x-command-version': '5.7.0',
             'x-lgw-os-type': '1',
             'x-lgw-terminal-type': '2',
             'x-source': 'web',
             'x-web-version': '3.9.32',
             'x-request-id': generate_long_request_id(),
         }
-        resp = self.http.post(self.auth.region.gateway_url, headers=headers, cookies=self.auth.cookies, data=packet.SerializeToString(), timeout=15)
+        resp = requests.post(self.auth.region.gateway_url, headers=headers, cookies=self.auth.cookies, data=packet.SerializeToString(), timeout=15)
         resp.raise_for_status()
         return resp.content
 
@@ -172,7 +162,7 @@ class LarkClient:
         keep_unread(默认关, 对应配置 LARKX_KEEP_UNREAD): 关着时就是普通发送, 直接发到目标会话。打开后, 会话里还有
         本人的未读、又不是回复时, 经本人私聊转发过来(见 _send_via_relay), 目标会话里是一条普通消息, 本人的已读位置不动;
         转发不成就退回普通发送, 只清掉本人的未读, 对方照样看不到已读。
-        fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读(网页版开着 keep_unread 时用)。
+        fallback=False 时转发不成就不发了(返回 None), 绝不清掉本人的未读。
         各种类型的消息都走同一套流程。
         """
         chat_id = str(chat_id)
@@ -196,7 +186,7 @@ class LarkClient:
         普通群和私聊: 默认是主会话里的引用回复, 和飞书客户端点"回复"一样, 不会新开话题; 只有回的那条已经在一个话题里
         (它是话题的根消息, 或者本身是话题里的回复)时才回进那个话题, 普通群话题里的对话(比如数字人在话题里答复)
         不会被拽到主会话。要判断时只读地查一下回的那条(PullMessagesByIdsRequest), 查不到就按引用回复发。
-        in_thread 和 parent_id 都给了(网页版点"回复"时)就照给的发, 不再查。
+        in_thread 和 parent_id 都给了就照给的发, 不再查。
         """
         target = str(parent_id or root_id)
         if thread_chat:
@@ -335,15 +325,14 @@ class LarkClient:
         except Exception:
             return None
 
-    def api(self, type_or_cmd, data: dict=None, raw: bytes=None, command_version: str=None):
-        """command_version: 请求声明的客户端版本, 默认 DEFAULT_COMMAND_VERSION; 拉消息要新版格式时传 MODERN_COMMAND_VERSION。"""
+    def api(self, type_or_cmd, data: dict=None, raw: bytes=None):
         from .proto import gateway
         cmd, req_cls, resp_cls = gateway.resolve_cmd(type_or_cmd)
         req_msg = None
         if req_cls is not None:
             req_msg = gateway.request_from_dict(req_cls, data or {})
         pkt = gateway.build_packet(cmd, generate_long_request_id(), req_msg=req_msg, req_bytes=raw if req_msg is None else None)
-        content = self._gateway_post(pkt, command_version) if command_version else self._gateway_post(pkt)
+        content = self._gateway_post(pkt)
         resp_pkt = P.Packet()
         resp_pkt.ParseFromString(content)
         if resp_cls is not None and resp_pkt.payload:
@@ -371,9 +360,8 @@ class LarkClient:
             self._thread_chats[chat_id] = decoders.is_thread_chat(info)
         return self._thread_chats[chat_id]
 
-    def pull_history(self, chat_id: str, positions, save_storage=None, command_version: str=None):
-        resp = self.api('messages.PullMessagesByPositionsRequest', {'chatId': str(chat_id), 'positions': [int(p) for p in positions]},
-                        command_version=command_version)
+    def pull_history(self, chat_id: str, positions, save_storage=None):
+        resp = self.api('messages.PullMessagesByPositionsRequest', {'chatId': str(chat_id), 'positions': [int(p) for p in positions]})
         messages = (resp or {}).get('messages') or {}
         thread_chat = self.is_thread_chat(chat_id)
         out = []
@@ -387,86 +375,6 @@ class LarkClient:
                     pass
         return out
 
-    def pull_messages(self, message_ids, command_version: str=None) -> list:
-        """按消息 id 批量取消息(只读), 格式和 pull_history 一样; 取不到的(没有权限、已被清理)不在结果里。"""
-        ids = [str(m) for m in message_ids if m]
-        out = []
-        for i in range(0, len(ids), 50):
-            resp = self.api('messages.PullMessagesByIdsRequest', {'messageIds': ids[i:i + 50]}, command_version=command_version)
-            for v in ((resp or {}).get('messages') or {}).values():
-                chat_id = str(v.get('chatId') or v.get('channelId') or '')
-                out.append(self._message_dict(v, chat_id, self.is_thread_chat(chat_id) if chat_id else False, 0))
-        return out
-
-    # ---- 话题群(只读) ----
-    # 话题群的消息按话题组织: 会话信息里 lastMessagePosition 是空的, 话题有自己的位置(lastThreadPosition、
-    # readThreadPosition, 从 0 开始); 每个话题里根消息的位置是 -1, 回复从 0 排到话题的 lastMessagePosition。
-
-    def pull_threads(self, chat_id: str, positions, command_version: str=None) -> dict:
-        """按话题位置取话题群里的话题(只读, thread.PullThreadsByPositionsRequest)。
-
-        只取看得见的话题: 入群提示这类系统消息也各占一个话题位置但不显示, 带上 onlyVisibleThreads 和向上的方向后,
-        服务端从 positions 里最大的位置往前找, 跳过看不见的(放在 invisibleThreads 里), 凑够约 len(positions) 个看得见的。
-        返回 {'threads': 话题列表(按位置从小到大, 格式见 _thread_dict), 'start': 这次往前查到的最小位置}。
-        """
-        positions = sorted({int(p) for p in positions if int(p) >= 0})
-        if not positions:
-            return {'threads': [], 'start': 0}
-        resp = self.api('thread.PullThreadsByPositionsRequest',
-                        {'channelId': str(chat_id), 'type': 'CHAT_CHANNEL', 'positions': positions,
-                         'onlyVisibleThreads': True, 'direction': 'CHANNEL_UP'}, command_version=command_version) or {}
-        threads = resp.get('threads') or {}
-        covered = [int(p) for p in threads] + [int(p) for p in (resp.get('invisibleThreads') or {})]
-        out = [self._thread_dict(t, resp.get('rootMessages') or {}, chat_id) for t in threads.values() if t.get('isVisible')]
-        out = sorted((t for t in out if t), key=lambda t: t['position'])
-        return {'threads': out, 'start': min(covered + [positions[0]])}
-
-    def pull_threads_by_ids(self, thread_ids, command_version: str=None) -> dict:
-        """按话题 id 取话题(只读, thread.PullThreadsByIDsRequest), {thread_id: 话题}; 取不到的不在结果里。"""
-        ids = [str(t) for t in thread_ids if t]
-        if not ids:
-            return {}
-        resp = self.api('thread.PullThreadsByIDsRequest', {'threadIds': ids}, command_version=command_version) or {}
-        out = {}
-        for t in (resp.get('threads') or {}).values():
-            d = self._thread_dict(t, resp.get('rootMessages') or {}, str(t.get('channelId') or ''))
-            if d:
-                out[d['thread_id']] = d
-        return out
-
-    def pull_thread_messages(self, chat_id: str, thread_id: str, positions, command_version: str=None) -> list:
-        """按话题内的位置取一个话题里的消息(只读, thread.PullThreadMessagesByPositionsRequest), 格式同 pull_history,
-        position 是话题内的位置(根消息 -1, 回复从 0 起), 会话里的位置放在 chat_position。超出范围的位置没有结果。"""
-        positions = sorted({int(p) for p in positions if int(p) >= -1})
-        if not positions:
-            return []
-        resp = self.api('thread.PullThreadMessagesByPositionsRequest',
-                        {'threadId': str(thread_id), 'channelId': str(chat_id), 'channelType': 'CHAT_CHANNEL', 'positions': positions},
-                        command_version=command_version) or {}
-        out = []
-        for pos, v in sorted((resp.get('messages') or {}).items(), key=lambda kv: int(kv[0])):
-            msg = self._message_dict(v, chat_id, True, int(pos))
-            msg['chat_position'], msg['position'] = msg['position'], int(pos)
-            out.append(msg)
-        return out
-
-    @classmethod
-    def _thread_dict(cls, t: dict, roots: dict, chat_id: str):
-        """一个话题: thread_id、position(话题位置)、reply_count、last_position(话题内最后一条回复的位置, 没有回复是 -1)、
-        update_time(最后有动静的时间, 有回复时就是最后一条回复的时间)、owner_id、root(根消息, 格式同 pull_history)。
-        找不到根消息的返回 None。"""
-        root = roots.get(str(t.get('rootMessageId') or t.get('id') or ''))
-        if not root:
-            return None
-        msg = cls._message_dict(root, str(chat_id or root.get('chatId') or ''), True, 0)
-        replies = int(t.get('replyCount') or 0)
-        last = t.get('lastMessagePosition')
-        # 没有这个字段时按回复数推算(回复从 0 起连续编号)
-        last = int(last) if last is not None else replies - 1
-        return {'thread_id': str(t.get('id') or ''), 'position': int(t.get('position') or 0), 'reply_count': replies,
-                'last_position': max(last, -1), 'update_time': int(t.get('updateTime') or 0),
-                'owner_id': str(t.get('ownerId') or ''), 'root': msg}
-
     @staticmethod
     def _message_dict(v: dict, chat_id: str, thread_chat: bool, position: int) -> dict:
         message_type = decoders.enum_to_int(v.get('type', 0))
@@ -479,4 +387,4 @@ class LarkClient:
                 'chat_type_name': decoders.CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': False,
                 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position') or position,
                 'create_time': v.get('createTime'), 'content': summary, 'content_data': data,
-                'recalled': v.get('status') == 2 or bool(v.get('isRemoved')), 'remover_id': str(v.get('removerId') or '')}
+                'recalled': v.get('status') == 2 or bool(v.get('isRemoved'))}

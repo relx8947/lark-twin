@@ -224,46 +224,6 @@ class Storage:
         finally:
             s.close()
 
-    def sender_names(self, user_ids) -> dict:
-        """消息库里见过的发送人名字: {user_id: name}。"""
-        ids = [str(u) for u in user_ids if u]
-        if not ids:
-            return {}
-        s = self.Session()
-        try:
-            rows = (s.query(Message.sender_id, Message.sender_name)
-                    .filter(Message.sender_id.in_(ids), Message.sender_name != '').distinct().all())
-            return {sid: name for sid, name in rows if name}
-        finally:
-            s.close()
-
-    def chat_peer(self, chat_id: str, user_id: str) -> str:
-        """私聊里对方的 user_id: 本地库里这个会话最近一条不是 user_id 发的消息的发送人; 没有这样的消息时是空串。"""
-        s = self.Session()
-        try:
-            row = (s.query(Message.sender_id).filter(Message.chat_id == str(chat_id), Message.sender_id.notin_(('', '0', str(user_id))))
-                   .order_by(desc(Message.id)).first())
-            return row[0] if row else ''
-        finally:
-            s.close()
-
-    def messages_after(self, chat_id: str, position: int, limit: int = 50):
-        """会话里 position 在这之后的消息, 按 position 排好。"""
-        s = self.Session()
-        try:
-            return (s.query(Message).filter(Message.chat_id == str(chat_id), Message.position > int(position))
-                    .order_by(Message.position).limit(limit).all())
-        finally:
-            s.close()
-
-    def latest_message_id(self) -> int:
-        """最新入库的那条消息的自增序号, 没有消息时是 0。"""
-        s = self.Session()
-        try:
-            return int(s.query(func.max(Message.id)).scalar() or 0)
-        finally:
-            s.close()
-
     def recalled_ids(self, msg_ids) -> set:
         """这些消息里已经成功撤回的。"""
         ids = [str(m) for m in msg_ids if m]

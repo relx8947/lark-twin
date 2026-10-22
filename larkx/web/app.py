@@ -5,7 +5,6 @@
 (令牌放在 # 片段里, 不会进 nginx 访问日志); 改动类请求还要带 X-Larkx 请求头, 防跨站伪造。
 """
 import hmac
-import inspect
 import json
 import re
 import secrets
@@ -16,12 +15,11 @@ from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import service, state
-from . import im
 from ..agent.home import commit_agent_home
 from ..config import DATA_DIR, load_config
 from ..storage import Storage
@@ -59,56 +57,29 @@ def _authorized(request: Request) -> bool:
 
 
 def api(fn):
-    """数据接口统一做鉴权; 改动类请求要求自定义请求头, 浏览器跨站提交带不上它。
-    fn 可以是普通函数(在线程池里跑), 也可以是 async 函数(要边收边处理请求体的上传接口)。"""
-    def guard(request: Request):
+    """数据接口统一做鉴权; 改动类请求要求自定义请求头, 浏览器跨站提交带不上它。"""
+    def endpoint(request: Request):
         if not _authorized(request):
             return _json({'error': '未登录'}, 401)
         if request.method != 'GET' and request.headers.get('x-larkx') != '1':
             return _json({'error': '缺少 X-Larkx 请求头'}, 403)
-        return None
-
-    def done(result):
-        return result if isinstance(result, Response) else _json(result)
-
-    def failed(e: Exception):
-        return _json({'error': str(e)}, 400 if isinstance(e, ValueError) else 502)
-
-    if inspect.iscoroutinefunction(fn):
-        async def async_endpoint(request: Request):
-            denied = guard(request)
-            if denied is not None:
-                return denied
-            try:
-                return done(await fn(request))
-            except (ValueError, im.UpstreamError) as e:
-                return failed(e)
-        return async_endpoint
-
-    def endpoint(request: Request):
-        denied = guard(request)
-        if denied is not None:
-            return denied
         try:
-            return done(fn(request))
-        except (ValueError, im.UpstreamError) as e:
-            return failed(e)
+            return fn(request)
+        except ValueError as e:
+            return _json({'error': str(e)}, 400)
     return endpoint
 
 
 # ---- 页面与登录 ----
 
-def _page(name: str) -> Response:
-    return Response((STATIC / name).read_text(encoding='utf-8'), media_type='text/html', headers={'Cache-Control': 'no-cache'})
-
-
 def index(request: Request):
-    """首页是网页版飞书; 控制台在 /console, 也嵌在它的「数字人」标签页里。"""
-    return _page('messenger.html')
+    return Response((STATIC / 'index.html').read_text(encoding='utf-8'), media_type='text/html',
+                    headers={'Cache-Control': 'no-cache'})
 
 
-def console(request: Request):
-    return _page('index.html')
+def old_console(request: Request):
+    """控制台以前在 /console, 旧书签跳回首页。# 后面的部分浏览器会带到新地址上。"""
+    return RedirectResponse('/', status_code=302)
 
 
 def login(request: Request):
@@ -122,8 +93,12 @@ def login(request: Request):
 
 # ---- 只读接口 ----
 
-OWNER_CHAT_NAME = im.OWNER_CHAT_NAME
-_owner_chat = im._owner_chat
+OWNER_CHAT_NAME = '我自己（私聊）'
+
+
+def _owner_chat() -> str:
+    from ..notify import _load
+    return _load().get('owner_chat', '')
 
 
 def _chat_names(st: Storage) -> dict:
@@ -454,8 +429,7 @@ class _Static(StaticFiles):
 
 
 class _JSONBody:
-    """把 JSON 请求体解析成 dict 放进 request.state.body, 供同步接口使用。
-    其他类型的请求体(上传图片和文件时是原始字节)不在这里读, 原样交给接口自己边收边处理。"""
+    """把 JSON 请求体解析成 dict 放进 request.state.body, 供同步接口使用。其他类型的请求体不读, body 为空。"""
 
     def __init__(self, app):
         self.app = app
@@ -486,7 +460,7 @@ class _JSONBody:
 
 def create_app() -> Starlette:
     routes = [
-        Route('/', index), Route('/console', console), Route('/login', login, methods=['POST']),
+        Route('/', index), Route('/console', old_console), Route('/login', login, methods=['POST']),
         Route('/api/overview', overview), Route('/api/activity', activity), Route('/api/conversations', conversations),
         Route('/api/chats', chats), Route('/api/mentions', mentions),
         Route('/api/tasks', tasks, methods=['GET', 'POST']), Route('/api/tasks/{task_id:int}', task_item, methods=['GET', 'DELETE']),
@@ -498,7 +472,6 @@ def create_app() -> Starlette:
         Route('/api/history', history), Route('/api/history/{sha}', history_item),
         Route('/api/logs', logs), Route('/api/control', control, methods=['POST']),
         Route('/api/restart', restart, methods=['POST']), Route('/api/recall', recall, methods=['POST']),
-        *[Route(path, api(fn), methods=methods) for path, fn, methods in im.ROUTES],
         Mount('/static', _Static(directory=str(STATIC)), name='static'),
     ]
     app = Starlette(routes=routes)

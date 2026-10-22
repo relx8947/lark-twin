@@ -1,4 +1,4 @@
-/* lark-twin 控制台。界面颜色用飞书网页端的设计色, 和网页版飞书一致; 图表系列色来自已校验的参考色板 */
+/* lark-twin 控制台。界面颜色用飞书网页端的设计色; 图表系列色来自已校验的参考色板 */
 :root {
   color-scheme: light;
   --surface-0: #f5f6f7;
@@ -169,10 +169,6 @@ pre.log .err { color: var(--critical); }
 .toast.show { opacity: .92; }
 .login { max-width: 460px; margin: 12vh auto; }
 .empty { color: var(--text-muted); padding: 8px 0; }
-
-/* 嵌在网页版飞书里 */
-html.embed .brand, html.embed .side .foot { display: none; }
-html.embed .side { padding-top: 14px; }
 
 @media (max-width: 860px) {
   .layout { grid-template-columns: 1fr; }

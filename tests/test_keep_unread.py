@@ -129,7 +129,7 @@ def test_reply_is_a_quote_reply_unless_already_in_a_thread(monkeypatch):
     assert reply('m7', RuntimeError('boom'))[0] == ('m7', 'm7', False)
     # 话题群拒收 isReplyInThread, 回复本来就在话题里; 不用查
     assert reply('t1', thread_chat=True) == (('t1', 't1', False), [])
-    # 网页版给了引用的那条和 in_thread: 照给的发, 不用查
+    # 调用方给了引用的那条和 in_thread: 照给的发, 不用查
     assert reply('m7', parent_id='m9', in_thread=False) == (('m7', 'm9', False), [])
 
 
@@ -141,7 +141,7 @@ def test_self_chat_target_and_keep_unread_off_send_normally(monkeypatch):
 
 
 def test_keep_unread_is_off_by_default(monkeypatch):
-    """已取消默认的匿名发送: 网页版、命令行、数字人默认都是普通发送, LARKX_KEEP_UNREAD=true 才打开。"""
+    """已取消默认的匿名发送: 命令行、数字人默认都是普通发送, LARKX_KEEP_UNREAD=true 才打开。"""
     from larkx.config import DEFAULTS, load_config
     monkeypatch.delenv('LARKX_KEEP_UNREAD', raising=False)
     assert DEFAULTS['keep_unread'] is False and load_config()['keep_unread'] is False

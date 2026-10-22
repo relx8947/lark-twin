@@ -88,70 +88,6 @@ def extract_rich_text(rich_text_dict):
     return text
 
 
-# 富文本元素的 property 是按元素类型编码的 protobuf 字节, 入库时字节会被丢掉(见 storage._json_default)。
-# 解码时把网页显示要用的几个字段解出来放进元素的 'prop'(只含字符串和数字), 本地库里的消息也能照样显示格式。
-TEXT_LIKE_TAGS = (1, 7, 8, 9, 23, 24, 25, 44, 45, 46)  # TEXT、B、I、U、H1~H6, 属性里只有一段文字
-
-
-def element_prop(tag: int, raw: bytes):
-    """解出一个富文本元素属性里显示要用的字段; 不认识的类型返回 None。"""
-    from .gateway import _lark_all
-    E = _lark_all().entities.RichTextElement
-    if tag in TEXT_LIKE_TAGS:
-        return {'content': E.TextProperty.FromString(raw).content}
-    if tag == 6:  # A: 链接
-        p = E.AnchorProperty.FromString(raw)
-        return {'href': p.href, 'content': p.content, 'textContent': p.textContent}
-    if tag == 5:  # AT
-        p = E.AtProperty.FromString(raw)
-        return {'userId': p.userId, 'content': p.content}
-    if tag in (10, 35):  # EMOTION、REACTION
-        return {'key': E.EmotionProperty.FromString(raw).key}
-    if tag == 2:  # IMG
-        p = E.ImageProperty.FromString(raw)
-        w, h = p.originWidth, p.originHeight
-        for variant in p.image.images:
-            if not (w and h) and variant.attribute.width and variant.attribute.height:
-                w, h = variant.attribute.width, variant.attribute.height
-        return {'key': p.token or p.image.imageKey or p.originKey, 'width': int(w or 0), 'height': int(h or 0)}
-    if tag == 17:  # LINK
-        return {'url': E.LinkProperty.FromString(raw).url}
-    if tag == 18:  # MEDIA
-        p = E.MediaProperty.FromString(raw)
-        return {'name': p.name, 'size': int(p.size), 'duration': int(p.duration)}
-    if tag == 31:  # CODE_BLOCK
-        return {'content': E.CodeBlockProperty.FromString(raw).content}
-    if tag == 37:  # CODE_BLOCK_V2: 按行存
-        p = E.CodeBlockV2Property.FromString(raw)
-        return {'content': '\n'.join(''.join(c.content for c in line.contents) for line in p.contents)}
-    if tag == 36:  # MENTION
-        return {'content': E.MentionProperty.FromString(raw).content}
-    if tag == 49:  # MARKDOWN: 原始 markdown 文本
-        return {'content': E.MarkdownProperty.FromString(raw).content}
-    if tag == 27:  # OL: 起始序号
-        return {'start': int(E.OLProperty.FromString(raw).start)}
-    return None
-
-
-def annotate_rich_text(rich_text_dict):
-    """给富文本的每个元素补上解码后的 'prop', 原来的 property 字节不动(触发判断还要用)。"""
-    try:
-        dictionary = rich_text_dict['elements']['dictionary']
-    except (TypeError, KeyError):
-        return rich_text_dict
-    for el in dictionary.values():
-        raw = el.get('property') if isinstance(el, dict) else None
-        if not isinstance(raw, (bytes, bytearray)) or not raw:
-            continue
-        try:
-            prop = element_prop(enum_to_int(el.get('tag', 1)), bytes(raw))
-        except Exception:
-            prop = None
-        if prop is not None:
-            el['prop'] = prop
-    return rich_text_dict
-
-
 def decode_message_content(message_type, content_bytes):
     try:
         if message_type == 4:
@@ -159,7 +95,6 @@ def decode_message_content(message_type, content_bytes):
             tc.ParseFromString(content_bytes)
             d = protobuf_to_dict(tc)
             text = extract_rich_text(d.get('richText', {})) or d.get('text', '')
-            annotate_rich_text(d.get('richText'))
             return (text, d)
         if message_type == 2:
             pc = P.PostContent()
@@ -167,7 +102,6 @@ def decode_message_content(message_type, content_bytes):
             d = protobuf_to_dict(pc)
             title = d.get('title', '')
             text = extract_rich_text(d.get('richText', {})) or d.get('text', '')
-            annotate_rich_text(d.get('richText'))
             return (f'[富文本] {title}\n{text}'.strip(), d)
         if message_type == 5:
             ic = P.ImageContent()
@@ -211,7 +145,6 @@ def decode_message_content(message_type, content_bytes):
             cc = P.CardContent()
             cc.ParseFromString(content_bytes)
             d = protobuf_to_dict(cc)
-            annotate_rich_text(d.get('richtext'))
             header = d.get('cardHeader') or {}
             title = header.get('title') or header.get('mainTitle') or ''
             json_card = d.get('jsonCard', '')
