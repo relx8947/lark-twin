@@ -60,10 +60,39 @@ def addressed_to_me(msg: dict, my_user_id: str) -> bool:
     return str(my_user_id) in ids
 
 
+def mentions_me(msg: dict, my_user_id: str) -> bool:
+    """消息里 @ 了本人: 先看 WS 推送带的 at_me; 补收的历史消息没有这个标记, 再从富文本里找 @ 本人的元素。"""
+    if msg.get('at_me'):
+        return True
+    data = msg.get('content_data')
+    rich = data.get('richText') if isinstance(data, dict) else None
+    try:
+        elements = rich['elements']['dictionary'].values()
+    except (TypeError, KeyError, AttributeError):
+        return False
+    for el in elements:
+        prop = (el or {}).get('property')
+        if (el or {}).get('tag') != AT_TAG or not isinstance(prop, (bytes, bytearray)):
+            continue
+        ap = P.AtProperty()
+        try:
+            ap.ParseFromString(prop)
+        except Exception:
+            continue
+        if ap.userId == str(my_user_id):
+            return True
+    return False
+
+
 def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
     t = cfg.get('triggers') or {}
+    is_own = str(msg.get('from_id')) == str(my_user_id)
     # 本人的消息只在有触发前缀时才可能触发: 数字人的回复被 CLI 禁止以前缀开头, 这样不会自己触发自己
-    if str(msg.get('from_id')) == str(my_user_id) and not (cfg.get('allow_self') and t.get('prefix')):
+    if is_own and not (cfg.get('allow_self') and t.get('prefix')):
+        return False
+    # 只有本人能唤起: 别人发的(私聊、群聊, 包括 @ 本人的)一律不触发;
+    # 接管中的会话、定时任务、larkx say 不经过这里, 不受影响
+    if t.get('owner_only') and not is_own:
         return False
     content = strip_mentions(msg.get('content'))
     chat_id = str(msg.get('chat_id'))
@@ -88,7 +117,10 @@ def should_handle(msg: dict, cfg: dict, my_user_id: str) -> bool:
     keywords = t.get('keywords') or []
     if keywords and (not any((kw in content for kw in keywords))):
         return False
-    if t.get('group_at_only') and type_name in ('group', 'topic_group') and (not msg.get('at_me')):
+    # 群里别人发的必须 @ 本人才算叫本人的数字人: 不带 @ 的 /ai 多半是在叫别的机器人;
+    # 本人自己在群里发的不受这条限制(不用 @ 自己)
+    if t.get('group_at_only') and not is_own and type_name in ('group', 'topic_group') \
+            and not mentions_me(msg, my_user_id):
         return False
     return True
 

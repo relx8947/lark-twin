@@ -74,7 +74,10 @@ DEFAULTS = {
         "exclude_chats": [],
         "include_senders": [],
         "keywords": [],
-        "group_at_only": False,
+        # 群聊/话题群里别人发的消息必须 @ 本人才触发(本人自己发的、私聊不受影响)
+        "group_at_only": True,
+        # 只有本人能唤起: 打开后别人发的消息(私聊、群聊, 包括 @ 本人的)一律不触发; 接管、定时任务、larkx say 不受影响
+        "owner_only": False,
     },
 }
 
@@ -86,6 +89,7 @@ TRIGGER_ENV = {
     "include_senders": "LARKX_TRIGGER_INCLUDE_SENDERS",
     "keywords": "LARKX_TRIGGER_KEYWORDS",
     "group_at_only": "LARKX_TRIGGER_GROUP_AT_ONLY",
+    "owner_only": "LARKX_TRIGGER_OWNER_ONLY",
 }
 
 
@@ -129,7 +133,7 @@ def load_config() -> dict:
         v = os.environ.get(env_name)
         if v is None:
             continue
-        if key == "group_at_only":
+        if isinstance(DEFAULTS["triggers"][key], bool):
             triggers[key] = _as_bool(v)
         elif isinstance(DEFAULTS["triggers"][key], list):
             triggers[key] = _as_list(v)

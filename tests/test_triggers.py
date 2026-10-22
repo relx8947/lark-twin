@@ -40,6 +40,89 @@ def test_group_at_only_and_chat_filters():
     assert not should_handle(dict(msg('/ai x'), chat_id='c2'), c, ME)
 
 
+def test_group_at_only_defaults_on():
+    assert DEFAULTS['triggers']['group_at_only'] is True
+    c = cfg(prefix='/ai')
+    # 别人在群/话题群里不 @ 本人: 不触发(多半是在叫别的机器人)
+    assert not should_handle(msg('/ai 整理一下群发言', chat_type=2), c, ME)
+    assert not should_handle(msg('/ai 整理一下群发言', chat_type=3), c, ME)
+    assert not should_handle(msg('/ai x', chat_type=2, at_me=False), c, ME)
+    # 别人在群里 @ 本人: 触发
+    assert should_handle(msg('/ai x', chat_type=2, at_me=True), c, ME)
+    assert should_handle(msg('@耿宇贺 /ai x', chat_type=3, at_me=True), c, ME)
+    # @ 了本人但没有触发前缀: 仍不触发
+    assert not should_handle(msg('@耿宇贺 你好', chat_type=2, at_me=True), c, ME)
+    # 本人自己在群里发 /ai: 不用 @ 自己也触发
+    assert should_handle(msg('/ai x', from_id=ME, chat_type=2), c, ME)
+    assert should_handle(msg('/ai x', from_id=ME, chat_type=3), c, ME)
+    # 私聊照旧, 不需要 @
+    assert should_handle(msg('/ai x', chat_type=1), c, ME)
+    assert not should_handle(msg('你好', chat_type=1), c, ME)
+    # 关掉后回到群里任何人发 /ai 都触发
+    assert should_handle(msg('/ai x', chat_type=2), cfg(prefix='/ai', group_at_only=False), ME)
+
+
+def test_group_at_only_reads_rich_text_mentions():
+    """补收的历史消息 at_me 恒为 False, 要从富文本里认出 @ 本人。"""
+    c = cfg(prefix='/ai')
+    content, data = rich(('text', '/ai 问问 '), ('at', ME, '@耿宇贺'))
+    assert should_handle(msg(content, chat_type=2, content_data=data, at_me=False), c, ME)
+    content, data = rich(('text', '/ai 问问 '), ('at', '999', '@张三'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data, at_me=False), c, ME)
+
+
+def test_group_at_only_env(monkeypatch):
+    from larkx.config import load_config
+    monkeypatch.delenv('LARKX_TRIGGER_GROUP_AT_ONLY', raising=False)
+    assert load_config()['triggers']['group_at_only'] is True
+    monkeypatch.setenv('LARKX_TRIGGER_GROUP_AT_ONLY', 'false')
+    assert load_config()['triggers']['group_at_only'] is False
+    monkeypatch.setenv('LARKX_TRIGGER_GROUP_AT_ONLY', 'true')
+    assert load_config()['triggers']['group_at_only'] is True
+
+
+def test_owner_only_env(monkeypatch):
+    from larkx.config import load_config
+    assert DEFAULTS['triggers']['owner_only'] is False
+    monkeypatch.delenv('LARKX_TRIGGER_OWNER_ONLY', raising=False)
+    assert load_config()['triggers']['owner_only'] is False
+    monkeypatch.setenv('LARKX_TRIGGER_OWNER_ONLY', 'true')
+    assert load_config()['triggers']['owner_only'] is True
+    monkeypatch.setenv('LARKX_TRIGGER_OWNER_ONLY', 'false')
+    assert load_config()['triggers']['owner_only'] is False
+
+
+def test_owner_only_on():
+    c = cfg(prefix='/ai', owner_only=True)
+    # 别人发的: 私聊、群聊、话题群, 包括 @ 本人的, 一律不触发
+    assert not should_handle(msg('/ai 你好', chat_type=1), c, ME)
+    assert not should_handle(msg('/ai 你好', chat_type=2), c, ME)
+    assert not should_handle(msg('/ai 你好', chat_type=2, at_me=True), c, ME)
+    assert not should_handle(msg('@耿宇贺 /ai 你好', chat_type=3, at_me=True), c, ME)
+    content, data = rich(('at', ME, '@耿宇贺'), ('text', ' /ai 你好'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data, at_me=True), c, ME)
+    # 本人发的 /ai: 私聊、群聊照常触发(群里不用 @ 自己)
+    assert should_handle(msg('/ai 你好', from_id=ME, chat_type=1), c, ME)
+    assert should_handle(msg('/ai 你好', from_id=ME, chat_type=2), c, ME)
+    assert should_handle(msg('/ai /stop', from_id=ME, chat_type=3), c, ME)
+    # 本人发的没有前缀、或开头 @ 了别人: 仍不触发
+    assert not should_handle(msg('你好', from_id=ME, chat_type=1), c, ME)
+    content, data = rich(('at', '999', '@江勇涛'), ('text', ' /ai 你好'))
+    assert not should_handle(msg(content, from_id=ME, chat_type=2, content_data=data), c, ME)
+
+
+def test_owner_only_off_matches_group_rules():
+    """开关关闭(默认)时和群聊规则一致: 私聊照旧, 群里别人要 @ 本人, 本人不用 @。"""
+    c = cfg(prefix='/ai')
+    assert c['triggers']['owner_only'] is False
+    assert should_handle(msg('/ai 你好', chat_type=1), c, ME)
+    assert not should_handle(msg('/ai 你好', chat_type=2), c, ME)
+    assert should_handle(msg('/ai 你好', chat_type=2, at_me=True), c, ME)
+    assert should_handle(msg('/ai 你好', from_id=ME, chat_type=2), c, ME)
+    content, data = rich(('at', '999', '@江勇涛'), ('text', ' /ai 你好'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data, at_me=True), c, ME)
+
+
 def test_parse_command():
     assert parse_command(strip_prefix('/ai /clear', '/ai')) == ('clear', '')
     assert parse_command(strip_prefix('/ai /stop 然后做别的', '/ai')) == ('stop', '然后做别的')
@@ -83,9 +166,16 @@ def test_leading_mentions_must_include_me():
     assert should_handle(msg(content, chat_type=2, content_data=data), c, ME)
     content, data = rich(('at', 'all', '@所有人'), ('text', '/ai 通知'))
     assert not should_handle(msg(content, chat_type=2, content_data=data), c, ME)
-    # 开头没有 @、@ 在指令后面: 照常触发
+    # 开头 @ 了别人, 即使后面也 @ 了本人(at_me 为真): 仍不触发
+    content, data = rich(('at', '999', '@江勇涛'), ('text', ' /ai 问下 '), ('at', ME, '@耿宇贺'))
+    assert not should_handle(msg(content, chat_type=2, content_data=data, at_me=True), c, ME)
+    # 本人自己开头 @ 别人: 同样不触发(是在叫那个人的数字人)
+    content, data = rich(('at', '999', '@江勇涛'), ('text', ' /ai 你好'))
+    assert not should_handle(msg(content, from_id=ME, chat_type=2, content_data=data), c, ME)
+    # 开头没有 @、@ 在指令后面: 群里还要看有没有 @ 本人(group_at_only 默认开)
     content, data = rich(('text', '/ai 问问 '), ('at', '999', '@张三'))
-    assert should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    assert not should_handle(msg(content, chat_type=2, content_data=data), c, ME)
+    assert should_handle(msg(content, chat_type=2, content_data=data), cfg(prefix='/ai', group_at_only=False), ME)
     # 解析不出富文本时退回 at_me
     assert should_handle(msg('@耿宇贺 /ai x', chat_type=2, at_me=True), c, ME)
     assert not should_handle(msg('@江勇涛 /ai x', chat_type=2), c, ME)

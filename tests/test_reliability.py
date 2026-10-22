@@ -115,7 +115,9 @@ def _daemon(tmp_path, fake_client, monkeypatch):
 def test_inbox_survives_restart(tmp_path, monkeypatch, fake_client):
     obj = _daemon(tmp_path, fake_client, monkeypatch)
     now = int(time.time())
-    msg = {'msg_id': 'x1', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '200', 'content': '/ai 在吗', 'create_time': now}
+    # 群里别人发的要 @ 本人才触发(group_at_only 默认开)
+    msg = {'msg_id': 'x1', 'chat_id': 'g1', 'chat_type': 2, 'from_id': '200', 'content': '/ai 在吗', 'create_time': now,
+           'at_me': True}
 
     async def receive_then_crash():
         await obj.on_message(msg, '项目群', '张三')
@@ -214,6 +216,59 @@ def test_takeover_flow(tmp_path, monkeypatch, fake_client):
     assert any('已接管' in t for c, t in fake_client.sent if c == 'self')  # 确认只发到本人私聊
     assert all(c == 'self' for c, _ in fake_client.sent)
     assert obj.storage.takeover_get('p1', time.time()) is None
+
+
+def test_takeover_in_group_ignores_group_at_only(tmp_path, monkeypatch, fake_client):
+    """群里接管: 本人发 /ai /takeover 不用 @ 自己; 接管期间别人不 @ 本人的话也交给数字人。"""
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    assert obj.cfg['triggers']['group_at_only'] is True
+    me = fake_client.auth.user_id
+    base = {'chat_id': 'g1', 'chat_type': 2, 'create_time': int(time.time())}
+
+    async def run():
+        await obj.on_message(dict(base, msg_id='g0', from_id='200', content='/ai 在吗'), '项目群', '张三')
+        before = obj.inbox.qsize()
+        await obj.on_message(dict(base, msg_id='g1', from_id=me, content='/ai /takeover 1h'), '项目群', '我')
+        await obj.on_message(dict(base, msg_id='g2', from_id='200', content='周二下午可以吗'), '项目群', '张三')
+        return before, obj.inbox.qsize()
+
+    assert asyncio.run(run()) == (0, 1)                  # 接管前不 @ 不触发; 接管后对方的话照样进队列
+    assert obj.storage.takeover_get('g1', time.time()) is not None
+    assert obj.inbox.get_nowait().ref == 'g2'
+
+
+def test_owner_only_keeps_takeover_tasks_and_say(tmp_path, monkeypatch, fake_client):
+    """只有本人能唤起: 别人的 /ai 不触发; 本人主动接管的会话、定时任务、larkx say 照常进队列。"""
+    from larkx import daemon as d
+    obj = _daemon(tmp_path, fake_client, monkeypatch)
+    obj.cfg['triggers']['owner_only'] = True
+    obj.cfg['memory_review_hour'] = -1
+    me = fake_client.auth.user_id
+    p2p = {'chat_id': 'p1', 'chat_type': 1, 'create_time': int(time.time())}
+
+    async def run():
+        await obj.on_message(dict(p2p, msg_id='o1', from_id='200', content='/ai 在吗'), '张三', '张三')
+        await obj.on_message(dict(p2p, msg_id='o2', chat_id='g1', chat_type=2, from_id='200', content='/ai 在吗',
+                                  at_me=True), '项目群', '张三')
+        before = obj.inbox.qsize()
+        await obj.on_message(dict(p2p, msg_id='o3', from_id=me, content='/ai /takeover 1h'), '张三', '我')
+        await obj.on_message(dict(p2p, msg_id='o4', from_id='200', content='周二下午可以吗'), '张三', '张三')
+        return before, obj.inbox.qsize()
+
+    assert asyncio.run(run()) == (0, 1)                  # 别人私聊/群里 @ 本人都不触发; 接管后对方的话照常进队列
+    assert obj.inbox.get_nowait().ref == 'o4'
+
+    obj.storage.add_task(kind='task', due_at=1, prompt='提醒喝水', chat_id='p1', by_owner=1)
+    obj.storage.add_task(kind='say', due_at=1, prompt='看下今天的消息')
+    monkeypatch.setattr(d, 'SCHEDULER_INTERVAL', 0)
+
+    async def one_round():
+        task = asyncio.create_task(obj._schedule())
+        evs = [await asyncio.wait_for(obj.inbox.get(), 2) for _ in range(2)]
+        task.cancel()
+        return evs
+
+    assert sorted(ev.kind for ev in asyncio.run(one_round())) == ['say', 'task']
 
 
 def test_takeover_in_owner_chat_gives_hint(tmp_path, monkeypatch, fake_client):
