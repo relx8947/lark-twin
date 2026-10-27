@@ -187,11 +187,16 @@ def cmd_send(args):
     agent = is_agent_actor()
     turn = state.read_turn() if agent else None
     client = LarkClient(LarkAuth())
+    # 防自回环的前缀检测按纯文本做, 不能让 markdown 格式把开头的触发前缀藏起来
+    plain = text
+    if getattr(args, 'markdown', False):
+        from .protocol import richtext
+        plain = richtext.to_plain_text(text)
     if agent:
         from .daemon.triggers import strip_mentions
         from .notify import Notifier
         # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
-        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(text).startswith(prefix) else ''
+        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(plain).startswith(prefix) else ''
         denied = denied or state.send_denied(args.chat_id, turn)
         if not denied:
             n = st.count_actions('agent', 'send', datetime.now() - timedelta(minutes=10))
@@ -204,7 +209,13 @@ def cmd_send(args):
                                         key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
             return _fail(args, denied)
         text = with_signature(text, cfg)
-    msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
+        if getattr(args, 'markdown', False):
+            from .protocol import richtext
+            plain = richtext.to_plain_text(text)
+    if getattr(args, 'markdown', False):
+        msg_id = client.send_markdown(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
+    else:
+        msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
     _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
     if not msg_id:
         return _fail(args, '发送失败')
@@ -215,7 +226,7 @@ def cmd_send(args):
             name = st.get_chat_name(args.chat_id) or args.chat_id
             notifier.send(f'📤 数字人在「{name}」发了:\n{text}', fallback=False)
     # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
-    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 4, 'msg_type_name': 'TEXT', 'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
     if args.json:
         _print_json({'ok': True, 'msg_id': msg_id, 'chat_id': args.chat_id})
     else:
@@ -822,10 +833,12 @@ def main():
     p.add_argument('--file', help='从文件读 cookie')
     p.add_argument('--region', choices=list(REGIONS), help='qr/import 登录的区域: feishu=飞书(国内版) lark=Lark(国际版);默认沿用已有凭证,无凭证时取 LARKX_REGION')
     p.set_defaults(fn=cmd_auth)
-    p = sub.add_parser('send', help='发送文本消息')
+    p = sub.add_parser('send', help='发送文本或 markdown 富文本消息')
     p.add_argument('chat_id')
     p.add_argument('text', nargs='*', help='消息内容; 省略或写 - 时从 stdin 读取')
     p.add_argument('--root', help='回复哪条消息: 普通群和私聊里是主会话里的引用回复(那条已在话题里时回进话题), 话题群里回进话题')
+    p.add_argument('-m', '--markdown', action='store_true',
+                   help='按 markdown 富文本发送: 代码块(```)、有序/无序列表、标题、引用、**加粗**、*斜体*、链接; 不带此选项时按纯文本发送')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser('config', help='查看生效中的配置(配置项写在 .env 里)')

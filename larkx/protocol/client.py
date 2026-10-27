@@ -152,6 +152,10 @@ class LarkClient:
         """发一条纯文字消息, 见 send_message。"""
         return self.send_message({'kind': 'text', 'text': text}, chat_id, root_id=root_id, keep_unread=keep_unread)
 
+    def send_markdown(self, text: str, chat_id: str, root_id: str=None, keep_unread: bool=False):
+        """发一条 markdown 富文本(代码块、列表、标题、引用、加粗/斜体、链接), 见 send_message。"""
+        return self.send_message({'kind': 'markdown', 'text': text}, chat_id, root_id=root_id, keep_unread=keep_unread)
+
     def send_message(self, msg: dict, chat_id: str, root_id: str=None, keep_unread: bool=False, fallback: bool=True,
                      parent_id: str=None, in_thread: bool=None):
         """发一条消息(文字、带 @ 的文字、图片、文件, 格式见 builders 里的消息描述)。

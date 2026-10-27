@@ -1,5 +1,6 @@
 from protobuf_to_dict import protobuf_to_dict
 from . import proto_pb2 as P
+from .gateway import _lark_all
 MSG_TYPE_NAMES = {
     0: 'UNKNOWN', 2: 'POST', 3: 'FILE', 4: 'TEXT', 5: 'IMAGE', 6: 'SYSTEM',
     7: 'AUDIO', 8: 'EMAIL', 9: 'SHARE_GROUP_CHAT', 10: 'STICKER',
@@ -71,47 +72,107 @@ def resolve_scope(msg_id: str, msg_type: int, chat_type: int, root_id: str, thre
 
 
 def extract_rich_text(rich_text_dict):
-    TAG_PLACEHOLDERS = {2: '[图片]', 5: '[@]', 10: '[表情]', 18: '[视频]', 22: '[文档]'}
+    """把 richText 元素树展开成纯文本摘要。
+
+    富文本有两种布局: 老的扁平式(叶子直接挂在 elementIds 下)和树形(DOCS(22) 下挂 P/UL/OL/LI/QUOTE/
+    代码块等块级元素, 文字在叶子里), 都按 childIds 递归走一遍。块级元素之间补换行, 列表项补
+    "- "/"n. "前缀, 代码块(31/37)取代码内容。解码失败的元素按占位符处理。
+    """
+    TAG_PLACEHOLDERS = {2: '[图片]', 10: '[表情]', 18: '[视频]'}
+    TEXT_TAGS = (1, 7, 8, 9, 17, 23, 24, 25, 44, 45, 46)
+    BLOCK_TAGS = (3, 26, 27, 28, 29, 31, 37, 23, 24, 25, 44, 45, 46)
+    AT, A, OL, LI, CODE_BLOCK, CODE_BLOCK_V2, P_TAG = 5, 6, 27, 28, 31, 37, 3
+    E = _lark_all().entities.RichTextElement
     text = ''
     try:
         dictionary = rich_text_dict['elements']['dictionary']
-        element_ids = rich_text_dict.get('elementIds') or []
-        if element_ids:
-            ordered = [(k, dictionary[k]) for k in element_ids if k in dictionary]
-            ordered += [(k, v) for k, v in dictionary.items() if k not in set(element_ids)]
-        else:
-            try:
-                ordered = sorted(dictionary.items(), key=lambda item: int(item[0]))
-            except Exception:
-                ordered = list(dictionary.items())
-        for k, v in ordered:
-            tag = v.get('tag', 1)
-            prop = v.get('property')
+
+        def render_tag(tag, prop):
+            nonlocal text
             if not prop:
-                continue
-            if tag in (1, 3, 7, 8, 9, 17):
+                return
+            if tag in TEXT_TAGS:
                 tp = P.TextProperty()
                 try:
                     tp.ParseFromString(prop)
                     text += tp.content
-                    if tag == 3:
-                        text += '\n'
-                    continue
                 except Exception:
                     pass
-            if tag == 5:
+                return
+            if tag == AT:
                 ap = P.AtProperty()
                 try:
                     ap.ParseFromString(prop)
-                    if ap.content:
-                        text += ap.content
-                        continue
+                    text += ap.content or '[@]'
+                except Exception:
+                    text += '[@]'
+                return
+            if tag == A:
+                lp = E.LinkProperty()
+                try:
+                    lp.ParseFromString(prop)
+                    if lp.url:
+                        text += lp.url
                 except Exception:
                     pass
+                return
+            if tag == CODE_BLOCK:
+                cb = E.CodeBlockProperty()
+                try:
+                    cb.ParseFromString(prop)
+                    text += cb.content
+                except Exception:
+                    pass
+                return
+            if tag == CODE_BLOCK_V2:
+                cb = E.CodeBlockV2Property()
+                try:
+                    cb.ParseFromString(prop)
+                    for line in cb.contents:
+                        text += ''.join(c.content for c in line.contents) + '\n'
+                except Exception:
+                    pass
+                return
             text += TAG_PLACEHOLDERS.get(tag, '')
+
+        seen = set()
+
+        def walk(key, ordered=False, index=0):
+            nonlocal text
+            if key in seen:
+                return
+            seen.add(key)
+            v = dictionary.get(key)
+            if not isinstance(v, dict):
+                return
+            tag = enum_to_int(v.get('tag', 1))
+            prop = v.get('property')
+            children = v.get('childIds') or []
+            if tag == LI:
+                text += f'{index + 1}. ' if ordered else '- '
+            if children:
+                if tag in BLOCK_TAGS and tag != LI and text and not text.endswith('\n'):
+                    text += '\n'
+                for i, child in enumerate(children):
+                    walk(child, ordered=(tag == OL), index=i)
+                if tag in BLOCK_TAGS and not text.endswith('\n'):
+                    text += '\n'
+            else:
+                render_tag(tag, prop)
+                if tag == P_TAG and not text.endswith('\n'):
+                    text += '\n'
+
+        element_ids = rich_text_dict.get('elementIds') or []
+        roots = [k for k in element_ids if k in dictionary]
+        # 扁平布局或漏挂的元素: 按 id 顺序补在后面
+        roots_set = set(roots)
+        roots += [k for k in sorted(dictionary, key=lambda x: int(x) if str(x).isdigit() else 0)
+                  if k not in roots_set]
+        for root in roots:
+            walk(root)
     except Exception:
         pass
-    return text
+    return text.strip()
 
 
 def decode_message_content(message_type, content_bytes):

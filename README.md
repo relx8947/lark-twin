@@ -56,6 +56,7 @@ cp .env.example .env          # 选择 claude / codex，并填写启动命令
 
 ```bash
 larkx send <chat_id> - <<'EOF'   # 以你的身份发消息
+larkx send <chat_id> -m -        # 发 markdown 富文本：代码块、列表、标题、引用、加粗/斜体、链接
 larkx say --wait "…"             # 直接指挥数字人
 larkx task add --in 30m -        # 安排定时任务
 larkx takeover start <chat_id> --for 2h --goal "…"   # 让它替你聊一段
