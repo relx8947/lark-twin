@@ -342,13 +342,28 @@ def parse_ws_frame(raw: bytes):
     return (frame_d, packet_d)
 
 
+def push_sids(raw: bytes) -> list:
+    """PUSH_SID(cmd 6000)帧: 服务端只推来 sid, 完整的推送包要按 sid 再拉。返回要拉的 sid: 包自己的 sid,
+    加上合并在一起推来的 compactedSids(proto_pb2.Packet 里没有这个字段, 按 improto.Packet 解)。"""
+    frame = P.Frame()
+    frame.ParseFromString(raw)
+    packet = _lark_all().improto.Packet()
+    packet.ParseFromString(frame_payload(frame))
+    return list(dict.fromkeys(s for s in (packet.sid, *map(str, packet.compactedSids)) if s))
+
+
 def decode_push_messages(raw: bytes):
     _, packet = parse_ws_frame(raw)
+    return push_messages(packet.get('payload') or b'')
+
+
+def push_messages(payload: bytes):
+    """新消息推送(PushMessagesRequest)里的消息。"""
     out = []
-    if 'payload' not in packet:
+    if not payload:
         return out
     pmr = P.PushMessagesRequest()
-    pmr.ParseFromString(packet['payload'])
+    pmr.ParseFromString(payload)
     pmr_d = protobuf_to_dict(pmr)
     at_me_map = pmr_d.get('messagesAtMe') or {}
     for k, v in (pmr_d.get('messages') or {}).items():

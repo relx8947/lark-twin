@@ -11,16 +11,19 @@ from .proto import builders, decoders, gateway, proto_pb2 as P
 from .proto.ids import generate_access_key, generate_long_request_id, generate_request_cid, generate_request_id
 
 WS_STATS_INTERVAL = 600
+PUSH_SID = 6000  # improto.Command.PUSH_SID: 只推来 sid, 完整的推送包要按 sid 再拉
 
 
 class PushStats:
     """WS 收到的推送统计, 用来查长连接漏推: 新消息(cmd 6)以外的推送每种 cmd 第一次出现时打一条 INFO(带解出来的内容摘要),
-    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数; 解不开的帧限频打 WARNING。不逐帧打日志。"""
+    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数和按 sid 补拉的结果; 解不开的帧、补拉失败限频打 WARNING。不逐帧打日志。"""
 
     def __init__(self, interval: int = WS_STATS_INTERVAL, clock=time.monotonic):
         self.interval, self.clock = interval, clock
         self.counts, self.seen = {}, set()
         self.compressed = self.errors = self.muted = 0
+        self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
+        self.pull_logged = False
         self.last_report = self.last_warn = clock()
         self.warned = False
 
@@ -37,15 +40,29 @@ class PushStats:
         logger.info(f'[WS 推送] 第一次收到 cmd {cmd}({names}), payload {len(packet.get("payload") or b"")} 字节: '
                     f'{str(body)[:300] if body is not None else "解不出来"}')
 
-    def error(self, e, raw: bytes):
-        """解不开的帧: 第一次马上打 WARNING, 之后每个周期最多打一条, 带上这期间压下去的条数。"""
-        self.errors += 1
+    def pull(self, sids, packets: dict, msgs: int):
+        """按 sid 补拉了一次 PUSH_SID: 拉到的包按 cmd 计数; 第一次拉到时打一条 INFO 看看拉回来的是什么。"""
+        self.pulls += 1
+        self.pulled_msgs += msgs
+        cmds = [int(p.get('cmd') or 0) for p in packets.values()]
+        for c in cmds:
+            self.pulled[c] = self.pulled.get(c, 0) + 1
+        if not self.pull_logged:
+            self.pull_logged = True
+            logger.info(f'[WS 推送] 第一次按 sid 补拉 PUSH_SID: sid {list(sids)} → {len(packets)} 个包, cmd {cmds}, 新消息 {msgs} 条')
+
+    def error(self, e, raw: bytes = b'', what: str = ''):
+        """解不开的帧(或按 sid 补拉失败): 第一次马上打 WARNING, 之后每个周期最多打一条, 带上这期间压下去的条数。"""
+        if what:
+            self.pull_errors += 1
+        else:
+            self.errors += 1
         now = self.clock()
         if self.warned and now - self.last_warn < self.interval:
             self.muted += 1
             return
-        more = f'(上次告警后还有 {self.muted} 帧也解不开)' if self.muted else ''
-        logger.warning(f'[WS 推送] 解不开的帧, {len(raw)} 字节, 已跳过: {e!r}{more}')
+        more = f'(上次告警后还有 {self.muted} 次也出错)' if self.muted else ''
+        logger.warning(f'[WS 推送] {what or f"解不开的帧, {len(raw)} 字节, 已跳过"}: {e!r}{more}')
         self.warned, self.last_warn, self.muted = True, now, 0
 
     def maybe_report(self):
@@ -55,9 +72,12 @@ class PushStats:
         minutes = (now - self.last_report) / 60
         others = ', '.join(f'cmd {c}({"/".join(gateway.push_types(c)) or "未知"}) {n}'
                            for c, n in sorted(self.counts.items()) if c != 6) or '无'
+        pulled = ', '.join(f'cmd {c} {n}' for c, n in sorted(self.pulled.items())) or '无'
         logger.info(f'[WS 推送] 近 {minutes:.0f} 分钟: 新消息(cmd 6) {self.counts.get(6, 0)} 帧, 其他推送: {others}; '
-                    f'压缩帧 {self.compressed}, 解不开的帧 {self.errors}')
+                    f'压缩帧 {self.compressed}, 解不开的帧 {self.errors}; 按 sid 补拉 PUSH_SID {self.pulls} 次, '
+                    f'拉到的包: {pulled}, 新消息 {self.pulled_msgs} 条, 补拉失败 {self.pull_errors} 次')
         self.counts, self.compressed, self.errors, self.last_report = {}, 0, 0, now
+        self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
 
 
 class LarkClient:
@@ -162,12 +182,31 @@ class LarkClient:
                                 if not msg.get('from_id'):
                                     continue
                                 asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
+                        elif cmd == PUSH_SID:
+                            asyncio.run_coroutine_threadsafe(self._pull_sids(decoders.push_sids(raw), on_message), self.loop)
                         self.push_stats.packet(cmd, frame, packet)
                     except Exception as e:
                         self.push_stats.error(e, raw)
                     self.push_stats.maybe_report()
             finally:
                 heartbeat_task.cancel()
+
+    async def _pull_sids(self, sids, on_message):
+        """PUSH_SID: 服务端没把推送包直接推过来, 只推来 sid(机器人发的卡片等很多消息都这样推), 要按 sid 再拉
+        (improto.PullPacketsBySidsRequest, 只是取推送包, 不改变已读状态)。拉到的新消息推送和直接推来的一样处理。"""
+        if not sids:
+            return
+        try:
+            resp = await asyncio.to_thread(self.api, 'improto.PullPacketsBySidsRequest', {'sids': sids})
+            packets = (resp or {}).get('packets') or {}
+            msgs = [m for p in packets.values() if int(p.get('cmd') or 0) == 6
+                    for m in decoders.push_messages(p.get('payload') or b'') if m.get('from_id')]
+        except Exception as e:
+            self.push_stats.error(e, what=f'按 sid 补拉 PUSH_SID {sids} 失败, 这几条靠补收')
+            return
+        self.push_stats.pull(sids, packets, len(msgs))
+        for msg in msgs:
+            await self._dispatch(msg, on_message)
 
     async def _dispatch(self, msg, on_message):
         try:
