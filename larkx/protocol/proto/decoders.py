@@ -1,3 +1,5 @@
+import gzip
+import zlib
 from protobuf_to_dict import protobuf_to_dict
 from . import proto_pb2 as P
 from .gateway import _lark_all
@@ -317,12 +319,25 @@ def decode_message_content(message_type, content_bytes):
     return (f'[{MSG_TYPE_NAMES.get(message_type, message_type)}类型消息]', None)
 
 
+def frame_payload(frame) -> bytes:
+    """WS 帧里 Packet 的字节。连接时声明了 accept_encoding=gzip, 服务端可以把推送 gzip 压缩后再发(payloadEncoding
+    标成 gzip, 或者没标但数据是 gzip 格式), 要先解压, 否则解不出 Packet, 整条推送会被当成坏帧丢掉。"""
+    encoding = (frame.payloadEncoding or '').lower()
+    if encoding == 'gzip' or (not encoding and frame.payload[:2] == b'\x1f\x8b'):
+        return gzip.decompress(frame.payload)
+    if encoding in ('deflate', 'zlib'):
+        return zlib.decompress(frame.payload)
+    if encoding and encoding not in ('identity', 'pb'):
+        raise ValueError(f'不认识的 payloadEncoding: {encoding}')
+    return frame.payload
+
+
 def parse_ws_frame(raw: bytes):
     frame = P.Frame()
     frame.ParseFromString(raw)
     frame_d = protobuf_to_dict(frame)
     packet = P.Packet()
-    packet.ParseFromString(frame.payload)
+    packet.ParseFromString(frame_payload(frame))
     packet_d = protobuf_to_dict(packet)
     return (frame_d, packet_d)
 

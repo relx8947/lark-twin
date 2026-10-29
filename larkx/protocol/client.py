@@ -7,8 +7,57 @@ import websockets
 from loguru import logger
 from .. import state
 from .auth import LarkAuth
-from .proto import builders, decoders, proto_pb2 as P
+from .proto import builders, decoders, gateway, proto_pb2 as P
 from .proto.ids import generate_access_key, generate_long_request_id, generate_request_cid, generate_request_id
+
+WS_STATS_INTERVAL = 600
+
+
+class PushStats:
+    """WS 收到的推送统计, 用来查长连接漏推: 新消息(cmd 6)以外的推送每种 cmd 第一次出现时打一条 INFO(带解出来的内容摘要),
+    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数; 解不开的帧限频打 WARNING。不逐帧打日志。"""
+
+    def __init__(self, interval: int = WS_STATS_INTERVAL, clock=time.monotonic):
+        self.interval, self.clock = interval, clock
+        self.counts, self.seen = {}, set()
+        self.compressed = self.errors = self.muted = 0
+        self.last_report = self.last_warn = clock()
+        self.warned = False
+
+    def packet(self, cmd, frame: dict, packet: dict):
+        cmd = int(cmd or 0)
+        self.counts[cmd] = self.counts.get(cmd, 0) + 1
+        if frame.get('payloadEncoding') or (frame.get('payload') or b'')[:2] == b'\x1f\x8b':
+            self.compressed += 1
+        if cmd == 6 or cmd in self.seen:
+            return
+        self.seen.add(cmd)
+        names = '/'.join(gateway.push_types(cmd)) or '未知'
+        body = gateway.decode_push(cmd, packet.get('payload') or b'')
+        logger.info(f'[WS 推送] 第一次收到 cmd {cmd}({names}), payload {len(packet.get("payload") or b"")} 字节: '
+                    f'{str(body)[:300] if body is not None else "解不出来"}')
+
+    def error(self, e, raw: bytes):
+        """解不开的帧: 第一次马上打 WARNING, 之后每个周期最多打一条, 带上这期间压下去的条数。"""
+        self.errors += 1
+        now = self.clock()
+        if self.warned and now - self.last_warn < self.interval:
+            self.muted += 1
+            return
+        more = f'(上次告警后还有 {self.muted} 帧也解不开)' if self.muted else ''
+        logger.warning(f'[WS 推送] 解不开的帧, {len(raw)} 字节, 已跳过: {e!r}{more}')
+        self.warned, self.last_warn, self.muted = True, now, 0
+
+    def maybe_report(self):
+        now = self.clock()
+        if now - self.last_report < self.interval:
+            return
+        minutes = (now - self.last_report) / 60
+        others = ', '.join(f'cmd {c}({"/".join(gateway.push_types(c)) or "未知"}) {n}'
+                           for c, n in sorted(self.counts.items()) if c != 6) or '无'
+        logger.info(f'[WS 推送] 近 {minutes:.0f} 分钟: 新消息(cmd 6) {self.counts.get(6, 0)} 帧, 其他推送: {others}; '
+                    f'压缩帧 {self.compressed}, 解不开的帧 {self.errors}')
+        self.counts, self.compressed, self.errors, self.last_report = {}, 0, 0, now
 
 
 class LarkClient:
@@ -23,6 +72,7 @@ class LarkClient:
         self._thread_chats = {}
         self._bots = {}
         self._self_chat = ''
+        self.push_stats = PushStats()
 
     def build_ws_url(self) -> str:
         device_id = self.auth.device_id
@@ -103,19 +153,19 @@ class LarkClient:
             try:
                 async for raw in ws:
                     try:
-                        _, packet = decoders.parse_ws_frame(raw)
+                        frame, packet = decoders.parse_ws_frame(raw)
                         sid, cmd = (packet.get('sid'), packet.get('cmd'))
                         if sid is not None:
                             await self.send_ack(ws, sid)
-                        if cmd != 6:
-                            continue
-                        for msg in decoders.decode_push_messages(raw):
-                            if not msg.get('from_id'):
-                                continue
-                            asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
+                        if cmd == 6:
+                            for msg in decoders.decode_push_messages(raw):
+                                if not msg.get('from_id'):
+                                    continue
+                                asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
+                        self.push_stats.packet(cmd, frame, packet)
                     except Exception as e:
-                        logger.debug(f'跳过异常帧: {e}')
-                        continue
+                        self.push_stats.error(e, raw)
+                    self.push_stats.maybe_report()
             finally:
                 heartbeat_task.cancel()
 

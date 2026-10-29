@@ -53,6 +53,24 @@ def resolve_cmd(type_or_cmd):
     return (entry['cmd'], req_cls, resp_cls)
 
 
+def push_types(cmd: int) -> list:
+    """cmd 对应的推送消息类型名(如 18 → chats.PushChatsRequest); 不是推送的 cmd 返回映射里的全部名字。"""
+    names = [r['req'] for r in _cmd_map()['by_cmd'].get(str(cmd), []) if r.get('req')]
+    return [n for n in names if '.Push' in n] or names
+
+
+def decode_push(cmd: int, payload: bytes):
+    """按 cmd 对应的推送类型解出 WS 推送的 payload, 解不出来时返回 None。只用于观察日志。"""
+    for name in push_types(cmd):
+        try:
+            msg = resolve_type(name)()
+            msg.ParseFromString(payload)
+            return protobuf_to_dict(msg)
+        except Exception:
+            continue
+    return None
+
+
 def build_packet(cmd: int, request_id: str, req_msg=None, req_bytes: bytes=None) -> P.Packet:
     pkt = P.Packet()
     pkt.payloadType = 1
