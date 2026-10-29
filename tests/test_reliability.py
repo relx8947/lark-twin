@@ -151,7 +151,7 @@ def test_catch_up_feeds_missed_messages(tmp_path, monkeypatch, fake_client):
     obj.listener = FakeListener()
     fake_client.api = lambda t, d=None: {'chats': {'g1': {'lastMessagePosition': 12}}}
     fake_client.pull_history = lambda cid, positions: [{'msg_id': f'p{p}', 'from_id': '200', 'chat_id': cid} for p in positions]
-    assert asyncio.run(obj.catch_up()) == 2 and fed == ['p11', 'p12']
+    assert asyncio.run(obj.catch_up()) == ({'g1': 2}, 0) and fed == ['p11', 'p12']
 
 
 def test_daemon_skips_relay_but_handles_forwarded_copy(tmp_path, monkeypatch, fake_client):

@@ -27,7 +27,7 @@ def _save(data: dict):
     NOTIFY_STATE.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
 
 
-def _cooling(key: str, cooldown: int) -> bool:
+def cooling(key: str, cooldown: int) -> bool:
     """同一个 key 在冷却时间内已经通知过时返回 True; 否则记下这次并返回 False。"""
     if not key or cooldown <= 0:
         return False
@@ -91,7 +91,7 @@ class Notifier:
 
     def send(self, text: str, key: str = '', cooldown: int = 0, fallback: bool = True) -> bool:
         """发到本人私聊; 失败且允许时改用备用命令。返回是否送达。"""
-        if _cooling(key, cooldown):
+        if cooling(key, cooldown):
             return False
         logger.info(f'[通知] {text[:200]}')
         chat = self.owner_chat()
@@ -108,7 +108,7 @@ class Notifier:
 
     def fallback_alert(self, text: str, key: str = '', cooldown: int = 3600) -> bool:
         """本人账号用不了时(如登录失效), 直接走备用命令。"""
-        if _cooling(key, cooldown):
+        if cooling(key, cooldown):
             return False
         logger.warning(f'[告警] {text}')
         return run_alert_command(self.cfg, f'⚠️ lark-twin：{text}')

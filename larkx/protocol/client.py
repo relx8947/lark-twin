@@ -352,6 +352,31 @@ class LarkClient:
             return chat
         return None
 
+    def feed_chats(self, since: float, max_pages: int = 20) -> list:
+        """消息列表(feed)里 since(unix 秒)之后有更新的会话 id, 新的在前。
+        只读地一页页拉收件箱的 feed 卡片(feed.PullFeedCardsRequest, 实测不改变已读状态), 卡片按更新时间从新到旧排,
+        翻到比 since 早就停; 只取会话卡片, 折叠在盒子里的会话也展开取出来, 话题、文档等别的卡片不要。"""
+        def chats(cards):
+            return [str(c['id']) for c in cards if c.get('type') in (1, 'CHAT') and int(c.get('updateTime') or 0) >= since]
+
+        out, cursor = [], 0
+        for _ in range(max_pages):
+            data = {'type': 'INBOX', 'pullType': 'LOAD_MORE' if cursor else 'REFRESH', 'count': 100}
+            if cursor:
+                data['cursor'] = cursor
+            resp = self.api('feed.PullFeedCardsRequest', data) or {}
+            cards = resp.get('cards') or []
+            out += chats(cards)
+            for box in cards:
+                if box.get('type') in (5, 'BOX') and int(box.get('updateTime') or 0) >= since:
+                    inner = self.api('feed.PullFeedCardsRequest', {'type': 'INBOX', 'pullType': 'REFRESH', 'count': 100,
+                                                                   'parentCardId': int(box['id'])}) or {}
+                    out += chats(inner.get('cards') or [])
+            cursor = int(resp.get('nextCursor') or 0)
+            if not cards or not cursor or min(int(c.get('updateTime') or 0) for c in cards) < since:
+                break
+        return list(dict.fromkeys(out))
+
     def is_bot(self, user_id: str) -> bool:
         """发消息的这个 id 是不是机器人(应用、AI 助手)。消息上的 fromType 不可靠(机器人发的私聊也是 USER),
         只读地查一下 chatter 的类型(chatters.PullChattersByIdsRequest), 查过的记住; 查不到时当成不是。"""

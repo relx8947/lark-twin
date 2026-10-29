@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from loguru import logger
 
-from .. import state
+from .. import notify, state
 from .. import whitelist as wl
 from ..agent import SessionCrashed, create_session, ensure_agent_home
 from ..agent.home import commit_agent_home
@@ -27,6 +27,10 @@ RETRY_NOTE = '上一次处理这条消息时 agent 进程中断过。先用 lark
 RESTART_NOTE = 'daemon 重启前收到了这条消息但没处理完。先用 larkx messages 查一下是否已经回复过, 避免重复回复'
 MSG_FIELDS = ('msg_id', 'chat_id', 'chat_type', 'from_id', 'anchor', 'at_me', 'create_time', 'content')
 CATCHUP_DELAY = 5
+CATCHUP_DAYS = 7           # 补收核对本地多少天内有动静的会话
+CATCHUP_BATCH = 50         # 每次按 position 拉多少条
+CATCHUP_ROUND_MAX = 2000   # 每轮补收最多拉多少个 position, 没拉完的下一轮接着拉
+WS_MISS_COOLDOWN = 86400   # 同一个会话的漏推告警多久报一次
 TAKEOVER_SUMMARY = ('接管「{name}」(chat_id={chat}) 已结束({why})。用 larkx messages {chat} --limit 60 回顾接管期间的对话, '
                     '给本人发一份简短总结: 聊了什么、谈成了什么、还有什么等本人决定或跟进。目标是: {goal}')
 RECONNECT_ALERT = (3, 600)  # 10 分钟内断线 3 次就告警
@@ -68,6 +72,7 @@ class Daemon:
         self.loop = None
         self.listener = None
         self._disconnects = []
+        self._feed_since = None  # 补收上一轮从 feed 拉到了什么时候, None 表示 daemon 启动后还没拉过
 
     def _banner(self):
         t = self.cfg.get('triggers') or {}
@@ -116,14 +121,19 @@ class Daemon:
         tk = None if is_owner else self.storage.takeover_get(chat_id, time.time())
         # 白名单每条都现查: 命令行、网页改了立即生效, 不用重启
         whitelist = () if is_owner else self.storage.whitelist_ids()
-        if not tk and not should_handle(msg, self.cfg, self.auth.user_id, whitelist=whitelist):
-            # 没权限的人想唤起: 马上回一句"没有权限", 不交给数字人
-            if not is_owner and denied_attempt(msg, self.cfg, self.auth.user_id, whitelist):
-                await self._deny(msg, chat_name, sender_name)
-            return
+        handle = bool(tk) or should_handle(msg, self.cfg, self.auth.user_id, whitelist=whitelist)
+        denied = not handle and not is_owner and denied_attempt(msg, self.cfg, self.auth.user_id, whitelist)
         age = time.time() - float(msg.get('create_time') or time.time())
         if age > self.cfg['inbox_max_age']:
-            logger.info(f'跳过 {age / 60:.0f} 分钟前的消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
+            # 太久远的消息(多是补收到的)只入库, 不做任何对外动作: 不交给数字人, 不回"没有权限", 不接管, 也不执行本人的指令
+            if handle or denied:
+                logger.info(f'跳过 {age / 60:.0f} 分钟前的消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
+            return
+        if denied:
+            # 没权限的人想唤起: 马上回一句"没有权限", 不交给数字人
+            await self._deny(msg, chat_name, sender_name)
+            return
+        if not handle:
             return
         if tk:
             # 接管中的会话: 对方说的每句话都交给数字人, 不看触发规则
@@ -300,38 +310,95 @@ class Daemon:
     async def _catch_up_loop(self):
         interval = self.cfg.get('catchup_interval') or 0
         await asyncio.sleep(CATCHUP_DELAY)
-        first = True
+        startup = True
         while True:
             try:
-                n = await self.catch_up()
-                if n and not first:
-                    logger.warning(f'补收到 {n} 条 WS 没推送的消息')
-                    self.notifier.alert(f'长连接漏推了 {n} 条消息, 已从服务器补收并处理', key='ws-miss', cooldown=3600)
-                elif n:
-                    logger.info(f'补收到 {n} 条 daemon 启动前漏收的消息')
+                got, left = await self.catch_up()
+                n = sum(got.values())
+                if got and not startup:
+                    logger.warning(f'补收到 {n} 条 WS 没推送的消息: {self._chat_counts(got, limit=0)}')
+                    self._alert_ws_miss(got, left)
+                elif got:
+                    logger.info(f'补收到 {n} 条 daemon 启动前漏收的消息: {self._chat_counts(got, limit=0)}')
+                if left:
+                    logger.info(f'补收还有 {left} 条没拉完, 下一轮接着拉')
+                # daemon 启动前积压的消息拉完之前不告警, 那些不是长连接这会儿漏推的
+                startup = startup and left > 0
             except Exception as e:
                 logger.warning(f'核对漏收消息失败: {e!r}')
-            first = False
             if not interval:
                 return
             await asyncio.sleep(interval)
 
-    async def catch_up(self) -> int:
-        """对比最近活跃会话在服务端的最新位置, 把本地没收到的消息补收进来(并照常判断是否触发)。"""
-        chats = {c.chat_id: c.last_position or 0 for c in self.storage.recent_chats(datetime.now() - timedelta(days=7))}
-        ids = [cid for cid, pos in chats.items() if pos]
-        new = 0
+    async def catch_up(self):
+        """补收: 核对会话在服务端的最新 position, 把核对位置之后的消息分批拉回来入库(并照常判断是否触发)。
+
+        核对哪些会话: 本地 7 天内有动静的全部会话, 加上消息列表(feed)里上一轮以来有更新的会话(长连接一条都没推过的会话
+        本地没有记录, 只能从 feed 发现)。核对位置只由这里推进, 一段消息都拉过、入过库才推进, WS 推来的消息不动它。
+        每轮最多拉 CATCHUP_ROUND_MAX 个 position, 缺得少的会话先补, 没拉完的下一轮从核对位置接着拉, 不会跳过。
+        返回 ({chat_id: 第一次入库的消息条数}, 留到下一轮的条数)。
+        """
+        started, first = time.time(), getattr(self, '_feed_since', None) is None
+        feed = []
+        try:
+            since = started - CATCHUP_DAYS * 86400 if first else self._feed_since
+            feed = await asyncio.to_thread(self.client.feed_chats, since)
+            self._feed_since = started - 300  # 留点余量, 防止 feed 的更新时间比这边晚一点
+        except Exception as e:
+            logger.warning(f'从消息列表(feed)拉最近有更新的会话失败, 这一轮只核对本地 7 天内有动静的会话: {e!r}')
+        marks = self.storage.catchup_marks(datetime.now() - timedelta(days=CATCHUP_DAYS), extra=feed)
+        ids = list(dict.fromkeys([*marks, *feed]))
+        gaps = []
         for i in range(0, len(ids), 20):
             resp = await asyncio.to_thread(self.client.api, 'chats.PullChatsByIdsRequest', {'chatIds': ids[i:i + 20]})
             for cid, info in ((resp or {}).get('chats') or {}).items():
                 latest = int(info.get('lastMessagePosition') or 0)
-                if latest <= chats.get(cid, latest):
-                    continue
-                positions = list(range(chats[cid] + 1, latest + 1))[-50:]
-                for m in await asyncio.to_thread(self.client.pull_history, cid, positions):
-                    if m.get('from_id') and await self.listener.on_message(m):
-                        new += 1
-        return new
+                if cid not in marks:
+                    # feed 里新发现、还没有核对位置的会话: daemon 启动后第一轮从服务端当前位置核对起, 以前的不回填;
+                    # 之后的轮次里它是刚有更新才出现的, 往前多拉 CATCHUP_BATCH 条, 把让它出现的那几条补上
+                    marks[cid] = latest if first else max(0, latest - CATCHUP_BATCH)
+                    self.storage.catchup_advance(cid, marks[cid])
+                if latest > marks[cid]:
+                    gaps.append((latest - marks[cid], cid, latest))
+        new, budget, left = {}, CATCHUP_ROUND_MAX, 0
+        # 缺得少的先补: 零星漏推的消息尽快收到, 积压很多的会话用剩下的额度慢慢补
+        for _, cid, latest in sorted(gaps):
+            pos = marks[cid]
+            try:
+                while pos < latest and budget > 0:
+                    end = min(latest, pos + CATCHUP_BATCH, pos + budget)
+                    for m in await asyncio.to_thread(self.client.pull_history, cid, range(pos + 1, end + 1)):
+                        if m.get('from_id') and await self.listener.on_message(m):
+                            new[cid] = new.get(cid, 0) + 1
+                    # 这一段都拉过、入过库才推进核对位置; 中途出错时下一轮从这里接着拉
+                    self.storage.catchup_advance(cid, end)
+                    budget -= end - pos
+                    pos = end
+            except Exception as e:
+                logger.warning(f'补收会话 {cid} 出错, 下一轮从 position {pos + 1} 接着拉: {e!r}')
+            left += latest - pos
+        return new, left
+
+    def _chat_counts(self, got: dict, limit: int = 10) -> str:
+        """{chat_id: 条数} 写成「会话名」N 条, 多的在前; limit 为 0 时全列出来。"""
+        items = sorted(got.items(), key=lambda kv: -kv[1])
+        shown = items[:limit] if limit else items
+        text = '、'.join(f'「{self.storage.get_chat_name(cid) or cid}」{n} 条' for cid, n in shown)
+        return text + (f' 等 {len(items)} 个会话' if len(items) > len(shown) else '')
+
+    def _alert_ws_miss(self, got: dict, left: int):
+        """长连接漏推告警: 写明哪些会话各漏了多少条。同一个会话一天内只报一次, 持续漏推的会话不会每轮都报。"""
+        fresh = {cid: n for cid, n in got.items() if not notify.cooling(f'ws-miss:{cid}', WS_MISS_COOLDOWN)}
+        if not fresh:
+            return
+        text = (f'长连接漏推了 {sum(fresh.values())} 条消息, 已从服务器补收入库'
+                f'(超过 {self.cfg["inbox_max_age"] / 3600:g} 小时的旧消息只入库, 不交给数字人): {self._chat_counts(fresh)}')
+        quiet = {cid: n for cid, n in got.items() if cid not in fresh}
+        if quiet:
+            text += f'。另有 {len(quiet)} 个会话一天内报过, 这轮也补收了 {sum(quiet.values())} 条'
+        if left:
+            text += f'。还有 {left} 条没拉完, 下一轮接着补'
+        self.notifier.alert(text + '。同一个会话一天内只报一次。', cooldown=0)
 
     def _on_disconnect(self, error):
         now = time.time()

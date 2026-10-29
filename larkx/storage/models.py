@@ -37,6 +37,15 @@ class Chat(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
+class CatchupMark(Base):
+    """补收核对到的 position: 这之前服务端的消息都确认拉过、入过库了。只由补收推进, WS 推来的消息不动它,
+    所以中间没推的消息下一轮还补得到(chats.last_position 会被任何一条新入库的消息抬到最新, 不能拿来当核对位置)。"""
+    __tablename__ = 'catchup_marks'
+    chat_id = Column(String(32), primary_key=True)
+    position = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class AgentSession(Base):
     __tablename__ = 'agent_sessions'
 

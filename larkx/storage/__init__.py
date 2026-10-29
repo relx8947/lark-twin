@@ -3,7 +3,8 @@ from datetime import datetime
 from sqlalchemy import create_engine, desc, func, or_
 from sqlalchemy.orm import sessionmaker
 from ..config import inside_twin, load_config
-from .models import Action, AgentSession, Base, Chat, Control, InboxItem, Message, Takeover, Task, WhitelistEntry
+from .models import (Action, AgentSession, Base, CatchupMark, Chat, Control, InboxItem, Message, Takeover, Task,
+                     WhitelistEntry)
 
 
 def _json_default(o):
@@ -52,6 +53,9 @@ class Storage:
             s.add(chat)
         if row.chat_name and (not chat.name):
             chat.name = row.chat_name
+        if row.position and not s.get(CatchupMark, row.chat_id):
+            # 会话第一次有带 position 的消息入库: 补收从这里核对起; 升级前就有的会话从当时的 last_position 起, 以前缺的不回填
+            s.add(CatchupMark(chat_id=row.chat_id, position=chat.last_position or row.position))
         if row.position and row.position > (chat.last_position or 0):
             chat.last_position = row.position
         chat.updated_at = datetime.now()
@@ -236,10 +240,35 @@ class Storage:
         finally:
             s.close()
 
-    def recent_chats(self, since: datetime, limit=30):
+    def catchup_marks(self, since: datetime, extra=()) -> dict:
+        """补收要核对的会话 {chat_id: 核对到的 position}: since 之后有动静的全部会话, 加上 extra 里有核对位置的会话。
+        还没有核对位置的会话(升级前就有的)从当前 last_position 起算并记下, 以前缺的不回填; 一条消息都没有的会话不核对。"""
         s = self.Session()
         try:
-            return s.query(Chat).filter(Chat.updated_at >= since).order_by(desc(Chat.updated_at)).limit(limit).all()
+            marks = {m.chat_id: m.position or 0 for m in s.query(CatchupMark).all()}
+            out = {cid: marks[cid] for cid in map(str, extra) if cid in marks}
+            for c in s.query(Chat).filter(Chat.updated_at >= since).all():
+                if c.chat_id not in marks and c.last_position:
+                    s.add(CatchupMark(chat_id=c.chat_id, position=c.last_position))
+                    marks[c.chat_id] = c.last_position
+                if c.chat_id in marks:
+                    out[c.chat_id] = marks[c.chat_id]
+            s.commit()
+            return out
+        finally:
+            s.close()
+
+    def catchup_advance(self, chat_id: str, position: int):
+        """补收把核对位置之后到 position 的消息都拉过、入过库了: 核对位置推进到 position(只进不退)。"""
+        s = self.Session()
+        try:
+            row = s.get(CatchupMark, str(chat_id))
+            if not row:
+                row = CatchupMark(chat_id=str(chat_id), position=0)
+                s.add(row)
+            if int(position) > (row.position or 0):
+                row.position = int(position)
+            s.commit()
         finally:
             s.close()
 
