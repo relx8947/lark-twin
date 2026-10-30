@@ -16,6 +16,7 @@ from ..config import CREDENTIALS_PATH, DATA_DIR, load_config, with_signature
 from ..notify import Notifier
 from ..protocol import AuthExpired, LarkAuth, LarkClient
 from ..storage import Storage
+from ..event_rules import RuleStore
 from .listener import Listener
 from .triggers import (build_prompt, build_say_prompt, build_system_prompt, build_task_prompt, denied_attempt,
                        parse_command, parse_takeover, should_handle, strip_mentions, strip_prefix, takeover_note)
@@ -65,6 +66,7 @@ class Daemon:
         self.auth = auth
         self.client = LarkClient(auth)
         self.storage = Storage()
+        self.rule_store = RuleStore(self.storage)
         self.session = create_session(self.cfg, self.storage)
         self.notifier = Notifier(self.cfg, self.client)
         self.prefix = (self.cfg.get('triggers') or {}).get('prefix') or ''
@@ -92,6 +94,7 @@ class Daemon:
         self.loop = asyncio.get_running_loop()
         self.home = ensure_agent_home(self.cfg)
         self._banner()
+        self.rule_store.recover()
         n = self.storage.reset_running_tasks()
         if n:
             logger.info(f'{n} 个上次没跑完的任务已重新排队')
@@ -458,9 +461,17 @@ class Daemon:
         while True:
             try:
                 now = time.time()
+                self.rule_store.reconcile(self.auth.user_id)
                 for task in self.storage.due_tasks(now):
-                    self.storage.update_task(task.id, status='running')
-                    if task.kind == 'say':
+                    if task.kind == 'event':
+                        if not self.rule_store.queue(task.id):
+                            continue
+                    else:
+                        self.storage.update_task(task.id, status='running')
+                    if task.kind == 'event':
+                        ev = Event('task', task.prompt, chat_id=task.chat_id, is_owner=True,
+                                   ref=f'event#{task.id}', task_id=task.id)
+                    elif task.kind == 'say':
                         ev = Event('say', build_say_prompt(task.prompt), is_owner=True, ref=f'say#{task.id}', task_id=task.id)
                     else:
                         ev = Event('task', build_task_prompt(task, now), chat_id=task.chat_id, anchor=task.anchor,
@@ -487,7 +498,8 @@ class Daemon:
         if task.every_sec and task.status != 'cancelled':
             fields.update(status='pending', due_at=int(state.next_due(task.due_at, task.every_sec, time.time())))
         elif task.status != 'cancelled':
-            fields['status'] = 'done' if result and not result.is_error else 'failed'
+            fields['status'] = ('done' if result and not result.is_error else
+                                'unknown' if task.kind == 'event' else 'failed')
         self.storage.update_task(task.id, **fields)
 
     # ---- 交给数字人 ----
@@ -500,8 +512,12 @@ class Daemon:
             state.clear_turn()
 
     async def _handle(self, ev: Event):
+        event_task = self.storage.get_task(ev.task_id) if ev.task_id else None
+        is_event = bool(event_task and event_task.kind == 'event')
+        if is_event and not self.rule_store.start(ev.task_id):
+            return  # paused/cancelled/duplicate queue item
         note, result = ev.note, None
-        for attempt in (1, 2):
+        for attempt in ((1,) if is_event else (1, 2)):
             prompt = ev.prompt
             if ev.kind == 'message':
                 prompt = build_prompt(ev.msg, ev.body, ev.chat_name, ev.sender_name, is_owner=ev.is_owner, note=note)
@@ -511,13 +527,20 @@ class Daemon:
             except SessionCrashed as e:
                 logger.error(f'agent 会话中断({attempt}/2): {e}')
                 note = RETRY_NOTE
+            except Exception:
+                if not is_event:
+                    raise
+                logger.exception(f'事件任务 {ev.task_id} 异常，结果未知，不自动重试')
+                break
+        if is_event:
+            self._finish_task(ev, result)
         if ev.inbox_id:
             self.storage.inbox_set(ev.inbox_id, 'done' if result else 'failed')
         self._report(ev, result)
         if result:
             logger.info(f'[agent] {ev.kind} {ev.ref} 结束: {result.subtype} {result.duration_s:.1f}s 工具调用 {len(result.tools)} 次'
                         + (f' | 输出: {result.text[:200]}' if result.text else ''))
-        if ev.task_id:
+        if ev.task_id and not is_event:
             self._finish_task(ev, result)
         await asyncio.to_thread(commit_agent_home, self.home, f'{ev.kind} {ev.ref}'.strip())
 
@@ -528,7 +551,7 @@ class Daemon:
         if hasattr(self.session, 'events'):
             self.session.events.clear()
         if result is None:
-            self.notifier.alert(f'处理 {ev.kind} {ev.ref} 时 agent 两次中断, 这一条没有处理完', key='crash', cooldown=900)
+            self.notifier.alert(f'处理 {ev.kind} {ev.ref} 时 agent 中断或异常, 这一条结果未知', key='crash', cooldown=900)
         elif result.is_error and result.subtype != 'interrupted' and ev.kind != 'system':
             self.notifier.alert(f'处理 {ev.kind} {ev.ref} 失败({result.subtype}): {result.text[:150]}',
                                 key=f'error:{result.text[:30]}', cooldown=1800)

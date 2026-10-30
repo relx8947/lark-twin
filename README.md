@@ -75,6 +75,33 @@ larkx service status | logs -f   # 运行状态
 
 执行 `larkx skill install` 之后，直接对你的 Claude Code 或 Codex 说"给张三发个消息""看看某个群在聊什么"就可以。完整命令见 `larkx --help`。
 
+## 消息监听任务
+
+除了 `/ai` 和定时任务，可以把指定群的消息作为事件，触发一项预设的 agent 任务。底层复用现有消息入库、Task 调度、Codex/Claude 执行、审计和通知；不改变普通 `/ai` 的权限规则。
+
+对数字人说：“创建监听任务，监听某群中 @指定机器人的消息，把同样任务发送到我的测试群并 @测试机器人。”它会确认群、发送人和机器人的身份，创建草稿，展示配置；你确认后启用。也可以说“查看监听任务”“暂停某监听”“查看最近触发记录”。
+
+终端管理（参数为飞书网页版的真实 ID）：
+
+```bash
+larkx rule add --name 对照测试 --chat SOURCE_CHAT_ID \
+  --sender OWNER_USER_ID --mention SOURCE_BOT_ID --instruction '这里填写预设任务指令'
+larkx rule list --json
+larkx rule enable 1
+larkx rule pause 1
+larkx rule runs --json
+larkx rule delete 1
+```
+
+- 来源群必须精确匹配；发送人、@对象、关键词分别支持重复传入 `--sender`、`--mention`、`--keyword`。同类条件任意命中，不同类同时满足。@按协议身份匹配，普通文字“@名字”不算。
+- 草稿不触发；启用/恢复后只处理新的消息，约 15 秒内进入原有任务队列。多个任务按原队列串行执行，耗时受已有任务影响。
+- 默认排除本人消息；监听本人任务时显式指定 `--sender`。已审计的 agent/daemon 发送不再触发规则。规则是独立授权，不受普通 `/ai` 的 owner-only、前缀和 @本人限制。
+- 消息与任务的去重关联、扫描进度及任务创建一起提交；补收不会重复创建任务。新增规则只处理启用后的消息，不追溯旧记录。
+- 暂停/删除取消未开始的事件任务，执行中的任务继续；打断用 `/ai /stop`。执行中重启、调用失败或超时的任务记为 unknown，不自动重试，避免重复副作用；需要查审计人工确认。普通定时任务恢复行为不变。
+- 第一版无独立配置页面，无自动语义过滤。条件命中后由预设指令交给现有 coding agent 执行，保留其完整本机权限；不是权限沙箱。
+
+真实 @发送复用现有协议能力：`larkx send CHAT_ID --mention USER_ID:显示名 --json -`，正文从 stdin 读取。`--mention` 暂不支持与 `--markdown` 同时使用，组合时明确报错，不会静默丢失 @或富文本。
+
 ## 配套 skill
 
 `skills/` 下有三个：`lark-twin`（在本仓库里部署运维）、`larkx`（装进你的 Claude Code / Codex，用来操作飞书）、`larkx-agent`（数字人自己用的 CLI 手册）。说明见 [skills/README.md](skills/README.md)。

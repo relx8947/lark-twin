@@ -26,7 +26,13 @@ class Storage:
     def save_message(self, msg: dict, sender_name='', chat_name='', direction='in') -> bool:
         s = self.Session()
         try:
-            fields = dict(msg_id=str(msg['msg_id']), chat_id=str(msg['chat_id']), chat_name=chat_name or '', chat_type=msg.get('chat_type', 0), scope=msg.get('scope', 'chat'), anchor=msg.get('anchor', '') or '', root_id=msg.get('root_id', '') or '', parent_id=msg.get('parent_id', '') or '', sender_id=str(msg.get('from_id') or ''), sender_name=sender_name or '', msg_type=msg.get('msg_type', 0), msg_type_name=msg.get('msg_type_name', ''), content=msg.get('content', '') or '', content_data=json.dumps(msg.get('content_data'), ensure_ascii=False, default=_json_default)[:20000] if msg.get('content_data') is not None else '', position=msg.get('position') or 0, create_time=msg.get('create_time') or 0, direction=direction)
+            from ..event_rules import mention_ids
+            data = dict(msg.get('content_data') or {}) if isinstance(msg.get('content_data'), dict) else {}
+            data['_larkx_mention_ids'] = mention_ids(msg)
+            encoded = json.dumps(data, ensure_ascii=False, default=_json_default)
+            if len(encoded) > 20000:
+                encoded = json.dumps({'_larkx_mention_ids': data['_larkx_mention_ids'], '_truncated': True})
+            fields = dict(msg_id=str(msg['msg_id']), chat_id=str(msg['chat_id']), chat_name=chat_name or '', chat_type=msg.get('chat_type', 0), scope=msg.get('scope', 'chat'), anchor=msg.get('anchor', '') or '', root_id=msg.get('root_id', '') or '', parent_id=msg.get('parent_id', '') or '', sender_id=str(msg.get('from_id') or ''), sender_name=sender_name or '', msg_type=msg.get('msg_type', 0), msg_type_name=msg.get('msg_type_name', ''), content=msg.get('content', '') or '', content_data=encoded, position=msg.get('position') or 0, create_time=msg.get('create_time') or 0, direction=direction)
             row = s.query(Message).filter_by(msg_id=fields['msg_id'], chat_id=fields['chat_id']).first()
             if row:
                 # lark send 先落的记录没有 position;WS 回显到达时用回显补全,并视作首次入库
