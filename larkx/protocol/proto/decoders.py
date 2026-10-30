@@ -1,4 +1,5 @@
 import gzip
+import json
 import zlib
 from protobuf_to_dict import protobuf_to_dict
 from . import proto_pb2 as P
@@ -336,10 +337,27 @@ def parse_ws_frame(raw: bytes):
     frame = P.Frame()
     frame.ParseFromString(raw)
     frame_d = protobuf_to_dict(frame)
+    if (frame.payloadEncoding or '').lower() == 'json':
+        return (frame_d, json_packet(frame.payload))
     packet = P.Packet()
     packet.ParseFromString(frame_payload(frame))
     packet_d = protobuf_to_dict(packet)
     return (frame_d, packet_d)
+
+
+def json_packet(payload: bytes) -> dict:
+    """payloadEncoding=json 的帧: payload 是一段 JSON, 不是 Packet 的 protobuf。返回 {'json': 解出来的内容, 'cmd': JSON
+    顶层的 cmd/command(没有时为 None)}。不带 sid: 这种帧不回 ack, 也不当新消息处理, 只用来计数和观察日志。"""
+    data = json.loads(payload)
+    cmd = None
+    if isinstance(data, dict):
+        for key in ('cmd', 'command'):
+            try:
+                cmd = int(data[key])
+                break
+            except (KeyError, TypeError, ValueError):
+                continue
+    return {'json': data, 'cmd': cmd}
 
 
 def push_sids(raw: bytes) -> list:

@@ -1,7 +1,10 @@
-"""WS 推送: gzip 压缩的帧能解开; PUSH_SID 只推来 sid 时按 sid 补拉; 推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警。"""
+"""WS 推送: gzip 压缩的帧能解开; PUSH_SID 只推来 sid 时按 sid 补拉; 推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警;
+payloadEncoding=json 的帧按 JSON 解开计数, 不算解不开。"""
 import asyncio
 import gzip
+import json
 
+import websockets
 from loguru import logger
 
 from larkx.protocol.client import LarkClient, PushStats
@@ -98,3 +101,89 @@ def test_push_sid_pulled_and_dispatched():
     assert got == [('8001', '卡片')]
     st = c.push_stats
     assert (st.pulls, st.pulled, st.pulled_msgs, st.pull_errors) == (1, {6: 1, 27: 1}, 1, 1)
+
+
+def json_frame(data, service=1):
+    frame = P.Frame()
+    frame.service, frame.method, frame.payloadEncoding = service, 1, 'json'
+    frame.payload = json.dumps(data).encode()
+    return frame.SerializeToString()
+
+
+def test_json_frames_decoded():
+    """payloadEncoding=json 的帧 payload 是 JSON, 不是 Packet: 按 JSON 解开, 取出顶层的 cmd(数字或数字字符串), 不带 sid。"""
+    _, packet = decoders.parse_ws_frame(json_frame({'cmd': 3603, 'sid': 'x', 'data': {'a': 1}}))
+    assert packet == {'json': {'cmd': 3603, 'sid': 'x', 'data': {'a': 1}}, 'cmd': 3603}
+    assert decoders.parse_ws_frame(json_frame({'command': '42'}))[1]['cmd'] == 42
+    assert decoders.parse_ws_frame(json_frame({'type': 'notice'}))[1]['cmd'] is None
+    assert decoders.parse_ws_frame(json_frame([1, 2]))[1] == {'json': [1, 2], 'cmd': None}
+
+
+def test_json_frames_counted_not_errors():
+    """JSON 帧按 cmd 计数, 每种 cmd 只在第一次打一条带内容的日志, 10 分钟汇总里单列, 不再算"解不开的帧";
+    里面要是新消息推送就打 WARNING。"""
+    lines, now = [], [0.0]
+    sink = logger.add(lambda m: lines.append((m.record['level'].name, m.record['message'])), level='INFO')
+    try:
+        stats = PushStats(interval=600, clock=lambda: now[0])
+        for raw in [json_frame({'cmd': 3603, 'data': '提示'})] * 3 + [json_frame({'x': 1})] * 2:
+            frame, packet = decoders.parse_ws_frame(raw)
+            stats.json_frame(frame, packet)
+        firsts = [msg for _, msg in lines if '第一次收到 JSON 帧' in msg]
+        assert len(firsts) == 2
+        assert 'cmd 3603(未知)' in firsts[0] and 'service 1' in firsts[0] and '"data": "提示"' in firsts[0]
+        assert '(没有 cmd)' in firsts[1]
+        assert not [lvl for lvl, _ in lines if lvl == 'WARNING']
+        now[0] = 601
+        stats.maybe_report()
+        report = lines[-1][1]
+        assert 'JSON 帧: cmd 3603(未知) 3, (没有 cmd) 2' in report and '解不开的帧 0' in report and '压缩帧 0' in report
+        now[0] = 1202
+        stats.maybe_report()
+        assert 'JSON 帧: 无' in lines[-1][1]
+        frame, packet = decoders.parse_ws_frame(json_frame({'cmd': 6, 'payload': ''}))
+        stats.json_frame(frame, packet)
+        assert lines[-1][0] == 'WARNING' and '新消息推送' in lines[-1][1]
+    finally:
+        logger.remove(sink)
+
+
+class FakeWS:
+    def __init__(self, frames):
+        self.frames, self.sent = frames, []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def _frames(self):
+        for f in self.frames:
+            yield f
+
+    def __aiter__(self):
+        return self._frames()
+
+    async def send(self, data):
+        self.sent.append(data)
+
+
+def test_ws_loop_skips_ack_for_json_frames(monkeypatch):
+    """长连接里混着 JSON 帧: JSON 帧只计数, 不 ack(哪怕 JSON 里有 sid); 普通推送照常 ack、计数。"""
+    ws = FakeWS([json_frame({'cmd': 3603, 'sid': 'j1'}), push_frame(27), b'\xff\xff'])
+    monkeypatch.setattr(websockets, 'connect', lambda url: ws)
+    c = LarkClient.__new__(LarkClient)
+    c.push_stats, c._loop_started, c.loop = PushStats(), True, None
+    c.build_ws_url = lambda: 'wss://example'
+    asyncio.run(c.connect_websocket(lambda msg: None))
+    acks = []
+    for raw in ws.sent:
+        frame = P.Frame()
+        frame.ParseFromString(raw)
+        pkt = P.Packet()
+        pkt.ParseFromString(frame.payload)
+        acks.append((pkt.cmd, pkt.sid))
+    assert acks == [(1, 's1')]
+    st = c.push_stats
+    assert st.json_counts == {3603: 1} and st.counts == {27: 1} and st.errors == 1   # 最后那个是真坏帧

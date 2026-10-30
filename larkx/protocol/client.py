@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 from urllib.parse import urlencode
@@ -16,11 +17,13 @@ PUSH_SID = 6000  # improto.Command.PUSH_SID: 只推来 sid, 完整的推送包�
 
 class PushStats:
     """WS 收到的推送统计, 用来查长连接漏推: 新消息(cmd 6)以外的推送每种 cmd 第一次出现时打一条 INFO(带解出来的内容摘要),
-    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数和按 sid 补拉的结果; 解不开的帧、补拉失败限频打 WARNING。不逐帧打日志。"""
+    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数和按 sid 补拉的结果; 解不开的帧、补拉失败限频打 WARNING。不逐帧打日志。
+    payloadEncoding=json 的帧(不是 Packet)单独按 JSON 里的 cmd 计数, 每种第一次出现时记下帧头和内容。"""
 
     def __init__(self, interval: int = WS_STATS_INTERVAL, clock=time.monotonic):
         self.interval, self.clock = interval, clock
         self.counts, self.seen = {}, set()
+        self.json_counts, self.json_seen = {}, set()
         self.compressed = self.errors = self.muted = 0
         self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
         self.pull_logged = False
@@ -39,6 +42,30 @@ class PushStats:
         body = gateway.decode_push(cmd, packet.get('payload') or b'')
         logger.info(f'[WS 推送] 第一次收到 cmd {cmd}({names}), payload {len(packet.get("payload") or b"")} 字节: '
                     f'{str(body)[:300] if body is not None else "解不出来"}')
+
+    def json_frame(self, frame: dict, packet: dict):
+        """payloadEncoding=json 的帧: 按 JSON 里的 cmd 计数; 每种 cmd 第一次出现时打一条日志, 记下帧头和 JSON 内容摘要。
+        这种帧不 ack、不当消息处理; 里面要是新消息推送(cmd 6 / PUSH_SID)就打 WARNING, 那样的消息目前靠补收兜底。"""
+        cmd = packet.get('cmd')
+        self.json_counts[cmd] = self.json_counts.get(cmd, 0) + 1
+        if cmd in self.json_seen:
+            return
+        self.json_seen.add(cmd)
+        headers = {h.get('key'): h.get('value') for h in frame.get('headers') or []}
+        body = json.dumps(packet.get('json'), ensure_ascii=False, default=str)
+        text = (f'[WS 推送] 第一次收到 JSON 帧(payloadEncoding=json) {self._json_label(cmd)}: service {frame.get("service")}, '
+                f'method {frame.get("method")}, payloadType {frame.get("payloadType") or "无"}, headers {str(headers)[:300]}, '
+                f'payload {len(frame.get("payload") or b"")} 字节: {body[:500]}')
+        if cmd in (6, PUSH_SID):
+            logger.warning(f'{text}。里面是新消息推送, 现在没按它入库, 这样的消息靠补收')
+        else:
+            logger.info(text)
+
+    @staticmethod
+    def _json_label(cmd) -> str:
+        if cmd is None:
+            return '(没有 cmd)'
+        return f'cmd {cmd}({"/".join(gateway.push_types(cmd)) or "未知"})'
 
     def pull(self, sids, packets: dict, msgs: int):
         """按 sid 补拉了一次 PUSH_SID: 拉到的包按 cmd 计数; 第一次拉到时打一条 INFO 看看拉回来的是什么。"""
@@ -73,10 +100,12 @@ class PushStats:
         others = ', '.join(f'cmd {c}({"/".join(gateway.push_types(c)) or "未知"}) {n}'
                            for c, n in sorted(self.counts.items()) if c != 6) or '无'
         pulled = ', '.join(f'cmd {c} {n}' for c, n in sorted(self.pulled.items())) or '无'
+        jsons = ', '.join(f'{self._json_label(c)} {n}' for c, n in
+                          sorted(self.json_counts.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))) or '无'
         logger.info(f'[WS 推送] 近 {minutes:.0f} 分钟: 新消息(cmd 6) {self.counts.get(6, 0)} 帧, 其他推送: {others}; '
-                    f'压缩帧 {self.compressed}, 解不开的帧 {self.errors}; 按 sid 补拉 PUSH_SID {self.pulls} 次, '
+                    f'压缩帧 {self.compressed}, JSON 帧: {jsons}, 解不开的帧 {self.errors}; 按 sid 补拉 PUSH_SID {self.pulls} 次, '
                     f'拉到的包: {pulled}, 新消息 {self.pulled_msgs} 条, 补拉失败 {self.pull_errors} 次')
-        self.counts, self.compressed, self.errors, self.last_report = {}, 0, 0, now
+        self.counts, self.json_counts, self.compressed, self.errors, self.last_report = {}, {}, 0, 0, now
         self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
 
 
@@ -174,22 +203,29 @@ class LarkClient:
                 async for raw in ws:
                     try:
                         frame, packet = decoders.parse_ws_frame(raw)
-                        sid, cmd = (packet.get('sid'), packet.get('cmd'))
-                        if sid is not None:
-                            await self.send_ack(ws, sid)
-                        if cmd == 6:
-                            for msg in decoders.decode_push_messages(raw):
-                                if not msg.get('from_id'):
-                                    continue
-                                asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
-                        elif cmd == PUSH_SID:
-                            asyncio.run_coroutine_threadsafe(self._pull_sids(decoders.push_sids(raw), on_message), self.loop)
-                        self.push_stats.packet(cmd, frame, packet)
+                        if 'json' in packet:
+                            # payloadEncoding=json 的帧不是 Packet: 只计数、记下第一次的内容, 不 ack 也不当消息处理
+                            self.push_stats.json_frame(frame, packet)
+                        else:
+                            await self._on_packet(ws, raw, frame, packet, on_message)
                     except Exception as e:
                         self.push_stats.error(e, raw)
                     self.push_stats.maybe_report()
             finally:
                 heartbeat_task.cancel()
+
+    async def _on_packet(self, ws, raw: bytes, frame: dict, packet: dict, on_message):
+        sid, cmd = (packet.get('sid'), packet.get('cmd'))
+        if sid is not None:
+            await self.send_ack(ws, sid)
+        if cmd == 6:
+            for msg in decoders.decode_push_messages(raw):
+                if not msg.get('from_id'):
+                    continue
+                asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
+        elif cmd == PUSH_SID:
+            asyncio.run_coroutine_threadsafe(self._pull_sids(decoders.push_sids(raw), on_message), self.loop)
+        self.push_stats.packet(cmd, frame, packet)
 
     async def _pull_sids(self, sids, on_message):
         """PUSH_SID: 服务端没把推送包直接推过来, 只推来 sid(机器人发的卡片等很多消息都这样推), 要按 sid 再拉
