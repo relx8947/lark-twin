@@ -1,5 +1,6 @@
 """WS 推送: gzip 压缩的帧能解开; PUSH_SID 只推来 sid 时按 sid 补拉; 逐条转发(cmd 134)推送里没带的消息按 id 拉回来;
-推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警; payloadEncoding=json 的帧按 JSON 解开计数, 不算解不开。"""
+推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警; payloadEncoding=json 的帧按 JSON 解开计数, 不算解不开;
+连上长连接后调用 on_open。"""
 import asyncio
 import gzip
 import json
@@ -340,3 +341,17 @@ def test_batch_copy_follows_dedup_and_old_message_rules(tmp_path, monkeypatch, f
     assert sorted(m.msg_id for m in obj.storage.get_messages('p1')) == ['901', '902', '903']
     events = [obj.inbox.get_nowait() for _ in range(obj.inbox.qsize())]
     assert [(e.ref, e.body) for e in events] == [('902', '在吗'), ('903', '帮我看看')]
+
+
+def test_ws_open_callback(monkeypatch):
+    """连上长连接后调用一次 on_open; 回调出错不影响收推送。"""
+    calls = []
+    for cb in (lambda: calls.append('open'), lambda: 1 / 0):
+        ws = FakeWS([push_frame(27)])
+        monkeypatch.setattr(websockets, 'connect', lambda url: ws)
+        c = LarkClient.__new__(LarkClient)
+        c.push_stats, c._loop_started, c.loop = PushStats(), True, None
+        c.build_ws_url = lambda: 'wss://example'
+        asyncio.run(c.connect_websocket(lambda msg: None, on_open=cb))
+        assert c.push_stats.counts == {27: 1}
+    assert calls == ['open']

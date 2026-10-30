@@ -214,12 +214,18 @@ class LarkClient:
             threading.Thread(target=run_loop, args=(self.loop,), daemon=True).start()
             self._loop_started = True
 
-    async def connect_websocket(self, on_message):
+    async def connect_websocket(self, on_message, on_open=None):
+        """连上长连接, 一直收推送直到断开(断开时抛异常)。on_open 在连上后马上调用一次(在调用方的事件循环里)。"""
         self._ensure_loop()
         url = self.build_ws_url()
         async with websockets.connect(url) as ws:
             logger.info('WS 已连接')
             heartbeat_task = asyncio.create_task(self.heartbeat_loop(ws))
+            if on_open:
+                try:
+                    on_open()
+                except Exception as e:
+                    logger.warning(f'WS 连上后的回调出错: {e!r}')
             try:
                 async for raw in ws:
                     try:

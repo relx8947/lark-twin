@@ -31,6 +31,9 @@ CATCHUP_DAYS = 7           # 补收核对本地多少天内有动静的会话
 CATCHUP_BATCH = 50         # 每次按 position 拉多少条
 CATCHUP_ROUND_MAX = 2000   # 每轮补收最多拉多少个 position, 没拉完的下一轮接着拉
 WS_MISS_COOLDOWN = 86400   # 同一个会话的漏推告警多久报一次
+RECONNECT_CATCHUP_DELAY = 5  # 长连接重新连上后等几秒再补收, 让连接先稳定
+WS_GAP_MARGIN = 60         # 断线窗口前后各放宽多少秒: 断开前刚发、重连后马上发的消息也可能没推到
+WS_GAP_KEEP = 86400        # 断线窗口记多久: 这期间补收到的、发送时间落在窗口里的消息都不算长连接漏推
 SYSTEM_MSG_TYPE = 6        # Message.Type.SYSTEM: 入群、改群名、"大群已关闭通知"(type=1500)这类系统提示
 TAKEOVER_SUMMARY = ('接管「{name}」(chat_id={chat}) 已结束({why})。用 larkx messages {chat} --limit 60 回顾接管期间的对话, '
                     '给本人发一份简短总结: 聊了什么、谈成了什么、还有什么等本人决定或跟进。目标是: {goal}')
@@ -74,6 +77,9 @@ class Daemon:
         self.listener = None
         self._disconnects = []
         self._feed_since = None  # 补收上一轮从 feed 拉到了什么时候, None 表示 daemon 启动后还没拉过
+        self._ws_down_at = None  # 长连接这次断开的时间(重连失败不改), 重新连上后清掉
+        self._ws_gaps = []       # 最近的断线窗口 [(断开时间, 重新连上的时间)]
+        self._catchup_wake = asyncio.Event()  # 长连接重新连上时叫醒补收循环, 马上补收一轮
 
     def _banner(self):
         t = self.cfg.get('triggers') or {}
@@ -98,7 +104,7 @@ class Daemon:
         await self.session.start()
         self._restore_inbox()
         self.listener = Listener(self.client, self.storage, self.cfg, self.auth.user_id, on_stored=self._from_listener,
-                                 on_disconnect=self._on_disconnect)
+                                 on_disconnect=self._on_disconnect, on_connect=self._on_connect)
         workers = [asyncio.create_task(self._consume()), asyncio.create_task(self._schedule()),
                    asyncio.create_task(self._catch_up_loop()), asyncio.create_task(self._control_loop())]
         try:
@@ -329,7 +335,17 @@ class Daemon:
                 logger.warning(f'核对漏收消息失败: {e!r}')
             if not interval:
                 return
-            await asyncio.sleep(interval)
+            await self._wait_catch_up(interval)
+
+    async def _wait_catch_up(self, interval):
+        """等下一轮补收: 到点了, 或者长连接断线后重新连上(提前醒, 等几秒让连接稳定再补, 断线期间的消息不用等一整个周期)。
+        补收只在 _catch_up_loop 里一轮接一轮地跑, 不会有两轮同时补同一个会话; 正在补收时重新连上, 这一轮完了马上再补一轮。"""
+        try:
+            await asyncio.wait_for(self._catchup_wake.wait(), interval)
+        except asyncio.TimeoutError:
+            return
+        self._catchup_wake.clear()
+        await asyncio.sleep(RECONNECT_CATCHUP_DELAY)
 
     async def catch_up(self):
         """补收: 核对会话在服务端的最新 position, 把核对位置之后的消息分批拉回来入库(并照常判断是否触发)。
@@ -340,6 +356,8 @@ class Daemon:
         返回 ({chat_id: 第一次入库的非系统消息条数}, 留到下一轮的条数)。
         系统提示照样入库、照常判断是否触发, 但不算在返回的条数里, 只打一条 INFO: 有些系统提示服务端本来就不推
         (比如大群的"已关闭通知"提示, type=1500), 补收到它们不说明长连接漏推, 不能拿去告警。
+        发送时间落在断线窗口里(长连接断开到重新连上, 前后各放宽 WS_GAP_MARGIN 秒)的消息也一样: 照样入库、触发,
+        不算在返回的条数里, 只打一条 INFO"断线期间补收 N 条", 那是断线时本来就收不到的, 不是长连接漏推。
         """
         started, first = time.time(), getattr(self, '_feed_since', None) is None
         feed = []
@@ -364,6 +382,7 @@ class Daemon:
                 if latest > marks[cid]:
                     gaps.append((latest - marks[cid], cid, latest))
         new, system, sys_types, budget, left = {}, {}, {}, CATCHUP_ROUND_MAX, 0
+        offline, hit_gaps = {}, set()
         # 缺得少的先补: 零星漏推的消息尽快收到, 积压很多的会话用剩下的额度慢慢补
         for _, cid, latest in sorted(gaps):
             pos = marks[cid]
@@ -373,10 +392,14 @@ class Daemon:
                     for m in await asyncio.to_thread(self.client.pull_history, cid, range(pos + 1, end + 1)):
                         if not (m.get('from_id') and await self.listener.on_message(m)):
                             continue
+                        gap = self._ws_gap(m.get('create_time'))
                         if m.get('msg_type') == SYSTEM_MSG_TYPE:
                             system[cid] = system.get(cid, 0) + 1
                             t = (m.get('content_data') or {}).get('type', '?')
                             sys_types[t] = sys_types.get(t, 0) + 1
+                        elif gap:
+                            offline[cid] = offline.get(cid, 0) + 1
+                            hit_gaps.add(gap)
                         else:
                             new[cid] = new.get(cid, 0) + 1
                     # 这一段都拉过、入过库才推进核对位置; 中途出错时下一轮从这里接着拉
@@ -390,7 +413,20 @@ class Daemon:
             types = '、'.join(f'type={t} {n} 条' for t, n in sorted(sys_types.items(), key=lambda kv: -kv[1]))
             logger.info(f'补收到 {sum(system.values())} 条系统提示({types}), 已入库, 不算长连接漏推: '
                         f'{self._chat_counts(system, limit=0)}')
+        if offline:
+            hms = lambda t: datetime.fromtimestamp(t).strftime('%H:%M:%S')
+            when = '、'.join(f'{hms(down)} 断开 {hms(up)} 连上' for down, up in sorted(hit_gaps))
+            logger.info(f'断线期间补收 {sum(offline.values())} 条(长连接 {when}), 已入库, 不算长连接漏推: '
+                        f'{self._chat_counts(offline, limit=0)}')
         return new, left
+
+    def _ws_gap(self, create_time):
+        """发送时间落在哪个断线窗口里(前后各放宽 WS_GAP_MARGIN 秒), 返回 (断开时间, 重新连上的时间); 不在任何窗口里返回 None。"""
+        try:
+            t = float(create_time)
+        except (TypeError, ValueError):
+            return None
+        return next(((down, up) for down, up in self._ws_gaps if down - WS_GAP_MARGIN <= t <= up + WS_GAP_MARGIN), None)
 
     def _chat_counts(self, got: dict, limit: int = 10) -> str:
         """{chat_id: 条数} 写成「会话名」N 条, 多的在前; limit 为 0 时全列出来。"""
@@ -415,11 +451,25 @@ class Daemon:
 
     def _on_disconnect(self, error):
         now = time.time()
+        if self._ws_down_at is None:
+            # 重连失败也会走到这里, 断线窗口从第一次断开算起
+            self._ws_down_at = now
         times, window = RECONNECT_ALERT
         self._disconnects = [t for t in self._disconnects if now - t < window] + [now]
         if len(self._disconnects) >= times:
             self.notifier.alert(f'飞书长连接 {window // 60} 分钟内断开了 {len(self._disconnects)} 次, 最近一次: {error}',
                                 key='ws-unstable', cooldown=3600)
+
+    def _on_connect(self):
+        """长连接连上了。是断线后重新连上的话, 记下断线窗口, 叫醒补收循环马上补一轮: 断线期间的消息长连接推不过来,
+        不用等到下一个补收周期; 补收到的、发送时间落在窗口里的消息不算长连接漏推, 不告警。"""
+        down, self._ws_down_at = self._ws_down_at, None
+        if down is None:
+            return
+        now = time.time()
+        self._ws_gaps = [g for g in self._ws_gaps if g[1] > now - WS_GAP_KEEP] + [(down, now)]
+        logger.info(f'长连接断开 {now - down:.0f} 秒后重新连上, {RECONNECT_CATCHUP_DELAY} 秒后补收断线期间的消息')
+        self._catchup_wake.set()
 
     def _drain_inbox(self) -> int:
         """清空排队的飞书消息; 定时任务和终端指令放回队列。"""

@@ -11,15 +11,17 @@ class Listener:
     """WS 收消息 → 补全会话/发送人名字 → 入库 → 交给 on_stored。
 
     on_message 跑在协议层自己的事件循环线程里(LarkClient.loop), on_stored 需要自己切回调用方的循环。
+    on_disconnect(异常) 在长连接断开(或重连失败)时调用, on_connect() 在每次连上后调用, 都在 run_forever 的循环里。
     """
 
-    def __init__(self, client, storage, cfg: dict, my_user_id: str, on_stored=None, on_disconnect=None):
+    def __init__(self, client, storage, cfg: dict, my_user_id: str, on_stored=None, on_disconnect=None, on_connect=None):
         self.client = client
         self.storage = storage
         self.cfg = cfg
         self.my_user_id = str(my_user_id)
         self.on_stored = on_stored
         self.on_disconnect = on_disconnect
+        self.on_connect = on_connect
         self.name_cache = {}
 
     async def on_message(self, msg) -> bool:
@@ -65,7 +67,7 @@ class Listener:
     async def run_forever(self):
         while True:
             try:
-                await self.client.connect_websocket(self.on_message)
+                await self.client.connect_websocket(self.on_message, on_open=self.on_connect)
             except AuthExpired:
                 raise
             except Exception as e:
