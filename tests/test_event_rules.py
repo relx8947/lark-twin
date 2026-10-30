@@ -231,3 +231,71 @@ def test_pause_after_due_snapshot_does_not_resurrect_task(monkeypatch):
     with pytest.raises(asyncio.CancelledError): asyncio.run(d._schedule())
     assert s.get_task(tid).status=='cancelled'
     assert d.inbox.qsize()==0
+
+
+def test_local_message_rule_pipeline(monkeypatch, fake_client):
+    """Real listener/storage/scheduler/turn/CLI; only model and network are fake."""
+    import pytest
+    from larkx import cli, state
+    import larkx.daemon as module
+    from larkx.daemon import Daemon
+    from larkx.daemon.listener import Listener
+    from larkx.config import load_config
+    from larkx.protocol.proto import proto_pb2 as P
+
+    storage, rules, _ = setup_rule()
+    obj = Daemon.__new__(Daemon)
+    obj.storage, obj.rule_store = storage, rules
+    obj.client, obj.auth = fake_client, fake_client.auth
+    obj.cfg = load_config()
+    obj.cfg['memory_review_hour'] = -1
+    obj.cfg['triggers'].update(prefix='/ai', owner_only=True)
+    obj.prefix, obj.inbox, obj.home = '/ai', asyncio.Queue(), 'unused'
+    obj._load_state = lambda: {}
+    obj._report = lambda *a: None
+    async def noop(): pass
+    obj._finish_takeovers = noop
+    monkeypatch.setattr(module, 'commit_agent_home', lambda *a: None)
+    monkeypatch.setattr(cli, 'LarkAuth', lambda: object())
+    monkeypatch.setattr(cli, 'LarkClient', lambda _: fake_client)
+    monkeypatch.setattr(cli, 'is_agent_actor', lambda: True)
+    monkeypatch.setenv('LARKX_MIRROR', 'false')
+    sent = []
+    original_send = fake_client.send_message
+    def send(msg, *a, **kw):
+        sent.append(msg)
+        return original_send(msg, *a, **kw)
+    fake_client.send_message = send
+    prompts = []
+    class Agent:
+        async def ask(self, prompt):
+            prompts.append(prompt)
+            assert state.read_turn()['is_owner'] is True
+            assert cli.cmd_send(argparse.Namespace(chat_id='target', text=['work'], root=None,
+                json=True, mention=['300:TestBot'])) == 0
+            return SimpleNamespace(is_error=False, subtype='success', text='sent', duration_s=1, tools=[])
+    obj.session = Agent()
+    rich = {'richText': {'elements': {'dictionary': {'0': {'tag': 5,
+        'property': P.AtProperty(userId='200', content='@SourceBot').SerializeToString()}}}}}
+    msg = message(content='@SourceBot work', content_data=rich, chat_type=2, position=1)
+    listener = Listener(fake_client, storage, obj.cfg, '100', on_stored=obj.on_message)
+    async def run():
+        assert await listener.on_message(msg)
+        assert not await listener.on_message(msg)  # duplicate WS push
+        assert obj.inbox.empty()  # ordinary /ai policy does not match
+        async def stop(*a): raise asyncio.CancelledError()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(module.asyncio, 'sleep', stop)
+            with pytest.raises(asyncio.CancelledError): await obj._schedule()
+        ev = obj.inbox.get_nowait()
+        await obj._handle(ev)
+        assert state.read_turn() is None
+        # The durable message is scanned again; it must not create another task.
+        assert rules.reconcile('100') == 0
+        assert obj.inbox.empty()
+    asyncio.run(run())
+    assert len(prompts) == 1
+    assert sent[0]['segments'][0] == {'type': 'at', 'user_id': '300', 'name': 'TestBot'}
+    assert sent[0]['segments'][-1]['text'] == 'work' + ('\n\n—— ' + load_config()['reply_signature'] if load_config()['reply_signature'] else '')
+    assert rules.history()[0]['status'] == 'done'
+    assert len(storage.list_actions()) == 1
