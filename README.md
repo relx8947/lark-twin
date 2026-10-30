@@ -100,7 +100,7 @@ larkx rule delete 1
 - 暂停/删除取消未开始的事件任务，执行中的任务继续；打断用 `/ai /stop`。执行中重启、调用失败或超时的任务记为 unknown，不自动重试，避免重复副作用；需要查审计人工确认。普通定时任务恢复行为不变。
 - 第一版无独立配置页面，无自动语义过滤。条件命中后由预设指令交给现有 coding agent 执行，保留其完整本机权限；不是权限沙箱。
 
-真实 @发送复用现有协议能力：`larkx send CHAT_ID --mention USER_ID:显示名 --json -`，正文从 stdin 读取。
+真实 @发送复用现有协议能力：`larkx send CHAT_ID --mention USER_ID:显示名 --json -`，正文从 stdin 读取。`--mention` 暂不支持与 `--markdown` 同时使用，组合时明确报错，不会静默丢失 @或富文本。
 
 ## 配套 skill
 

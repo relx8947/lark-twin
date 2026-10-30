@@ -299,3 +299,10 @@ def test_local_message_rule_pipeline(monkeypatch, fake_client):
     assert sent[0]['segments'][-1]['text'] == 'work' + ('\n\n—— ' + load_config()['reply_signature'] if load_config()['reply_signature'] else '')
     assert rules.history()[0]['status'] == 'done'
     assert len(storage.list_actions()) == 1
+
+
+def test_mention_markdown_combination_fails_explicitly(monkeypatch):
+    from larkx import cli
+    args = argparse.Namespace(chat_id='target', text=['**task**'], root=None,
+                              json=True, mention=['300:TestBot'], markdown=True)
+    assert cli.cmd_send(args) == 1
