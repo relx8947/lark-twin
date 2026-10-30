@@ -411,3 +411,26 @@ def batch_copy_messages(payload: bytes) -> tuple:
     if last is None or (ids and last.id not in ids):
         return ids, []
     return ids or [last.id], [message_dict(protobuf_to_dict(last))]
+
+
+def frame_diag(raw: bytes) -> str:
+    """解不开的 WS 帧的诊断信息(只用于告警日志): 原始字节开头 64 字节的 hex, 再试着当外层 Frame 解, 列出解得出的字段
+    和 payload 的开头(gzip 的再解压看一眼)。"""
+    head = f'前 64 字节 hex: {raw[:64].hex()}'
+    try:
+        frame = P.Frame()
+        frame.ParseFromString(raw)
+    except Exception as e:
+        return f'{head}; 当外层 Frame 也解不开: {e!r}'
+    headers = {h.key: h.value for h in frame.headers}
+    payload = frame.payload
+    text = (f'{head}; 当外层 Frame 解: seqid {frame.seqid}, logid {frame.logid}, service {frame.service}, method {frame.method}, '
+            f'headers {str(headers)[:300]}, payloadEncoding {frame.payloadEncoding!r}, payloadType {frame.payloadType!r}, '
+            f'payload {len(payload)} 字节, 开头 hex: {payload[:32].hex()}')
+    if (frame.payloadEncoding or '').lower() == 'gzip' or payload[:2] == b'\x1f\x8b':
+        try:
+            inner = gzip.decompress(payload)
+            text += f', gzip 解压后 {len(inner)} 字节, 开头 hex: {inner[:32].hex()}'
+        except Exception as e:
+            text += f', gzip 解压失败: {e!r}'
+    return text

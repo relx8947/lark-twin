@@ -95,7 +95,7 @@ class PushStats:
 
     def error(self, e, raw: bytes = b'', what: str = '', kind: str = 'pull'):
         """解不开的帧(或按 sid 补拉、逐条转发拉消息失败, kind 分别是 pull、batch): 第一次马上打 WARNING, 之后每个周期最多
-        打一条, 带上这期间压下去的条数。"""
+        打一条, 带上这期间压下去的条数。解不开的帧在打 WARNING 的那次附上诊断(原始字节开头的 hex、当外层 Frame 解出的字段)。"""
         if not what:
             self.errors += 1
         elif kind == 'batch':
@@ -107,7 +107,8 @@ class PushStats:
             self.muted += 1
             return
         more = f'(上次告警后还有 {self.muted} 次也出错)' if self.muted else ''
-        logger.warning(f'[WS 推送] {what or f"解不开的帧, {len(raw)} 字节, 已跳过"}: {e!r}{more}')
+        diag = '' if what else f'。{decoders.frame_diag(raw)}'
+        logger.warning(f'[WS 推送] {what or f"解不开的帧, {len(raw)} 字节, 已跳过"}: {e!r}{more}{diag}')
         self.warned, self.last_warn, self.muted = True, now, 0
 
     def maybe_report(self):

@@ -1,5 +1,5 @@
 """WS 推送: gzip 压缩的帧能解开; PUSH_SID 只推来 sid 时按 sid 补拉; 逐条转发(cmd 134)推送里没带的消息按 id 拉回来;
-推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警; payloadEncoding=json 的帧按 JSON 解开计数, 不算解不开;
+推送按 cmd 统计, 不逐帧打日志, 解不开的帧限频告警, 告警那次带上诊断; payloadEncoding=json 的帧按 JSON 解开计数, 不算解不开;
 连上长连接后调用 on_open。"""
 import asyncio
 import gzip
@@ -341,6 +341,50 @@ def test_batch_copy_follows_dedup_and_old_message_rules(tmp_path, monkeypatch, f
     assert sorted(m.msg_id for m in obj.storage.get_messages('p1')) == ['901', '902', '903']
     events = [obj.inbox.get_nowait() for _ in range(obj.inbox.qsize())]
     assert [(e.ref, e.body) for e in events] == [('902', '在吗'), ('903', '帮我看看')]
+
+
+# ---- 解不开的帧的诊断 ----
+
+def test_undecodable_frame_diag_only_when_warned():
+    """解不开的帧: 只在打 WARNING 的那次附上原始字节开头的 hex 和当外层 Frame 解出的字段, 压下去的那些不打。"""
+    frame = P.Frame()
+    frame.seqid, frame.logid, frame.service, frame.method, frame.payloadType = 77, 88, 7, 9, 'pb'
+    h = frame.headers.add()
+    h.key, h.value = 'x-request-time', '1793348235000'
+    frame.payload = b'\x0a\xff\x01oops'                     # 当 Packet 解会报 DecodeError
+    raw = frame.SerializeToString()
+    lines, now = [], [0.0]
+    sink = logger.add(lambda m: lines.append(m.record['message']), level='WARNING')
+    try:
+        stats = PushStats(interval=600, clock=lambda: now[0])
+        for _ in range(3):
+            try:
+                decoders.parse_ws_frame(raw)
+            except Exception as e:
+                stats.error(e, raw)
+        [line] = lines
+        assert f'前 64 字节 hex: {raw[:64].hex()}' in line
+        assert 'seqid 77, logid 88, service 7, method 9' in line and "'x-request-time': '1793348235000'" in line
+        assert "payloadEncoding '', payloadType 'pb', payload 7 字节, 开头 hex: 0aff016f6f7073" in line
+        now[0] = 601
+        stats.error(ValueError('坏帧'), b'\xff\xff')
+        assert '还有 2 次也出错' in lines[-1] and '当外层 Frame 也解不开' in lines[-1]
+        stats.error(RuntimeError('网关出错'), what='按 sid 补拉 PUSH_SID [1] 失败')
+        assert len(lines) == 2                                # 补拉失败照旧和坏帧共用限频, 也不带帧诊断
+        now[0] = 1202
+        stats.error(RuntimeError('网关出错'), what='按 sid 补拉 PUSH_SID [1] 失败')
+        assert 'hex' not in lines[-1] and stats.pull_errors == 2
+    finally:
+        logger.remove(sink)
+
+
+def test_frame_diag_gzip_payload():
+    import gzip as gz
+    frame = P.Frame()
+    frame.payloadEncoding, frame.payload = 'gzip', gz.compress(b'\x0a\xff\x01')
+    assert 'gzip 解压后 3 字节, 开头 hex: 0aff01' in decoders.frame_diag(frame.SerializeToString())
+    frame.payload = b'\x1f\x8bnot gzip'
+    assert 'gzip 解压失败' in decoders.frame_diag(frame.SerializeToString())
 
 
 def test_ws_open_callback(monkeypatch):
