@@ -31,6 +31,7 @@ CATCHUP_DAYS = 7           # 补收核对本地多少天内有动静的会话
 CATCHUP_BATCH = 50         # 每次按 position 拉多少条
 CATCHUP_ROUND_MAX = 2000   # 每轮补收最多拉多少个 position, 没拉完的下一轮接着拉
 WS_MISS_COOLDOWN = 86400   # 同一个会话的漏推告警多久报一次
+SYSTEM_MSG_TYPE = 6        # Message.Type.SYSTEM: 入群、改群名、"大群已关闭通知"(type=1500)这类系统提示
 TAKEOVER_SUMMARY = ('接管「{name}」(chat_id={chat}) 已结束({why})。用 larkx messages {chat} --limit 60 回顾接管期间的对话, '
                     '给本人发一份简短总结: 聊了什么、谈成了什么、还有什么等本人决定或跟进。目标是: {goal}')
 RECONNECT_ALERT = (3, 600)  # 10 分钟内断线 3 次就告警
@@ -336,7 +337,9 @@ class Daemon:
         核对哪些会话: 本地 7 天内有动静的全部会话, 加上消息列表(feed)里上一轮以来有更新的会话(长连接一条都没推过的会话
         本地没有记录, 只能从 feed 发现)。核对位置只由这里推进, 一段消息都拉过、入过库才推进, WS 推来的消息不动它。
         每轮最多拉 CATCHUP_ROUND_MAX 个 position, 缺得少的会话先补, 没拉完的下一轮从核对位置接着拉, 不会跳过。
-        返回 ({chat_id: 第一次入库的消息条数}, 留到下一轮的条数)。
+        返回 ({chat_id: 第一次入库的非系统消息条数}, 留到下一轮的条数)。
+        系统提示照样入库、照常判断是否触发, 但不算在返回的条数里, 只打一条 INFO: 有些系统提示服务端本来就不推
+        (比如大群的"已关闭通知"提示, type=1500), 补收到它们不说明长连接漏推, 不能拿去告警。
         """
         started, first = time.time(), getattr(self, '_feed_since', None) is None
         feed = []
@@ -360,7 +363,7 @@ class Daemon:
                     self.storage.catchup_advance(cid, marks[cid])
                 if latest > marks[cid]:
                     gaps.append((latest - marks[cid], cid, latest))
-        new, budget, left = {}, CATCHUP_ROUND_MAX, 0
+        new, system, sys_types, budget, left = {}, {}, {}, CATCHUP_ROUND_MAX, 0
         # 缺得少的先补: 零星漏推的消息尽快收到, 积压很多的会话用剩下的额度慢慢补
         for _, cid, latest in sorted(gaps):
             pos = marks[cid]
@@ -368,7 +371,13 @@ class Daemon:
                 while pos < latest and budget > 0:
                     end = min(latest, pos + CATCHUP_BATCH, pos + budget)
                     for m in await asyncio.to_thread(self.client.pull_history, cid, range(pos + 1, end + 1)):
-                        if m.get('from_id') and await self.listener.on_message(m):
+                        if not (m.get('from_id') and await self.listener.on_message(m)):
+                            continue
+                        if m.get('msg_type') == SYSTEM_MSG_TYPE:
+                            system[cid] = system.get(cid, 0) + 1
+                            t = (m.get('content_data') or {}).get('type', '?')
+                            sys_types[t] = sys_types.get(t, 0) + 1
+                        else:
                             new[cid] = new.get(cid, 0) + 1
                     # 这一段都拉过、入过库才推进核对位置; 中途出错时下一轮从这里接着拉
                     self.storage.catchup_advance(cid, end)
@@ -377,6 +386,10 @@ class Daemon:
             except Exception as e:
                 logger.warning(f'补收会话 {cid} 出错, 下一轮从 position {pos + 1} 接着拉: {e!r}')
             left += latest - pos
+        if system:
+            types = '、'.join(f'type={t} {n} 条' for t, n in sorted(sys_types.items(), key=lambda kv: -kv[1]))
+            logger.info(f'补收到 {sum(system.values())} 条系统提示({types}), 已入库, 不算长连接漏推: '
+                        f'{self._chat_counts(system, limit=0)}')
         return new, left
 
     def _chat_counts(self, got: dict, limit: int = 10) -> str:

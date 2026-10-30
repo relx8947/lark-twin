@@ -4,6 +4,9 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 
+import pytest
+from loguru import logger
+
 from larkx import daemon as d
 from larkx.daemon.listener import Listener
 from larkx.protocol.client import LarkClient
@@ -234,6 +237,72 @@ def test_ws_miss_alert_names_chats_and_cools_down_per_chat(tmp_path, monkeypatch
     text = fake_client.sent[1][1]
     assert '漏推了 2 条' in text and '「g3」2 条' in text and '另有 1 个会话一天内报过, 这轮也补收了 30 条' in text
     assert '还有 120 条没拉完' in text
+
+
+def system_tip(cid, p, srv):
+    """大群"已关闭通知"的系统提示(type=1500): 服务端本来就不经长连接推, 只有补收拉得到。"""
+    return {'msg_id': f'{cid}-{p}', 'chat_id': cid, 'chat_type': 2, 'from_id': '1', 'position': p,
+            'create_time': srv.create_time, 'msg_type': 6, 'msg_type_name': 'SYSTEM', 'content': '[系统消息] type=1500 ',
+            'content_data': {'messageTemplate': 'This is a large group. Notifications are turned off to avoid distractions. ',
+                             'type': 1500, 'sysContentValues': {'visible_chatters': {}}}}
+
+
+def test_system_messages_stored_but_not_counted(tmp_path, monkeypatch, fake_client):
+    """补收到的系统提示照样入库、推进核对位置, 但不算进漏推条数, 只打一条 INFO。"""
+    obj, srv = setup(tmp_path, monkeypatch, fake_client)
+    obj.storage.save_message(srv.message('g1', 10))
+    srv.latest['g1'] = 14
+    plain = srv.message
+    srv.message = lambda cid, p, **kw: plain(cid, p, **kw) if p == 14 else system_tip(cid, p, srv)
+    lines = []
+    sink = logger.add(lambda m: lines.append((m.record['level'].name, m.record['message'])), level='INFO')
+    try:
+        got, left = asyncio.run(obj.catch_up())
+    finally:
+        logger.remove(sink)
+    assert got == {'g1': 1} and left == 0
+    assert stored(obj.storage, 'g1') == [10, 11, 12, 13, 14] and mark(obj.storage, 'g1') == 14
+    [info] = [msg for lvl, msg in lines if '系统提示' in msg]
+    assert '补收到 3 条系统提示(type=1500 3 条)' in info and '「g1」3 条' in info
+    assert not [msg for lvl, msg in lines if lvl == 'WARNING']
+
+
+def test_system_messages_do_not_alert_or_use_cooldown(tmp_path, monkeypatch, fake_client):
+    """补收循环里只补到系统提示: 不发漏推告警、不打 WARNING, 也不占这个会话一天一次的告警额度;
+    之后真漏推了人发的消息照样告警, 条数里不算系统提示。"""
+    monkeypatch.setattr(d, 'CATCHUP_DELAY', 0)
+    obj, srv = setup(tmp_path, monkeypatch, fake_client)
+    obj.cfg['catchup_interval'] = 0.01
+    obj.storage.update_chat_name('g1', '大群', 2)
+    obj.storage.save_message(srv.message('g1', 10))
+    srv.latest['g1'] = 10
+    plain = srv.message
+    srv.message = lambda cid, p, **kw: plain(cid, p, **kw) if p in (14, 15) else system_tip(cid, p, srv)
+    rounds = [lambda: None,                                   # 第一轮: 启动时没有积压
+              lambda: srv.latest.update(g1=13),               # 只有系统提示
+              lambda: srv.latest.update(g1=15),               # 人发的 14、15
+              ]
+    real, warnings, before = obj.catch_up, [], []
+
+    async def next_round():
+        before.append((len(fake_client.sent), len(warnings)))   # 每轮开始前: 已发的通知、已打的 WARNING
+        if not rounds:
+            raise asyncio.CancelledError
+        rounds.pop(0)()
+        return await real()
+    obj.catch_up = next_round
+    sink = logger.add(lambda m: warnings.append(m.record['message']), level='WARNING')
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(obj._catch_up_loop())
+    finally:
+        logger.remove(sink)
+    assert stored(obj.storage, 'g1') == [10, 11, 12, 13, 14, 15] and mark(obj.storage, 'g1') == 15
+    assert before[2] == (0, 0)                                # 只补到系统提示的那一轮过后: 没通知, 没 WARNING
+    [(_, text)] = fake_client.sent
+    # 这个会话的告警额度没被系统提示占掉: 人发的消息照样报, 条数里不算系统提示
+    assert '漏推了 2 条' in text and '「大群」2 条' in text and '一天内报过' not in text
+    assert warnings == ['补收到 2 条 WS 没推送的消息: 「大群」2 条']
 
 
 # ---- 存储与 feed ----
