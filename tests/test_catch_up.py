@@ -1,5 +1,5 @@
 """补收不丢消息: 核对位置只由补收推进、核对全部近期会话、分批拉全、feed 发现新会话; 补收到的旧消息不触发任何动作;
-漏推告警按会话冷却。"""
+漏推告警按会话冷却; 长连接重新连上后马上补收, 断线期间的消息不算漏推。"""
 import asyncio
 import time
 from datetime import datetime, timedelta
@@ -333,3 +333,96 @@ def test_feed_chats_pages_until_since():
     c.api = api
     assert c.feed_chats(800) == ['c1', 'b1', 'c2']
     assert [x.get('pullType') for x in calls] == ['REFRESH', 'REFRESH', 'LOAD_MORE']  # 翻到比 since 早就停
+
+
+# ---- 断线重连后马上补收, 断线期间的消息不算漏推 ----
+
+def test_gap_messages_not_counted_as_ws_miss(tmp_path, monkeypatch, fake_client):
+    """补收到的消息发送时间落在断线窗口里(前后各放宽 60 秒): 照样入库、推进核对位置, 但不算漏推, 只打一条 INFO;
+    窗口外的照旧算漏推。"""
+    obj, srv = setup(tmp_path, monkeypatch, fake_client)
+    now = int(time.time())
+    obj._ws_gaps = [(now - 300, now - 290)]
+    obj.storage.save_message(srv.message('g1', 10))
+    obj.storage.save_message(srv.message('g2', 10))
+    srv.latest.update(g1=13, g2=11)
+    sent_at = {('g1', 11): now - 295, ('g1', 12): now - 355, ('g1', 13): now - 365, ('g2', 11): now - 3 * 3600}
+    plain = srv.message
+    srv.message = lambda cid, p, **kw: plain(cid, p, **kw) | {'create_time': sent_at[(cid, p)]}
+    lines = []
+    sink = logger.add(lambda m: lines.append((m.record['level'].name, m.record['message'])), level='INFO')
+    try:
+        got, left = asyncio.run(obj.catch_up())
+    finally:
+        logger.remove(sink)
+    assert got == {'g1': 1, 'g2': 1} and left == 0            # g1 的 13 比断开早 65 秒, g2 的是 3 小时前的
+    assert stored(obj.storage, 'g1') == [10, 11, 12, 13] and mark(obj.storage, 'g1') == 13
+    hms = lambda t: datetime.fromtimestamp(t).strftime('%H:%M:%S')
+    [info] = [msg for lvl, msg in lines if '断线期间' in msg]
+    assert info == f'断线期间补收 2 条(长连接 {hms(now - 300)} 断开 {hms(now - 290)} 连上), 已入库, 不算长连接漏推: 「g1」2 条'
+    assert not [msg for lvl, msg in lines if lvl == 'WARNING']
+
+
+def test_disconnect_window_starts_at_first_drop(tmp_path, monkeypatch, fake_client):
+    """断线窗口从第一次断开算到重新连上(中间重连失败不改起点); 第一次连上(daemon 启动)不算; 一天前的窗口丢掉。"""
+    obj, srv = setup(tmp_path, monkeypatch, fake_client)
+    now = [1000.0]
+    monkeypatch.setattr(d, 'time', type('T', (), {'time': staticmethod(lambda: now[0])}))
+    obj._on_connect()                                         # 启动时第一次连上
+    assert obj._ws_gaps == [] and not obj._catchup_wake.is_set()
+    obj._ws_gaps = [(1.0, 2.0)]
+    now[0] = 90000.0
+    obj._on_disconnect(RuntimeError('3007'))
+    now[0] = 90010.0
+    obj._on_disconnect(RuntimeError('连不上'))                  # 重连失败
+    now[0] = 90020.0
+    obj._on_connect()
+    assert obj._ws_gaps == [(90000.0, 90020.0)] and obj._ws_down_at is None and obj._catchup_wake.is_set()
+    assert obj._ws_gap(90000 - 60) and obj._ws_gap(90080) and not obj._ws_gap(90081) and not obj._ws_gap(None)
+
+
+def test_reconnect_wakes_catch_up_loop(tmp_path, monkeypatch, fake_client):
+    """重新连上后补收循环马上醒来补一轮(不等 15 分钟), 补收只在这个循环里一轮接一轮地跑;
+    断线期间的消息不告警、不打 WARNING, 同一轮里窗口外的照旧告警。"""
+    monkeypatch.setattr(d, 'CATCHUP_DELAY', 0)
+    monkeypatch.setattr(d, 'RECONNECT_CATCHUP_DELAY', 0)
+    obj, srv = setup(tmp_path, monkeypatch, fake_client)
+    obj.cfg['catchup_interval'] = 3600
+    obj.storage.update_chat_name('g1', '严肃 Agent 交流群', 2)
+    for cid in ('g1', 'g2'):
+        obj.storage.save_message(srv.message(cid, 10))
+        srv.latest[cid] = 10
+    plain = srv.message
+    srv.message = lambda cid, p, **kw: plain(cid, p, **kw) | ({'create_time': int(time.time())} if cid == 'g1' else {})
+
+    def reconnect():
+        obj._on_disconnect(RuntimeError('received 3007 (registered) close by server api'))
+        obj._on_connect()
+
+    rounds = [reconnect,                                      # 第一轮(启动)跑着的时候断线又连上
+              lambda: srv.latest.update(g1=11, g2=11)]        # g1 的是断线期间发的, g2 的是 3 小时前的
+    real, warnings, running = obj.catch_up, [], []
+
+    async def next_round():
+        if not rounds:
+            raise asyncio.CancelledError
+        running.append(1)
+        assert len(running) == 1                              # 不会两轮同时跑
+        try:
+            rounds.pop(0)()
+            return await real()
+        finally:
+            running.pop()
+            if not rounds:
+                obj._catchup_wake.set()                       # 让循环再醒一次, 结束测试
+    obj.catch_up = next_round
+    sink = logger.add(lambda m: warnings.append(m.record['message']), level='WARNING')
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(obj._catch_up_loop(), 5))
+    finally:
+        logger.remove(sink)
+    assert stored(obj.storage, 'g1') == [10, 11] and stored(obj.storage, 'g2') == [10, 11]
+    assert warnings == ['补收到 1 条 WS 没推送的消息: 「g2」1 条']
+    [(_, text)] = fake_client.sent
+    assert '漏推了 1 条' in text and '「g2」1 条' in text and '严肃 Agent' not in text

@@ -109,6 +109,7 @@ def _daemon(tmp_path, fake_client, monkeypatch):
     obj.notifier = notify.Notifier(obj.cfg, fake_client)
     obj.auth = fake_client.auth
     obj.prefix, obj.home, obj._disconnects = '/ai', tmp_path, []
+    obj._ws_down_at, obj._ws_gaps, obj._catchup_wake = None, [], asyncio.Event()
     obj.inbox = asyncio.Queue()
     monkeypatch.setattr(d, 'commit_agent_home', lambda *a: False)
     return obj

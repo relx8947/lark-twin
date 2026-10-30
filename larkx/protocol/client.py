@@ -13,12 +13,13 @@ from .proto.ids import generate_access_key, generate_long_request_id, generate_r
 
 WS_STATS_INTERVAL = 600
 PUSH_SID = 6000  # improto.Command.PUSH_SID: 只推来 sid, 完整的推送包要按 sid 再拉
+BATCH_COPY = 134  # messages.PushBatchCopyMessages: 逐条转发到会话的消息不推 cmd 6, 只推这个, 别的消息要按 id 再拉
 
 
 class PushStats:
     """WS 收到的推送统计, 用来查长连接漏推: 新消息(cmd 6)以外的推送每种 cmd 第一次出现时打一条 INFO(带解出来的内容摘要),
-    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数和按 sid 补拉的结果; 解不开的帧、补拉失败限频打 WARNING。不逐帧打日志。
-    payloadEncoding=json 的帧(不是 Packet)单独按 JSON 里的 cmd 计数, 每种第一次出现时记下帧头和内容。"""
+    之后每 WS_STATS_INTERVAL 秒汇总一次各 cmd 的次数、按 sid 补拉和逐条转发(cmd 134)的处理结果; 解不开的帧、补拉失败限频打
+    WARNING。不逐帧打日志。payloadEncoding=json 的帧(不是 Packet)单独按 JSON 里的 cmd 计数, 每种第一次出现时记下帧头和内容。"""
 
     def __init__(self, interval: int = WS_STATS_INTERVAL, clock=time.monotonic):
         self.interval, self.clock = interval, clock
@@ -27,6 +28,8 @@ class PushStats:
         self.compressed = self.errors = self.muted = 0
         self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
         self.pull_logged = False
+        self.batches, self.batch_msgs, self.batch_pulled, self.batch_missing, self.batch_errors = 0, 0, 0, 0, 0
+        self.batch_logged = False
         self.last_report = self.last_warn = clock()
         self.warned = False
 
@@ -78,18 +81,34 @@ class PushStats:
             self.pull_logged = True
             logger.info(f'[WS 推送] 第一次按 sid 补拉 PUSH_SID: sid {list(sids)} → {len(packets)} 个包, cmd {cmds}, 新消息 {msgs} 条')
 
-    def error(self, e, raw: bytes = b'', what: str = ''):
-        """解不开的帧(或按 sid 补拉失败): 第一次马上打 WARNING, 之后每个周期最多打一条, 带上这期间压下去的条数。"""
-        if what:
-            self.pull_errors += 1
-        else:
+    def batch_copy(self, ids, direct: int, pulled: int, msgs: int):
+        """处理了一次逐条转发推送(cmd 134): ids 是这批消息的 id, direct 条推送里直接带着, 按 id 拉回 pulled 条, msgs 条交给回调;
+        第一次处理时打一条 INFO 看看。"""
+        self.batches += 1
+        self.batch_msgs += msgs
+        self.batch_pulled += pulled
+        self.batch_missing += max(0, len(ids) - direct - pulled)
+        if not self.batch_logged:
+            self.batch_logged = True
+            logger.info(f'[WS 推送] 第一次处理逐条转发 cmd 134: 消息 id {list(ids)}, 推送里直接带着 {direct} 条, '
+                        f'按 id 拉回 {pulled} 条, 交给回调 {msgs} 条')
+
+    def error(self, e, raw: bytes = b'', what: str = '', kind: str = 'pull'):
+        """解不开的帧(或按 sid 补拉、逐条转发拉消息失败, kind 分别是 pull、batch): 第一次马上打 WARNING, 之后每个周期最多
+        打一条, 带上这期间压下去的条数。解不开的帧在打 WARNING 的那次附上诊断(原始字节开头的 hex、当外层 Frame 解出的字段)。"""
+        if not what:
             self.errors += 1
+        elif kind == 'batch':
+            self.batch_errors += 1
+        else:
+            self.pull_errors += 1
         now = self.clock()
         if self.warned and now - self.last_warn < self.interval:
             self.muted += 1
             return
         more = f'(上次告警后还有 {self.muted} 次也出错)' if self.muted else ''
-        logger.warning(f'[WS 推送] {what or f"解不开的帧, {len(raw)} 字节, 已跳过"}: {e!r}{more}')
+        diag = '' if what else f'。{decoders.frame_diag(raw)}'
+        logger.warning(f'[WS 推送] {what or f"解不开的帧, {len(raw)} 字节, 已跳过"}: {e!r}{more}{diag}')
         self.warned, self.last_warn, self.muted = True, now, 0
 
     def maybe_report(self):
@@ -104,9 +123,12 @@ class PushStats:
                           sorted(self.json_counts.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))) or '无'
         logger.info(f'[WS 推送] 近 {minutes:.0f} 分钟: 新消息(cmd 6) {self.counts.get(6, 0)} 帧, 其他推送: {others}; '
                     f'压缩帧 {self.compressed}, JSON 帧: {jsons}, 解不开的帧 {self.errors}; 按 sid 补拉 PUSH_SID {self.pulls} 次, '
-                    f'拉到的包: {pulled}, 新消息 {self.pulled_msgs} 条, 补拉失败 {self.pull_errors} 次')
+                    f'拉到的包: {pulled}, 新消息 {self.pulled_msgs} 条, 补拉失败 {self.pull_errors} 次; '
+                    f'逐条转发(cmd 134) {self.batches} 次, 消息 {self.batch_msgs} 条(按 id 拉回 {self.batch_pulled} 条, '
+                    f'没拉到 {self.batch_missing} 条), 处理失败 {self.batch_errors} 次')
         self.counts, self.json_counts, self.compressed, self.errors, self.last_report = {}, {}, 0, 0, now
         self.pulls, self.pulled, self.pulled_msgs, self.pull_errors = 0, {}, 0, 0
+        self.batches, self.batch_msgs, self.batch_pulled, self.batch_missing, self.batch_errors = 0, 0, 0, 0, 0
 
 
 class LarkClient:
@@ -193,12 +215,18 @@ class LarkClient:
             threading.Thread(target=run_loop, args=(self.loop,), daemon=True).start()
             self._loop_started = True
 
-    async def connect_websocket(self, on_message):
+    async def connect_websocket(self, on_message, on_open=None):
+        """连上长连接, 一直收推送直到断开(断开时抛异常)。on_open 在连上后马上调用一次(在调用方的事件循环里)。"""
         self._ensure_loop()
         url = self.build_ws_url()
         async with websockets.connect(url) as ws:
             logger.info('WS 已连接')
             heartbeat_task = asyncio.create_task(self.heartbeat_loop(ws))
+            if on_open:
+                try:
+                    on_open()
+                except Exception as e:
+                    logger.warning(f'WS 连上后的回调出错: {e!r}')
             try:
                 async for raw in ws:
                     try:
@@ -225,6 +253,8 @@ class LarkClient:
                 asyncio.run_coroutine_threadsafe(self._dispatch(msg, on_message), self.loop)
         elif cmd == PUSH_SID:
             asyncio.run_coroutine_threadsafe(self._pull_sids(decoders.push_sids(raw), on_message), self.loop)
+        elif cmd == BATCH_COPY:
+            asyncio.run_coroutine_threadsafe(self._batch_copy(packet.get('payload') or b'', on_message), self.loop)
         self.push_stats.packet(cmd, frame, packet)
 
     async def _pull_sids(self, sids, on_message):
@@ -241,6 +271,30 @@ class LarkClient:
             self.push_stats.error(e, what=f'按 sid 补拉 PUSH_SID {sids} 失败, 这几条靠补收')
             return
         self.push_stats.pull(sids, packets, len(msgs))
+        for msg in msgs:
+            await self._dispatch(msg, on_message)
+
+    async def _batch_copy(self, payload: bytes, on_message):
+        """逐条转发(messages.PushBatchCopyMessages, cmd 134): 有人一次逐条转发几条消息到会话时, 服务端不推 cmd 6, 只推这个,
+        里面是这批消息的 id、会话的 feed 卡片和最后一条消息的完整内容。推送里带着的那条直接用, 其余的按 id 只读地拉回来
+        (messages.PullMessagesByIdsRequest, 只是取消息, 不改变已读状态), 按 position 排好, 和新消息推送一样交给回调
+        (去重、旧消息只入库这些规则都在回调里, 一样适用)。"""
+        ids = []
+        try:
+            ids, msgs = decoders.batch_copy_messages(payload)
+            have = {str(m.get('msg_id')) for m in msgs}
+            rest = [i for i in ids if i not in have]
+            direct, pulled = len(msgs), 0
+            if rest:
+                resp = await asyncio.to_thread(self.api, 'messages.PullMessagesByIdsRequest', {'messageIds': rest})
+                got = [decoders.message_dict(v) for v in ((resp or {}).get('messages') or {}).values()]
+                got = [m for m in got if str(m.get('msg_id')) in rest]
+                msgs, pulled = msgs + got, len(got)
+            msgs = sorted((m for m in msgs if m.get('from_id')), key=lambda m: int(m.get('position') or 0))
+        except Exception as e:
+            self.push_stats.error(e, what=f'处理逐条转发 cmd 134(消息 {ids or "?"})失败, 这几条靠补收', kind='batch')
+            return
+        self.push_stats.batch_copy(ids, direct, pulled, len(msgs))
         for msg in msgs:
             await self._dispatch(msg, on_message)
 

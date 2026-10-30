@@ -385,10 +385,52 @@ def push_messages(payload: bytes):
     pmr_d = protobuf_to_dict(pmr)
     at_me_map = pmr_d.get('messagesAtMe') or {}
     for k, v in (pmr_d.get('messages') or {}).items():
-        message_type = enum_to_int(v.get('type', 0))
-        chat_type = enum_to_int(v.get('chatType', 0))
-        summary, data = decode_message_content(message_type, v.get('content', b''))
-        root_id = v.get('rootId') or ''
-        scope, anchor = resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '')
-        out.append({'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'from_type': from_type(v.get('fromType')), 'chat_id': v.get('chatId') or v.get('channelId'), 'chat_type': chat_type, 'chat_type_name': CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': bool(at_me_map.get(v.get('id')) or at_me_map.get(k)), 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position'), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data})
+        out.append(message_dict(v, at_me=bool(at_me_map.get(v.get('id')) or at_me_map.get(k))))
     return out
+
+
+def message_dict(v: dict, at_me: bool = False) -> dict:
+    """消息实体(entities.Message 解成的 dict)转成入库、判断触发用的消息, 和新消息推送里的一样。
+    推送里没有会话模式, 话题群的根消息由 LarkClient._dispatch 查过 chatMode 再归到它自己的话题。"""
+    message_type = enum_to_int(v.get('type', 0))
+    chat_type = enum_to_int(v.get('chatType', 0))
+    summary, data = decode_message_content(message_type, v.get('content', b''))
+    root_id = v.get('rootId') or ''
+    scope, anchor = resolve_scope(v.get('id'), message_type, chat_type, root_id, v.get('threadId') or '')
+    return {'msg_id': v.get('id'), 'msg_type': message_type, 'msg_type_name': MSG_TYPE_NAMES.get(message_type, str(message_type)), 'from_id': v.get('fromId'), 'from_type': from_type(v.get('fromType')), 'chat_id': v.get('chatId') or v.get('channelId'), 'chat_type': chat_type, 'chat_type_name': CHAT_TYPE_NAMES.get(chat_type, str(chat_type)), 'scope': scope, 'anchor': anchor, 'at_me': at_me, 'root_id': root_id, 'parent_id': v.get('parentId') or '', 'cid': v.get('cid') or '', 'position': v.get('position'), 'create_time': v.get('createTime'), 'content': summary, 'content_data': data}
+
+
+def batch_copy_messages(payload: bytes) -> tuple:
+    """逐条转发推送(messages.PushBatchCopyMessages, cmd 134): 返回 (这批消息的 id, 推送里直接带着的消息)。
+    推送里只有 messageIds、会话的 feedCard 和会话最后一条消息 lastMessage(完整的消息实体), 别的消息要按 id 再拉。
+    lastMessage 在这批里才用; 没有 messageIds 时就是 lastMessage 这一条。"""
+    p = _lark_all().messages.PushBatchCopyMessages()
+    p.ParseFromString(payload)
+    ids = list(dict.fromkeys(str(i) for i in p.messageIds if i))
+    last = p.lastMessage if p.HasField('lastMessage') and p.lastMessage.id else None
+    if last is None or (ids and last.id not in ids):
+        return ids, []
+    return ids or [last.id], [message_dict(protobuf_to_dict(last))]
+
+
+def frame_diag(raw: bytes) -> str:
+    """解不开的 WS 帧的诊断信息(只用于告警日志): 原始字节开头 64 字节的 hex, 再试着当外层 Frame 解, 列出解得出的字段
+    和 payload 的开头(gzip 的再解压看一眼)。"""
+    head = f'前 64 字节 hex: {raw[:64].hex()}'
+    try:
+        frame = P.Frame()
+        frame.ParseFromString(raw)
+    except Exception as e:
+        return f'{head}; 当外层 Frame 也解不开: {e!r}'
+    headers = {h.key: h.value for h in frame.headers}
+    payload = frame.payload
+    text = (f'{head}; 当外层 Frame 解: seqid {frame.seqid}, logid {frame.logid}, service {frame.service}, method {frame.method}, '
+            f'headers {str(headers)[:300]}, payloadEncoding {frame.payloadEncoding!r}, payloadType {frame.payloadType!r}, '
+            f'payload {len(payload)} 字节, 开头 hex: {payload[:32].hex()}')
+    if (frame.payloadEncoding or '').lower() == 'gzip' or payload[:2] == b'\x1f\x8b':
+        try:
+            inner = gzip.decompress(payload)
+            text += f', gzip 解压后 {len(inner)} 字节, 开头 hex: {inner[:32].hex()}'
+        except Exception as e:
+            text += f', gzip 解压失败: {e!r}'
+    return text
