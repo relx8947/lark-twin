@@ -136,3 +136,30 @@ class WhitelistEntry(Base):
     avatar_key = Column(String(256), default='')
     added_by = Column(String(16), default='')
     added_at = Column(DateTime, default=datetime.now)
+
+
+class EventRule(Base):
+    """Owner-authored subscription; executions use the existing Task model."""
+    __tablename__ = 'event_rules'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(256), nullable=False)
+    chat_id = Column(String(32), nullable=False)
+    instruction = Column(Text, nullable=False)
+    sender_ids = Column(Text, default='[]')
+    mention_ids = Column(Text, default='[]')
+    keywords = Column(Text, default='[]')
+    enabled = Column(Integer, default=0)  # -1 deleted, 0 draft/paused, 1 enabled
+    since = Column(BigInteger, default=0)
+    cursor = Column(Integer, default=0)
+
+
+class EventTrigger(Base):
+    """Dedup and source/task association, not a separate task lifecycle."""
+    __tablename__ = 'event_triggers'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, nullable=False, index=True)
+    chat_id = Column(String(32), nullable=False)
+    msg_id = Column(String(32), nullable=False)
+    task_id = Column(Integer, nullable=False, unique=True)
+    started = Column(Integer, default=0)
+    __table_args__ = (UniqueConstraint('rule_id', 'chat_id', 'msg_id', name='uq_event_source'),)

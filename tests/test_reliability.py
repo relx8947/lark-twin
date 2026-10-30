@@ -103,6 +103,8 @@ def _daemon(tmp_path, fake_client, monkeypatch):
     obj.cfg = json.loads(json.dumps(DEFAULTS))
     obj.cfg['triggers']['prefix'] = '/ai'
     obj.storage = Storage(f'sqlite:///{tmp_path}/d.db')
+    from larkx.event_rules import RuleStore
+    obj.rule_store = RuleStore(obj.storage)
     obj.session, obj.client = FakeSession(), fake_client
     obj.notifier = notify.Notifier(obj.cfg, fake_client)
     obj.auth = fake_client.auth

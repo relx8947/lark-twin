@@ -131,6 +131,10 @@ def test_daemon_schedules_due_task(tmp_path, monkeypatch):
     tid = st.add_task(kind='task', due_at=1, every_sec=3600, prompt='提醒喝水', chat_id='c1', by_owner=0)
     obj = d.Daemon.__new__(d.Daemon)
     obj.storage, obj.inbox = st, asyncio.Queue()
+    from larkx.event_rules import RuleStore
+    from types import SimpleNamespace
+    obj.rule_store = RuleStore(st)
+    obj.auth = SimpleNamespace(user_id='100')
     obj.cfg = {'memory_review_hour': -1}
     monkeypatch.setattr(d, 'SCHEDULER_INTERVAL', 0)
 

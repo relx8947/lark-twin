@@ -181,6 +181,14 @@ def cmd_send(args):
     text = _read_send_text(args)
     if not text.strip():
         return _fail(args, '消息内容为空')
+    mentions=[]
+    for value in getattr(args, 'mention', []) or []:
+        uid, sep, name = value.partition(':')
+        if not sep or not uid.isdigit() or not name.strip():
+            return _fail(args, '--mention 格式为数字 user_id:显示名')
+        mentions.append({'type':'at','user_id':uid,'name':name})
+    if mentions and getattr(args, 'markdown', False):
+        return _fail(args, '--mention 暂不支持与 --markdown 同时使用；请按纯文本发送')
     cfg = load_config()
     prefix = (cfg.get('triggers') or {}).get('prefix') or ''
     st = Storage()
@@ -212,7 +220,15 @@ def cmd_send(args):
         if getattr(args, 'markdown', False):
             from .protocol import richtext
             plain = richtext.to_plain_text(text)
-    if getattr(args, 'markdown', False):
+    if mentions:
+        segments=[]
+        for mention in mentions:
+            segments.extend([mention, {'type':'text','text':' '}])
+        segments.append({'type':'text','text':text})
+        msg_id=client.send_message({'kind':'text','segments':segments},args.chat_id,
+                                  root_id=args.root,keep_unread=cfg['keep_unread'])
+        text=' '.join('@'+m['name'] for m in mentions)+' '+text
+    elif getattr(args, 'markdown', False):
         msg_id = client.send_markdown(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
     else:
         msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
@@ -226,7 +242,7 @@ def cmd_send(args):
             name = st.get_chat_name(args.chat_id) or args.chat_id
             notifier.send(f'📤 数字人在「{name}」发了:\n{text}', fallback=False)
     # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
-    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'content_data': {'_larkx_mention_ids': [m['user_id'] for m in mentions]}, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
     if args.json:
         _print_json({'ok': True, 'msg_id': msg_id, 'chat_id': args.chat_id})
     else:
@@ -482,6 +498,33 @@ def cmd_takeover(args):
     else:
         print(msg)
     return 0 if ok else 1
+
+
+def cmd_rule(args):
+    from .event_rules import RuleStore
+    turn=state.read_turn() if is_agent_actor() else None
+    if is_agent_actor() and not (turn and turn.get('is_owner') and turn.get('kind') in ('message','say')):
+        return _fail(args, '监听规则只能由本人在对话或终端中管理；事件任务和访客不能管理')
+    store=RuleStore(Storage())
+    try:
+        if args.action=='list':
+            _print_json(store.list())
+        elif args.action=='runs':
+            _print_json(store.history())
+        elif args.action=='add':
+            if not args.name or not args.chat or not args.instruction:
+                return _fail(args, 'add 需要 --name、--chat 和 --instruction（- 从 stdin 读）')
+            instruction=sys.stdin.read() if args.instruction=='-' else args.instruction
+            rid=store.add(args.name,args.chat,instruction,args.sender,args.mention,args.keyword)
+            _print_json({'ok':True,'id':rid,'status':'draft','message':'规则已保存为草稿，请本人确认后执行 rule enable <id>'})
+        else:
+            if args.id is None: return _fail(args, '需要规则 id')
+            if args.action=='enable': store.enable(args.id)
+            else: store.pause(args.id,delete=args.action=='delete')
+            _print_json({'ok':True,'id':args.id,'action':args.action})
+    except ValueError as e:
+        return _fail(args,str(e))
+    return 0
 
 
 def cmd_mentions(args):
@@ -841,6 +884,7 @@ def main():
                    help='按 markdown 富文本发送: 代码块(```)、有序/无序列表、标题、引用、**加粗**、*斜体*、链接; 不带此选项时按纯文本发送')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_send)
+    p.add_argument('--mention', action='append', default=[], metavar='USER_ID:NAME', help='真实 @对象，可重复')
     p = sub.add_parser('config', help='查看生效中的配置(配置项写在 .env 里)')
     p.set_defaults(fn=cmd_config)
     p = sub.add_parser('chats', help='列出本地会话')
@@ -903,6 +947,17 @@ def main():
     p.add_argument('target', nargs='*', help='add: 名字(搜人, 同名时让你选)或 user_id; remove: 名单里的名字或 user_id')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_whitelist)
+    p = sub.add_parser('rule', help='监听任务：消息匹配规则后，交给现有 agent 执行预设任务')
+    p.add_argument('action', choices=['add','list','enable','pause','delete','runs'])
+    p.add_argument('id', type=int, nargs='?')
+    p.add_argument('--name')
+    p.add_argument('--chat', help='来源群真实 chat_id')
+    p.add_argument('--instruction', help='预设任务指令；- 从 stdin 读')
+    p.add_argument('--sender', action='append', default=[], help='发送人 user_id，可重复；默认他人')
+    p.add_argument('--mention', action='append', default=[], help='被 @的 user_id，任意命中，可重复')
+    p.add_argument('--keyword', action='append', default=[], help='正文关键词，任意命中，可重复')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_rule)
     p = sub.add_parser('mentions', help='最近谁找过你: 别人的私聊、@你的群消息, 以及你之后回没回')
     p.add_argument('--since', default='24h', help='多久以内, 如 12h、1d')
     p.add_argument('--json', action='store_true')
